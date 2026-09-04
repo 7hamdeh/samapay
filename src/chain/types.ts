@@ -32,9 +32,17 @@ export interface ChainObserver {
   confirmationsFor(chain: Chain, txHash: string): Promise<number>;
 }
 
+// `preBroadcast` reasons are refusals that happen BEFORE anything reached the
+// network by construction (no signed tx exists) — the only case a `failed`
+// row may be refunded with an empty txHashesChecked. `unknown` means the
+// adapter got as far as signing (or cannot say): `candidateTxHash` is the
+// hash of the signed tx, stored on the row so the reconciler can prove its
+// absence on-chain before anything is restored.
+export type PreBroadcastReason = "insufficient_gas" | "nonce_refused" | "invalid_address" | "rejected_pre_broadcast";
 export type BroadcastResult =
   | { ok: true; txHash: string }
-  | { ok: false; reason: "insufficient_gas" | "rejected" | "unknown"; detail: string };
+  | { ok: false; reason: PreBroadcastReason; detail: string }
+  | { ok: false; reason: "unknown"; detail: string; candidateTxHash: string | null };
 
 export interface TxSender {
   /** Pinned-nonce, single-attempt broadcast. Never retries on its own; a retry is a NEW decision by the caller. */

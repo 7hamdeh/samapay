@@ -36,8 +36,13 @@ withdrawals.post("/", idempotent, async (c) => {
     throw e;
   }
   if (!result.replayed) void submitForSending(result.withdrawalId).catch(() => undefined); // the sender records its own outcome; never awaited on the request path
+  // On a replay the row may have moved on (sent/failed/…): read the REAL status so a
+  // retrying client never sees a stale "pending" (value-model's review finding 3).
+  const status = result.replayed
+    ? (await prisma.withdrawal.findUniqueOrThrow({ where: { id: result.withdrawalId }, select: { status: true } })).status
+    : "pending";
   // `balance` is the position AFTER this reservation was counted — on a replay it is the CURRENT position.
-  return c.json({ withdrawal: { id: result.withdrawalId, status: "pending", replayed: result.replayed }, balance: positionBody(result.position) }, 202);
+  return c.json({ withdrawal: { id: result.withdrawalId, status, replayed: result.replayed }, balance: positionBody(result.position) }, 202);
 });
 
 withdrawals.get("/:id", async (c) => {

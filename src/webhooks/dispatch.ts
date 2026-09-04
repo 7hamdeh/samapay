@@ -9,7 +9,7 @@ export const RETRY_SCHEDULE_MS = [1_000, 5_000, 30_000, 5 * 60_000, 30 * 60_000,
 export const MAX_ATTEMPTS = RETRY_SCHEDULE_MS.length;
 const TIMEOUT_MS = 10_000;
 
-export type EventType = "deposit.confirmed" | "withdrawal.sent" | "withdrawal.failed";
+export type EventType = "deposit.confirmed" | "withdrawal.sent" | "withdrawal.failed" | "withdrawal.cancelled";
 
 /** Enqueue one delivery for a key; the worker delivers. Idempotent per (key, eventId). */
 export async function enqueue(keyId: string, eventType: EventType, eventId: string, data: Record<string, unknown>) {

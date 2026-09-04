@@ -25,7 +25,7 @@ async function main() {
   setChainAdapters({
     deriver: { async deriveNext(chain) { const i = nextIndex++; return { chain, address: `0xVERIFY${RUN}${i}`, derivationIndex: i }; } },
     observer: { async scan() { return transfers; }, async confirmationsFor() { return confirmations; } },
-    sender: { async send() { return { ok: false, reason: "rejected", detail: "verify: no real chain" }; } },
+    sender: { async send() { return { ok: false, reason: "rejected_pre_broadcast", detail: "verify: no real chain" }; } },
   });
   try {
     const client = await prisma.client.create({ data: { name: `verify-e2e-${RUN}`, kind: "merchant" } }); made.clients.push(client.id);
@@ -92,7 +92,18 @@ async function main() {
     await new Promise((r) => setTimeout(r, 300));
     const w1s = await prisma.withdrawal.findUniqueOrThrow({ where: { id: w1b.withdrawal.id }, select: { status: true } });
     const bal2 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { allowance: string } };
-    check(w1s.status === "failed" && bal2.balance.allowance === "3.5", "8. a failed send keeps CONSUMING: status=failed, allowance still 3.5 (restore needs evidence)", `status=${w1s.status} allowance=${bal2.balance.allowance}`);
+    check(w1s.status === "failed" && bal2.balance.allowance === "3.5", "8. a failed (pre-broadcast) send keeps CONSUMING: status=failed, allowance still 3.5 (restore needs evidence)", `status=${w1s.status} allowance=${bal2.balance.allowance}`);
+    // 8c. finding 1: with NO chain (ChainUnavailable) a request is RELEASED with a reason, not left pending
+    setChainAdapters({ sender: { async send() { throw new (await import("@/chain/registry.js")).ChainUnavailable("send"); } } });
+    const w3 = await app.request("/withdrawals", { method: "POST", headers: hdr(A.plaintext, `wd3-${RUN}`), body: JSON.stringify({ to: "0x" + "a".repeat(40), amount: "1", chain: "BEP20" }) });
+    const w3b = (await w3.json()) as { withdrawal: { id: string } };
+    await new Promise((r) => setTimeout(r, 300));
+    const w3s = await prisma.withdrawal.findUniqueOrThrow({ where: { id: w3b.withdrawal.id }, select: { status: true, reservation: { select: { status: true, reason: true } } } });
+    const cancelledHook = await prisma.webhookDelivery.count({ where: { keyId: A.id, eventType: "withdrawal.cancelled" } });
+    const bal4 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { allowance: string } };
+    check(w3.status === 202 && w3s.status === "cancelled" && w3s.reservation?.reason === "chain_unavailable" && cancelledHook === 1 && bal4.balance.allowance === "3.5", "8c. ChainUnavailable → cancelled with reason chain_unavailable + webhook; allowance restored to 3.5, nothing left pending", `status=${w3s.status} reason=${w3s.reservation?.reason} hooks=${cancelledHook} allowance=${bal4.balance.allowance}`);
+    const replayStatus = (await (await app.request("/withdrawals", { method: "POST", headers: hdr(A.plaintext, `wd3-${RUN}`), body: JSON.stringify({ to: "0x" + "a".repeat(40), amount: "1", chain: "BEP20" }) })).json()) as { withdrawal: { status: string; replayed: boolean } };
+    check(replayStatus.withdrawal.replayed && replayStatus.withdrawal.status === "cancelled", "8d. a replay reports the REAL status (cancelled), not a stale pending", JSON.stringify(replayStatus.withdrawal));
     // 8b. CONTROL: the balance number is not clamped — force withdrawn > received in the DB and read
     await prisma.withdrawal.create({ data: { keyId: A.id, toAddress: "0x" + "f".repeat(40), chain: "BEP20", amount: new Prisma.Decimal("20"), status: "sent", idempotencyKey: `forced-${RUN}` } });
     const bal3 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { allowance: string } };
