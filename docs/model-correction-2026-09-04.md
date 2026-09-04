@@ -12,6 +12,39 @@ is one client, not many."*
 Written to a file because a message-only deliverable does not survive a
 context reset. Nothing here is applied.
 
+## ⚠️ WHAT THIS SESSION RAN vs WHAT IT RELAYED
+
+**Standing requirement, Ibrahim 2026-09-04: a log separates what a session
+RAN from what it RELAYED. Where a doc says "measured" without naming who,
+the reader must assume RELAYED — one instrument, the reporter's.**
+
+***RAN BY providers-rules, in this worktree, 2026-09-04:***
+
+    grep over prisma/schema.prisma + src/ + scripts/ for merchant-as-client,
+      keys.issue callers, `reference` in src/allowance/*, `reference` in
+      balance.ts, and the ClientKind values          -> §1, §2, §4
+    node_modules/.bin/prisma migrate diff --from-empty  (the regenerated
+      migration: 9 CREATE TABLE, 0 DROP, 0 samaprime_merchant_id)
+    node_modules/.bin/tsc --noEmit                      -> exit 0
+
+***RELAYED — NOT MY INSTRUMENT:***
+
+    Ibrahim's correction itself         his words, via the coordinator
+    value-model's nine clauses and the  her module, her derivation; quoted
+      reservation/restore semantics       here, not re-derived by me
+    the $246.32 / 29 unattributable     docs/scratch/the-allowance-has-no-
+      deposits precedent in §5            source-2026-09-03.txt, ANOTHER
+                                          session's measurement, cited not re-run
+
+⚠️ ***AND THE AGREEMENT IN §3 IS NOT A SECOND INSTRUMENT.*** The coordinator
+agreed with the per-key reading — from MY framing, having read MY argument.
+That is one instrument reported twice. **The reading below is one session's
+analysis until value-model confirms it from her own clauses**, because her
+derivation is independent of mine. Do not read "two sessions agreed" into
+this file; it is not there yet.
+
+---
+
 ## 1. WHAT IS ALREADY RIGHT — most of it, and not by luck
 
 MEASURED across the built tree:
