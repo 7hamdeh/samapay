@@ -5,7 +5,8 @@
 // value-model's review finding 1 (2026-09-04): a row put BACK to `pending`
 // with nobody to re-submit it would later be EXPIRED by the reconciler —
 // a valid request silently restored with no reason the client can act on.
-// So until a pending-submitter worker exists, a ChainUnavailable RELEASES
+// The pending-submitter now exists (src/worker/index.ts) and closes the
+// route's fire-and-forget window; a ChainUnavailable still RELEASES
 // the reservation (status cancelled, reason 'chain_unavailable') and tells
 // the client with a withdrawal.cancelled webhook; the client retries with a
 // new idempotency key. Nothing ever looks sent, and nothing sits pending

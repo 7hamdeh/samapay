@@ -11,5 +11,14 @@ module.exports = {
     exec_mode: "fork",
     autorestart: true,
     max_memory_restart: "512M",
+  }, {
+    name: "samapay-worker",
+    script: "dist/worker/index.js",
+    cwd: "/www/wwwroot/samapay",
+    node_args: "--env-file=.env",
+    instances: 1,
+    exec_mode: "fork",
+    autorestart: true,
+    max_memory_restart: "256M",
   }],
 };
