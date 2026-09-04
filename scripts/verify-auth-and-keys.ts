@@ -1,12 +1,19 @@
 // STEP 2, RED-FIRST. Drives the REAL Hono app in-process (app.request — no
-// port, no PM2) against the sandbox database. Refuses any other database.
+// port, no PM2) against the sandbox database.
+//
+// ⚠️ THE ADMIN KEYS ROUTE IS NOT MOUNTED IN v1 (model correction, 2026-09-04:
+// SamaPrime is ONE client with ONE key, minted from the CLI). So the issuing
+// checks below exercise the CLI path — issueKey()/revokeKey() — and the AUTH
+// checks drive a mounted route (/balance). Nothing here tests handlers that
+// no longer have a caller; when SamaPay's own registration site mounts
+// admin-keys, it brings its own suite. Refuses any other database.
 //
 // The RED run is the guard itself: until samapay_sandbox exists this script
 // exits 1 with "REFUSING TO RUN", which is the only honest state for it.
 import { assertSandboxDatabase } from "@/db/guard.js";
 import { prisma } from "@/db/client.js";
 import { buildApp } from "@/http/app.js";
-import { issueKey } from "@/keys/issue.js";
+import { issueKey, IssueKeyError, revokeKey } from "@/keys/issue.js";
 import { computeAuditHash, GENESIS_HASH } from "@/audit/append.js";
 
 let pass = 0, fail = 0;
@@ -20,8 +27,8 @@ async function main() {
   const made = { clients: [] as string[], keys: [] as string[] };
   try {
     const platform = await prisma.client.create({ data: { name: `verify-platform-${RUN}`, kind: "platform" } });
-    const merchant = await prisma.client.create({ data: { name: `verify-merchant-${RUN}`, kind: "merchant" } });
-    made.clients.push(platform.id, merchant.id);
+    const partner = await prisma.client.create({ data: { name: `verify-partner-${RUN}`, kind: "partner" } });
+    made.clients.push(platform.id, partner.id);
 
     // The admin key is minted by the CLI path only.
     const admin = await issueKey({ clientId: platform.id, name: "admin", scopes: ["keys.issue"], issuedBy: "verify", issuedVia: "cli" });
@@ -31,32 +38,34 @@ async function main() {
     check(!stored.keyHash.includes(admin.plaintext) && stored.keyHash.startsWith("$argon2"), "2. the plaintext is NOT stored; an argon2 hash is", stored.keyHash.slice(0, 10));
     check(stored.keyPrefix === admin.plaintext.slice(0, 12) && stored.keyLast4 === admin.plaintext.slice(-4), "2b. prefix and last4 match the plaintext", `${stored.keyPrefix} …${stored.keyLast4}`);
 
-    // 3. admin key issues a merchant key over HTTP; plaintext returned once
-    const res = await app.request(`/admin/clients/${merchant.id}/keys`, { method: "POST", headers: { authorization: `Bearer ${admin.plaintext}`, "content-type": "application/json" }, body: JSON.stringify({ name: "store key", scopes: ["addresses.write", "balance.read"], environment: "test" }) });
-    const body = (await res.json()) as { key?: { id: string; plaintext: string; scopes: string[]; environment: string } };
-    check(res.status === 201 && !!body.key?.plaintext?.startsWith("sk_test_"), "3. keys.issue admin key issues a merchant key over HTTP, 201, plaintext once", `status=${res.status}`);
-    if (body.key) made.keys.push(body.key.id);
-    const merchantKey = body.key?.plaintext ?? "";
+    // 3. the CLI path issues a client key for another client; plaintext once
+    const client = await issueKey({ clientId: partner.id, name: "store key", scopes: ["balance.read"], environment: "test", issuedBy: "verify", issuedVia: "cli" });
+    made.keys.push(client.id);
+    check(client.plaintext.startsWith("sk_test_") && client.scopes.join() === "balance.read", "3. the CLI issues a client key for another client, plaintext returned once", `${client.keyPrefix}… scopes=${client.scopes.join()}`);
 
-    // 4. wrong secret with a real prefix -> 401 (same message as unknown)
-    const wrong = merchantKey.slice(0, 12) + "a".repeat(40);
-    const r4 = await app.request("/admin/keys/nothing", { method: "DELETE", headers: { authorization: `Bearer ${wrong}` } });
-    const r4b = await app.request("/admin/keys/nothing", { method: "DELETE", headers: { authorization: "Bearer sk_live_" + "b".repeat(40) } });
+    // 4. wrong secret with a real prefix, and an unknown prefix, are BOTH 401 with the SAME body (no oracle)
+    const wrong = client.plaintext.slice(0, 12) + "a".repeat(40);
+    const r4 = await app.request("/balance", { headers: { authorization: `Bearer ${wrong}` } });
+    const r4b = await app.request("/balance", { headers: { authorization: "Bearer sk_live_" + "b".repeat(40) } });
     check(r4.status === 401 && r4b.status === 401 && (await r4.text()) === (await r4b.text()), "4. wrong secret and unknown prefix both 401 with the SAME body (no oracle)", `${r4.status}/${r4b.status}`);
 
-    // 5. merchant key lacks keys.issue -> 403 with the scope named
-    const r5 = await app.request(`/admin/clients/${merchant.id}/keys`, { method: "POST", headers: { authorization: `Bearer ${merchantKey}`, "content-type": "application/json" }, body: JSON.stringify({ name: "x", scopes: ["balance.read"] }) });
+    // 5. a key without the scope is refused 403, with the scope named
+    const noScope = await issueKey({ clientId: partner.id, name: "no scope", scopes: ["deposits.read"], issuedBy: "verify", issuedVia: "cli" });
+    made.keys.push(noScope.id);
+    const r5 = await app.request("/balance", { headers: { authorization: `Bearer ${noScope.plaintext}` } });
     const b5 = (await res5json(r5)) as { error?: { code: string; details?: { scope?: string } } };
-    check(r5.status === 403 && b5.error?.code === "insufficient_scope" && b5.error.details?.scope === "keys.issue", "5. a client key without keys.issue is refused 403, scope named", `status=${r5.status} code=${b5.error?.code}`);
+    check(r5.status === 403 && b5.error?.code === "insufficient_scope" && b5.error.details?.scope === "balance.read", "5. a key missing the scope is refused 403, scope named", `status=${r5.status} code=${b5.error?.code}`);
 
-    // 6. the admin surface cannot mint another keys.issue key
-    const r6 = await app.request(`/admin/clients/${merchant.id}/keys`, { method: "POST", headers: { authorization: `Bearer ${admin.plaintext}`, "content-type": "application/json" }, body: JSON.stringify({ name: "escalate", scopes: ["keys.issue"] }) });
-    check(r6.status === 403, "6. CONTROL — the admin key cannot mint a second keys.issue key (only the CLI can)", `status=${r6.status}`);
+    // 6. CONTROL — keys.issue can be minted by the CLI ONLY: the admin path refuses
+    let refusedEscalation = false;
+    try { await issueKey({ clientId: partner.id, name: "escalate", scopes: ["keys.issue"], issuedBy: "verify", issuedVia: "samaprime_admin_action" }); }
+    catch (e) { refusedEscalation = e instanceof IssueKeyError && e.code === "keys_issue_not_via_admin"; }
+    check(refusedEscalation, "6. CONTROL — keys.issue is refused unless it comes from the CLI (his hand), so no admin path can mint an admin key");
 
-    // 7. revoke, then the revoked key is 401 — and the audit chain holds
-    const r7 = await app.request(`/admin/keys/${body.key?.id}`, { method: "DELETE", headers: { authorization: `Bearer ${admin.plaintext}` } });
-    const r7b = await app.request(`/admin/clients/${merchant.id}/keys`, { method: "POST", headers: { authorization: `Bearer ${merchantKey}`, "content-type": "application/json" }, body: "{}" });
-    check(r7.status === 200 && r7b.status === 401, "7. revoked key is 401 on its next request", `${r7.status}/${r7b.status}`);
+    // 7. revoke, then the revoked key is 401 on its next request
+    const revoked = await revokeKey(client.id, "verify", "revoked by the suite");
+    const r7b = await app.request("/balance", { headers: { authorization: `Bearer ${client.plaintext}` } });
+    check(revoked === 1 && r7b.status === 401, "7. a revoked key is 401 on its next request", `revoked=${revoked} status=${r7b.status}`);
 
     const rows = await prisma.auditEvent.findMany({ orderBy: { at: "asc" }, select: { at: true, keyId: true, actor: true, action: true, subjectId: true, idempotencyKey: true, params: true, prevHash: true, hash: true } });
     let prev = GENESIS_HASH, broken = 0;

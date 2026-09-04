@@ -1,6 +1,22 @@
-// The keys.issue surface. Held by the SamaPrime server's admin key only.
-// It can issue and revoke CLIENT keys; it cannot mint another keys.issue
-// key (issue.ts refuses), and it has no route that moves money.
+// ⚠️⚠️ NOT MOUNTED IN v1. KEPT, NOT DELETED.
+//
+// This was the surface SamaPrime's merchant-enable action called to mint a
+// key per merchant. The 2026-09-04 model correction retired that caller
+// outright: SamaPrime is ONE client with ONE key, minted from the CLI by
+// Ibrahim's own hand (scripts/issue-key.ts). So this route has NO CALLER —
+// and a mounted route with no caller is attack surface for nothing, plus
+// the "looks finished because the thing that would expose it is disabled"
+// shape this project has paid for before.
+//
+// It is kept because SamaPay's OWN registration site (where dahabi and
+// other external owners will mint their own keys) needs exactly this
+// mechanism. When that arrives, mount it in http/app.ts and give it its own
+// red-first suite — do not assume these handlers work because they compile:
+// as of today NOTHING has ever called them over HTTP.
+//
+// The keys.issue surface. It can issue and revoke CLIENT keys; it cannot
+// mint another keys.issue key (issue.ts refuses), and it has no route that
+// moves money.
 import { Hono } from "hono";
 import { z } from "zod";
 import { bearerAuth, requireScope } from "../auth.js";

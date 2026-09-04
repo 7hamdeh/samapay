@@ -5,6 +5,13 @@
 import type { Chain } from "@prisma/client";
 import type { AddressDeriver, ChainObserver, TxExistenceProver, TxSender } from "./types.js";
 
+// ⚠️⚠️ DO NOT WIRE THE DERIVER UNTIL THE `reference` FORMAT IS DECIDED.
+// An address's reference is its attribution, created at derivation time and
+// NOT RECOMPUTABLE — the $246.32 of unattributable SamaPrime deposits is
+// that exact mistake, already paid for once. The question is with Ibrahim;
+// docs/model-correction-2026-09-04.md §5 has it and the recommendation.
+// Until he answers, no address may be issued — which is true by
+// construction today, because the deriver below refuses.
 export class ChainUnavailable extends Error {
   constructor(what: string) { super(`chain layer not wired: ${what} (step 4)`); this.name = "ChainUnavailable"; }
 }

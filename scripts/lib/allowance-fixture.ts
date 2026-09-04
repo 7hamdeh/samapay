@@ -12,7 +12,7 @@ const madeKeys: string[] = [];
 
 export async function makeKey(tag: string): Promise<{ clientId: string; keyId: string }> {
   const client = await prisma.client.create({
-    data: { name: `verify-allowance ${STAMP} ${tag}`, kind: "merchant" },
+    data: { name: `verify-allowance ${STAMP} ${tag}`, kind: "platform" },
     select: { id: true },
   });
   madeClients.push(client.id);

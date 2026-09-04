@@ -14,10 +14,14 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// A CLIENT IS A WHOLE SYSTEM, NEVER ONE OF ITS MERCHANTS. Ibrahim,
+// 2026-09-04: "SamaPrime is ONE client of SamaPay with ONE key; it
+// distributes internally to its merchants by reference — a merchant never
+// knows SamaPay exists." `merchant` was a value here until that correction
+// and is retired: a SamaPrime merchant is not a client of anything.
 enum ClientKind {
-  platform
-  merchant
-  partner
+  platform // SamaPrime itself — one client, one key
+  partner  // an external site (dahabi, others) that registers on SamaPay's own site
 }
 
 enum KeyEnvironment {
@@ -63,8 +67,10 @@ model Client {
   id        String     @id @default(cuid())
   name      String
   kind      ClientKind
-  // The SamaPrime merchant this client IS, when it is one. Opaque here.
-  samaprimeMerchantId String? @unique @map("samaprime_merchant_id")
+  // NO LINK TO A SAMAPRIME ACCOUNT, DELIBERATELY. A `samaprime_merchant_id`
+  // column lived here until 2026-09-04 and was removed with the model
+  // correction: the two systems are separate, and nothing about a
+  // SamaPrime merchant belongs in this table.
   createdAt DateTime   @default(now()) @map("created_at")
 
   keys ClientKey[]

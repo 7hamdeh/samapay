@@ -2,7 +2,7 @@
 CREATE SCHEMA IF NOT EXISTS "public";
 
 -- CreateEnum
-CREATE TYPE "ClientKind" AS ENUM ('platform', 'merchant', 'partner');
+CREATE TYPE "ClientKind" AS ENUM ('platform', 'partner');
 
 -- CreateEnum
 CREATE TYPE "KeyEnvironment" AS ENUM ('live', 'test');
@@ -30,7 +30,6 @@ CREATE TABLE "clients" (
     "id" TEXT NOT NULL,
     "name" TEXT NOT NULL,
     "kind" "ClientKind" NOT NULL,
-    "samaprime_merchant_id" TEXT,
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "clients_pkey" PRIMARY KEY ("id")
@@ -175,9 +174,6 @@ CREATE TABLE "audit_events" (
 
     CONSTRAINT "audit_events_pkey" PRIMARY KEY ("id")
 );
-
--- CreateIndex
-CREATE UNIQUE INDEX "clients_samaprime_merchant_id_key" ON "clients"("samaprime_merchant_id");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "client_keys_key_prefix_key" ON "client_keys"("key_prefix");

@@ -28,7 +28,7 @@ async function main() {
     sender: { async send() { return { ok: false, reason: "rejected_pre_broadcast", detail: "verify: no real chain" }; } },
   });
   try {
-    const client = await prisma.client.create({ data: { name: `verify-e2e-${RUN}`, kind: "merchant" } }); made.clients.push(client.id);
+    const client = await prisma.client.create({ data: { name: `verify-e2e-${RUN}`, kind: "platform" } }); made.clients.push(client.id);
     const scopes = ["addresses.write", "deposits.read", "withdrawals.write", "withdrawals.read", "balance.read"];
     const A = await issueKey({ clientId: client.id, name: "A", scopes, issuedBy: "verify", issuedVia: "cli" });
     const B = await issueKey({ clientId: client.id, name: "B", scopes, issuedBy: "verify", issuedVia: "cli" });
