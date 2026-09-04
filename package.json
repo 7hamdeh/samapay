@@ -1,0 +1,34 @@
+{
+  "name": "samapay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SamaPay — key-scoped crypto deposit/withdrawal service. Own repo, own DB, own process. Not a public gateway.",
+  "type": "module",
+  "engines": { "node": ">=24", "pnpm": ">=11" },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src scripts",
+    "prisma:generate": "prisma generate",
+    "prisma:validate": "prisma validate",
+    "verify:sandbox": "bash scripts/sandbox.sh"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@node-rs/argon2": "^2.0.2",
+    "@prisma/client": "6.19.3",
+    "hono": "^4.6.14",
+    "pino": "^10.3.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "eslint": "^9.0.0",
+    "prisma": "6.19.3",
+    "tsx": "^4.23.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.0.0"
+  }
+}
