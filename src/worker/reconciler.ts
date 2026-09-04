@@ -11,8 +11,15 @@
 //      needs a hash — which it cannot have, so it stays consuming until an
 //      operator supplies evidence by hand (his line). Never guessed.
 //
-// This file does not merge until value-model has checked the evidence
-// object it builds against markRefunded's required fields.
+// The pre-broadcast `failed` family also waits the full MIN_AGE_MS although
+// no tx can exist for it — deliberate conservatism; do NOT "optimise" that
+// into a skip, because the same skip applied to send_unknown is the exact
+// hole the gate exists to close.
+//
+// RESTORE ONLY. This file never flips anything to `sent`; a present-on-chain
+// discovery is PERSISTED (hash + audit) and confirmOutgoingOnce() in
+// worker/index.ts owns send_unknown → sent. Two doors, two files, two audits.
+// Reviewed by value-model 2026-09-04 before merge.
 import pino from "pino";
 import { prisma } from "@/db/client.js";
 import { appendAudit } from "@/audit/append.js";
@@ -25,6 +32,7 @@ export const MIN_AGE_MS = 10 * 60_000;
 export const MIN_NODES = 2;
 
 export type ReconcileOutcome = "refunded" | "too_young" | "present_on_chain" | "insufficient_nodes" | "needs_hash" | "not_eligible";
+export type ReconcileTally = Record<ReconcileOutcome, number>;
 
 export async function reconcileOne(withdrawalId: string, now = new Date()): Promise<ReconcileOutcome> {
   const w = await prisma.withdrawal.findUniqueOrThrow({ where: { id: withdrawalId }, select: { keyId: true, chain: true, status: true, txHash: true, sentAt: true, requestedAt: true, amount: true } });
@@ -45,17 +53,27 @@ export async function reconcileOne(withdrawalId: string, now = new Date()): Prom
   }
   if (candidates.size === 0 && !(w.status === "failed" && preBroadcast)) return "needs_hash";
 
-  // prove absence for every candidate, on >= MIN_NODES endpoints
-  let nodesAskedMin = Number.POSITIVE_INFINITY;
+  // prove absence for every candidate, on >= MIN_NODES DISTINCT endpoints
+  const nodesPerCandidate: string[][] = [];
   for (const h of candidates) {
     const r = await chainAdapters().prover.exists(w.chain, h);
-    if (r.known) return "present_on_chain"; // it happened: not refundable, ever — the observer/sender path owns it now
-    nodesAskedMin = Math.min(nodesAskedMin, r.nodesAsked);
+    if (r.known) {
+      // It happened. Not refundable, ever — and NOT a silent return: persist
+      // what was found so the row is not stuck and invisible (review (A)).
+      await prisma.$transaction(async (tx) => {
+        await tx.withdrawal.updateMany({ where: { id: withdrawalId, txHash: null }, data: { txHash: h } });
+        await appendAudit(tx, { keyId: w.keyId, actor: "reconciler", action: "withdrawal.present_on_chain", subjectId: withdrawalId, params: { txHash: h, confirmed: r.confirmed, confirmations: r.confirmations, node: r.node } });
+      });
+      return "present_on_chain";
+    }
+    nodesPerCandidate.push([...new Set(r.nodes)]);
   }
-  if (candidates.size > 0 && nodesAskedMin < MIN_NODES) return "insufficient_nodes";
+  const fewestDistinct = nodesPerCandidate.reduce((m, n) => Math.min(m, n.length), Number.POSITIVE_INFINITY);
+  if (candidates.size > 0 && fewestDistinct < MIN_NODES) return "insufficient_nodes";
+  const hosts = [...new Set(nodesPerCandidate.flat())].sort();
 
   const evidence: AbsenceEvidence = {
-    checkedVia: candidates.size === 0 ? "pre-broadcast failure by construction (no signed tx)" : `tx existence on ${nodesAskedMin} independent endpoints`,
+    checkedVia: candidates.size === 0 ? "pre-broadcast failure by construction (no signed tx)" : `tx existence absent on ${hosts.join(", ")}`,
     txHashesChecked: [...candidates],
     checkedAt: now.toISOString(),
     absentOnChain: true,
@@ -63,7 +81,7 @@ export async function reconcileOne(withdrawalId: string, now = new Date()): Prom
   await prisma.$transaction(async (tx) => {
     await markRefunded(tx, withdrawalId, evidence);
     await appendAudit(tx, { keyId: w.keyId, actor: "reconciler", action: "withdrawal.refunded", subjectId: withdrawalId, params: { ...evidence, ageMs: now.getTime() - since.getTime() } });
-    await enqueue(w.keyId, "withdrawal.cancelled", `wd_${withdrawalId}_refunded`, { withdrawal_id: withdrawalId, reason: "refunded", amount: w.amount.toString(), chain: w.chain, evidence: { checked_via: evidence.checkedVia, tx_hashes_checked: evidence.txHashesChecked } });
+    await enqueue(w.keyId, "withdrawal.refunded", `wd_${withdrawalId}_refunded`, { withdrawal_id: withdrawalId, amount: w.amount.toString(), chain: w.chain, evidence: { checked_via: evidence.checkedVia, tx_hashes_checked: evidence.txHashesChecked } });
   });
   return "refunded";
 }

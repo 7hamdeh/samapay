@@ -50,11 +50,11 @@ export interface TxSender {
 }
 
 export type TxExistence =
-  | { known: true; confirmed: boolean; confirmations: number }
-  | { known: false; checkedAt: Date; nodesAsked: number };
+  | { known: true; confirmed: boolean; confirmations: number; node: string }
+  | { known: false; checkedAt: Date; nodes: string[] }; // DISTINCT hostnames that actually answered — a count cannot show one host asked twice
 
 export interface TxExistenceProver {
-  /** The on-chain-absence proof markRefunded requires. `known:false` is evidence only with nodesAsked >= 2. */
+  /** The on-chain-absence proof markRefunded requires. `known:false` is evidence only when >= 2 DISTINCT nodes answered; the reconciler enforces and records WHICH. */
   exists(chain: Chain, txHash: string): Promise<TxExistence>;
 }
 

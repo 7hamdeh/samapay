@@ -21,6 +21,8 @@ import { appendAudit } from "@/audit/append.js";
 import { expire } from "@/allowance/index.js";
 import { submitForSending } from "@/sender/index.js";
 import { attemptDelivery, enqueue } from "@/webhooks/dispatch.js";
+import { chainAdapters } from "@/chain/registry.js";
+import { reconcileOnce } from "./reconciler.js";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info", name: "samapay-worker" });
 export const GRACE_MS = 5_000;                 // a route's own submit gets this long first
@@ -54,13 +56,33 @@ export async function deliverDueOnce(now = new Date()): Promise<{ attempted: num
   return { attempted: due.length, delivered };
 }
 
+/** 3. CONFIRM OUTGOING — send_unknown with a hash that the chain now knows → sent. Confirm only; restore lives in reconciler.ts. */
+export async function confirmOutgoingOnce(): Promise<{ confirmed: number }> {
+  const rows = await prisma.withdrawal.findMany({ where: { status: "send_unknown", txHash: { not: null } }, take: BATCH, select: { id: true, keyId: true, chain: true, txHash: true, amount: true } });
+  let confirmed = 0;
+  for (const w of rows) {
+    const r = await chainAdapters().prover.exists(w.chain, w.txHash as string);
+    if (!r.known || !r.confirmed) continue;
+    await prisma.$transaction(async (tx) => {
+      const flipped = await tx.withdrawal.updateMany({ where: { id: w.id, status: "send_unknown" }, data: { status: "sent", sentAt: new Date() } });
+      if (flipped.count !== 1) return;
+      confirmed++;
+      await appendAudit(tx, { keyId: w.keyId, actor: "reconciler", action: "withdrawal.sent", subjectId: w.id, params: { txHash: w.txHash, confirmations: r.confirmations, node: r.node, via: "confirmOutgoingOnce" } });
+      await enqueue(w.keyId, "withdrawal.sent", `wd_${w.id}_sent`, { withdrawal_id: w.id, tx_hash: w.txHash, amount: w.amount.toString(), chain: w.chain });
+    });
+  }
+  return { confirmed };
+}
+
 async function loop(): Promise<never> {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
       const a = await submitPendingOnce();
       const b = await deliverDueOnce();
-      if (a.submitted || a.expired || b.attempted) log.info({ ...a, ...b }, "tick");
+      const c = await confirmOutgoingOnce();
+      const d = await reconcileOnce();
+      if (a.submitted || a.expired || b.attempted || c.confirmed || d.refunded || d.present_on_chain) log.info({ ...a, ...b, ...c, reconcile: d }, "tick");
     } catch (e) { log.error({ err: e instanceof Error ? `${e.name}: ${e.message}` : String(e) }, "tick failed"); }
     await new Promise((r) => setTimeout(r, TICK_MS));
   }
