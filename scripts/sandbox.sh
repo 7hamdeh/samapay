@@ -7,4 +7,4 @@ set -euo pipefail
 url="$(grep -E '^DATABASE_URL=' .env.sandbox | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//')"
 [ -n "$url" ] || { echo ".env.sandbox has no DATABASE_URL" >&2; exit 1; }
 case "$url" in *_sandbox*) ;; *) echo "REFUSING: .env.sandbox DATABASE_URL does not name a *_sandbox database" >&2; exit 1;; esac
-DATABASE_URL="$url" exec pnpm exec tsx "$@"
+DATABASE_URL="$url" exec node_modules/.bin/tsx "$@"

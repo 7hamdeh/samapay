@@ -1,15 +1,24 @@
 // FAIL-CLOSED SANDBOX GUARD — the first statement of every verify script.
-// Refuses any database whose NAME does not end in `_sandbox`. Copied as a
-// contract from SamaPrime's scripts/lib/sandbox-guard.ts, which exists
-// because three verify scripts there were found writing production in one
-// day. Here it is present on day one, before any script exists.
+// Two checks, closing two doors: (1) the DATABASE_URL's database NAME must end
+// in `_sandbox`, decided BEFORE any connection is opened, so a wrong URL
+// refuses instead of erroring; (2) `current_database()` must agree, so a
+// URL that lies about its name is caught by the server's own answer.
+// Contract copied from SamaPrime's scripts/lib/sandbox-guard.ts, present here
+// on day one.
 import { prisma } from "./client.js";
 
+export function databaseNameFromUrl(url: string | undefined): string | null {
+  if (!url) return null;
+  try { return decodeURIComponent(new URL(url).pathname.replace(/^\//, "")) || null; } catch { return null; }
+}
+
 export async function assertSandboxDatabase(): Promise<string> {
-  const rows = (await prisma.$queryRawUnsafe("select current_database() as db")) as Array<{ db: string }>;
-  const db = rows[0]?.db ?? "<unknown>";
-  if (!db.endsWith("_sandbox")) {
-    throw new Error(`REFUSING TO RUN — "${db}" is not a sandbox database (name must end in _sandbox). Fail-closed: no marker means refuse.`);
+  const named = databaseNameFromUrl(process.env.DATABASE_URL);
+  if (!named || !named.endsWith("_sandbox")) {
+    throw new Error(`REFUSING TO RUN — DATABASE_URL names "${named ?? "<none>"}", not a sandbox database (name must end in _sandbox). Refused before connecting.`);
   }
-  return db;
+  const rows = (await prisma.$queryRawUnsafe("select current_database() as db")) as Array<{ db: string }>;
+  const actual = rows[0]?.db ?? "<unknown>";
+  if (actual !== named) throw new Error(`REFUSING TO RUN — connected to "${actual}" but the URL named "${named}".`);
+  return actual;
 }
