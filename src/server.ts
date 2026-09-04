@@ -1,12 +1,10 @@
-// Entry point. Step 1 exposes only /health so the scaffold type-checks and
-// boots; routes arrive in steps 2-5. Binds 127.0.0.1 — nginx fronts it.
+// Entry point. Binds 127.0.0.1 — nginx fronts it; opening it is his keystroke.
 import { serve } from "@hono/node-server";
-import { Hono } from "hono";
 import pino from "pino";
+import { buildApp } from "./http/app.js";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
-export const app = new Hono();
-app.get("/health", (c) => c.json({ ok: true, service: "samapay", version: "0.1.0" }));
+export const app = buildApp();
 
 if (process.argv[1]?.endsWith("server.ts") || process.argv[1]?.endsWith("server.js")) {
   const port = Number(process.env.PORT ?? 3090);
