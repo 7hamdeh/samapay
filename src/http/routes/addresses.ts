@@ -9,6 +9,7 @@ import { appendAudit } from "@/audit/append.js";
 import { chainAdapters, ChainUnavailable } from "@/chain/registry.js";
 import { bearerAuth, requireScope } from "../auth.js";
 import { ApiError } from "../errors.js";
+import { isValidReference } from "@/reference/index.js";
 import { idempotent } from "../idempotency.js";
 
 const Body = z.object({ chain: z.enum(["BEP20", "TRC20"]), reference: z.string().min(1).max(200) });
@@ -20,6 +21,10 @@ addresses.post("/", idempotent, async (c) => {
   const parsed = Body.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) throw new ApiError("invalid_input", "Body must be { chain: BEP20|TRC20, reference }.");
   const { chain, reference } = parsed.data;
+  // ⚠️ REFUSED HERE, NOT LATER. A reference is ATTRIBUTION CREATED AT
+  // DERIVATION TIME and is not recomputable — a malformed one stored on an
+  // address is permanent. Shape only: SamaPay never reads the segments.
+  if (!isValidReference(reference)) throw new ApiError("invalid_input", "reference must be client:tenant:kind:id — four non-empty segments, no colon, whitespace or control character inside a segment (e.g. samaprime:samacard:user:abc123).", { reference });
   const existing = await prisma.address.findFirst({ where: { keyId: key.id, chain, reference }, select: { id: true, address: true, createdAt: true } });
   if (existing) return c.json({ address: { id: existing.id, chain, reference, address: existing.address, created_at: existing.createdAt, reused: true } }, 200);
   let derived;

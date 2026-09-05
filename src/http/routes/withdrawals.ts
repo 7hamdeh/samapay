@@ -11,6 +11,7 @@ import { reserve, AllowanceExceeded, InvalidAmount } from "@/allowance/index.js"
 import { submitForSending } from "@/sender/index.js";
 import { bearerAuth, requireScope } from "../auth.js";
 import { ApiError } from "../errors.js";
+import { isValidReference } from "@/reference/index.js";
 import { idempotent } from "../idempotency.js";
 import { positionBody } from "./balance.js";
 
@@ -19,10 +20,14 @@ import { positionBody } from "./balance.js";
 // in her module because it is a rule about what the CLIENT sends:
 // `GET /balance?reference=x` sums deposits through the ADDRESS's reference
 // and withdrawals through THIS field. If a client issues an address under
-// `m:7/u:42` and then withdraws under `m:7`, that reference shows `received`
-// with no matching `withdrawn` — and it reads exactly like money missing,
-// which is the worst way for a reconciliation instrument to be wrong.
-// Send the same string, or the agreed aggregating prefix; never a third form.
+// `samaprime:samacard:user:abc123` and then withdraws under
+// `samaprime:samacard:user:abc124`, that reference shows `received` with no
+// matching `withdrawn` — and it reads exactly like money missing, which is
+// the worst way for a reconciliation instrument to be wrong.
+// Send the same string; aggregate with `tenantPrefix()`, never a third form.
+// (This comment cited the retired two-part `m:<id>/u:<id>` form until
+// 2026-09-05; Ibrahim ruled `client:tenant:kind:id`, and a stale example
+// inside a rule is this project's documented worst kind of stale.)
 const Body = z.object({ to: z.string().min(20).max(120), amount: z.string().regex(/^\d+(\.\d{1,6})?$/), chain: z.enum(["BEP20", "TRC20"]), reference: z.string().max(200).optional() });
 export const withdrawals = new Hono();
 withdrawals.use("*", bearerAuth);
@@ -31,6 +36,12 @@ withdrawals.post("/", idempotent, async (c) => {
   const key = c.get("key"); requireScope(key, "withdrawals.write");
   const parsed = Body.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) throw new ApiError("invalid_input", "Body must be { to, amount (decimal string, ≤6 dp), chain, reference? }.");
+  // Same shape rule as POST /addresses: a withdrawal's reference must be
+  // comparable with the address's, or GET /balance?reference= sums two
+  // different things and reads as money missing.
+  if (parsed.data.reference !== undefined && !isValidReference(parsed.data.reference)) {
+    throw new ApiError("invalid_input", "reference must be client:tenant:kind:id — the same form the address was issued under.", { reference: parsed.data.reference });
+  }
   const idemKey = c.req.header("idempotency-key") as string;
   let result;
   try {

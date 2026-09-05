@@ -36,9 +36,9 @@ async function main() {
     const hdr = (k: string, idem?: string) => ({ authorization: `Bearer ${k}`, "content-type": "application/json", ...(idem ? { "idempotency-key": idem } : {}) });
 
     // 1. address issued to A, bound to a reference; same (reference, chain) reuses
-    const a1 = await app.request("/addresses", { method: "POST", headers: hdr(A.plaintext, `addr-${RUN}`), body: JSON.stringify({ chain: "BEP20", reference: "cust-1" }) });
+    const a1 = await app.request("/addresses", { method: "POST", headers: hdr(A.plaintext, `addr-${RUN}`), body: JSON.stringify({ chain: "BEP20", reference: "samaprime:verify:user:cust1" }) });
     const a1b = (await a1.json()) as { address: { address: string; reused: boolean } };
-    const a2 = await app.request("/addresses", { method: "POST", headers: hdr(A.plaintext, `addr2-${RUN}`), body: JSON.stringify({ chain: "BEP20", reference: "cust-1" }) });
+    const a2 = await app.request("/addresses", { method: "POST", headers: hdr(A.plaintext, `addr2-${RUN}`), body: JSON.stringify({ chain: "BEP20", reference: "samaprime:verify:user:cust1" }) });
     const a2b = (await a2.json()) as { address: { address: string; reused: boolean } };
     check(a1.status === 201 && a2.status === 200 && a2b.address.reused && a2b.address.address === a1b.address.address, "1. POST /addresses issues once per (key, reference, chain); the second call reuses", `${a1.status}/${a2.status}`);
     const noIdem = await app.request("/addresses", { method: "POST", headers: hdr(A.plaintext), body: "{}" });
