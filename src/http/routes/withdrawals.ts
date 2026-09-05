@@ -14,6 +14,15 @@ import { ApiError } from "../errors.js";
 import { idempotent } from "../idempotency.js";
 import { positionBody } from "./balance.js";
 
+// ⚠️ `reference` — SEND THE SAME STRING YOU ISSUED THE ADDRESS UNDER.
+// value-model's contract note, 2026-09-04, and it belongs HERE rather than
+// in her module because it is a rule about what the CLIENT sends:
+// `GET /balance?reference=x` sums deposits through the ADDRESS's reference
+// and withdrawals through THIS field. If a client issues an address under
+// `m:7/u:42` and then withdraws under `m:7`, that reference shows `received`
+// with no matching `withdrawn` — and it reads exactly like money missing,
+// which is the worst way for a reconciliation instrument to be wrong.
+// Send the same string, or the agreed aggregating prefix; never a third form.
 const Body = z.object({ to: z.string().min(20).max(120), amount: z.string().regex(/^\d+(\.\d{1,6})?$/), chain: z.enum(["BEP20", "TRC20"]), reference: z.string().max(200).optional() });
 export const withdrawals = new Hono();
 withdrawals.use("*", bearerAuth);
