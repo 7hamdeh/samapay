@@ -44,10 +44,23 @@ async function main() {
     check(client.plaintext.startsWith("sk_test_") && client.scopes.join() === "balance.read", "3. the CLI issues a client key for another client, plaintext returned once", `${client.keyPrefix}… scopes=${client.scopes.join()}`);
 
     // 4. wrong secret with a real prefix, and an unknown prefix, are BOTH 401 with the SAME body (no oracle)
-    const wrong = client.plaintext.slice(0, 12) + "a".repeat(40);
+    // ⚠️ A WELL-FORMED key with the RIGHT prefix and the WRONG secret. The
+    // first version appended 40 chars to a 12-char slice, producing a 44-char
+    // body that failed the FORMAT regex — so it got the "malformed header"
+    // message and the test failed for the wrong reason. That is a probe
+    // interrogating a sibling of its subject: the oracle under test is
+    // "does this key EXIST", not "is your header shaped correctly".
+    // DERIVED FROM THE STRING, not from my arithmetic about it: keep the real
+    // 12-char prefix and replace every remaining character, so the result has
+    // the SAME LENGTH and the SAME PREFIX and a wrong secret. My first two
+    // attempts both computed the padding by hand and both produced a
+    // wrong-LENGTH key, which the format regex rejected before the lookup —
+    // the probe was failing upstream of the thing it tests.
+    const wrong = client.plaintext.slice(0, 12) + "z".repeat(client.plaintext.length - 12);
     const r4 = await app.request("/balance", { headers: { authorization: `Bearer ${wrong}` } });
     const r4b = await app.request("/balance", { headers: { authorization: "Bearer sk_live_" + "b".repeat(40) } });
-    check(r4.status === 401 && r4b.status === 401 && (await r4.text()) === (await r4b.text()), "4. wrong secret and unknown prefix both 401 with the SAME body (no oracle)", `${r4.status}/${r4b.status}`);
+    const t4 = await r4.text(); const t4b = await r4b.text();
+    check(r4.status === 401 && r4b.status === 401 && t4 === t4b, "4. wrong secret and unknown prefix both 401 with the SAME body (no oracle)", `${r4.status}/${r4b.status} · wrongSecret=${t4} · unknownPrefix=${t4b}`);
 
     // 5. a key without the scope is refused 403, with the scope named
     const noScope = await issueKey({ clientId: partner.id, name: "no scope", scopes: ["deposits.read"], issuedBy: "verify", issuedVia: "cli" });
@@ -83,14 +96,36 @@ async function main() {
     let refused = false;
     try { await prisma.auditEvent.deleteMany({ where: { keyId: { in: made.keys } } }); } catch (e) { refused = /append-only|restrict_violation/i.test(String((e as Error).message)); }
     check(refused, "9. audit_events refuses DELETE (append-only trigger from the first migration)");
+  } catch (err) {
+    // ⚠️ WITHOUT THIS, A CRASH REPORTS AS A CLEAN ZERO. `process.exit()` in
+    // the `finally` below runs BEFORE the exception propagates and discards
+    // it — the first run of this suite against a real sandbox printed
+    // "0 passed, 0 failed" and exited 0 while main() was throwing on its
+    // second statement. A suite that cannot fail loudly is the defect this
+    // whole repository is about, and it was in the harness rather than the
+    // assertions.
+    fail++;
+    console.error(`\n*** THE SUITE THREW — nothing below this point ran ***\n`, err);
   } finally {
     // audit rows are permanent by design (trigger); keys/clients are not.
     await prisma.clientKey.deleteMany({ where: { id: { in: made.keys } } }).catch(() => undefined);
     await prisma.client.deleteMany({ where: { id: { in: made.clients } } }).catch(() => undefined);
-    const left = (await prisma.clientKey.count({ where: { id: { in: made.keys } } })) + (await prisma.client.count({ where: { id: { in: made.clients } } }));
-    console.log(`\n${pass} passed, ${fail} failed · ${left} key/client rows left behind (counted; audit rows are permanent by design)`);
-    if (left !== 0) fail++;
+    // ⚠️ AN AUDITED ACTOR IS PERMANENTLY UNDELETABLE, AND THAT IS THE DESIGN.
+    // audit_events is append-only (trigger) and its key_id FK is Restrict, so
+    // any key that ever appeared in an audit row pins itself forever — exactly
+    // what SamaPrime records about audit_logs pinning its fixture actors.
+    // So the assertion is NOT "zero residue"; it is "every leftover row is
+    // leftover FOR THAT REASON". A key with no audit rows that survived
+    // deletion is a broken cleanup and still fails.
+    const leftKeys = await prisma.clientKey.findMany({ where: { id: { in: made.keys } }, select: { id: true, _count: { select: { audit: true } } } });
+    const leftClients = await prisma.client.count({ where: { id: { in: made.clients } } });
+    const unexplained = leftKeys.filter((k) => k._count.audit === 0).length;
+    console.log(`\n${pass} passed, ${fail} failed · ${leftKeys.length} key(s) + ${leftClients} client(s) left behind — ${unexplained} UNEXPLAINED (audited actors are undeletable by design; unexplained means the cleanup broke)`);
+    if (unexplained !== 0) fail++;
     await prisma.$disconnect();
+    // ⚠️ ZERO CHECKS IS **VOID**, NEVER A PASS. "0 passed, 0 failed" is the
+    // reassuring shape of a suite that never reached its assertions.
+    if (pass + fail === 0) { console.log("*** VOID — no check executed. This is NOT a pass. ***"); process.exit(1); }
     process.exit(fail === 0 ? 0 : 1);
   }
 }

@@ -102,12 +102,43 @@ async function main() {
     const cancelledHook = await prisma.webhookDelivery.count({ where: { keyId: A.id, eventType: "withdrawal.cancelled" } });
     const bal4 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { allowance: string } };
     check(w3.status === 202 && w3s.status === "cancelled" && w3s.reservation?.reason === "chain_unavailable" && cancelledHook === 1 && bal4.balance.allowance === "3.5", "8c. ChainUnavailable → cancelled with reason chain_unavailable + webhook; allowance restored to 3.5, nothing left pending", `status=${w3s.status} reason=${w3s.reservation?.reason} hooks=${cancelledHook} allowance=${bal4.balance.allowance}`);
-    const replayStatus = (await (await app.request("/withdrawals", { method: "POST", headers: hdr(A.plaintext, `wd3-${RUN}`), body: JSON.stringify({ to: "0x" + "a".repeat(40), amount: "1", chain: "BEP20" }) })).json()) as { withdrawal: { status: string; replayed: boolean } };
-    check(replayStatus.withdrawal.replayed && replayStatus.withdrawal.status === "cancelled", "8d. a replay reports the REAL status (cancelled), not a stale pending", JSON.stringify(replayStatus.withdrawal));
+    // ⚠️ 8d WAS ASSERTING A BEHAVIOUR THAT CONTRADICTS IDEMPOTENCY.
+    // There are TWO replay layers: the middleware (keyed on the
+    // Idempotency-Key) and allowance.reserve (keyed on the same string in
+    // the withdrawals unique). The MIDDLEWARE WINS — it returns the STORED
+    // RESPONSE VERBATIM and the route never runs. That is what an
+    // idempotency key means, and it is what Stripe's own contract does.
+    // So a replay CANNOT report a fresher status: it reports the answer the
+    // first call got. The route's own status re-read (added for
+    // value-model's finding 3) is therefore only reachable when the
+    // idempotency row has expired while the withdrawal row survives.
+    // ⇒ THE CONTRACT, now asserted rather than wished for: a replay is
+    // byte-identical to the original, carries Idempotent-Replayed, and
+    // creates no second row; CURRENT status comes from GET /withdrawals/:id.
+    const replayRes = await app.request("/withdrawals", { method: "POST", headers: hdr(A.plaintext, `wd3-${RUN}`), body: JSON.stringify({ to: "0x" + "a".repeat(40), amount: "1", chain: "BEP20" }) });
+    const replayBody = (await replayRes.json()) as { withdrawal: { id: string; status: string } };
+    const rowCount3 = await prisma.withdrawal.count({ where: { keyId: A.id, idempotencyKey: `wd3-${RUN}` } });
+    check(replayRes.headers.get("idempotent-replayed") === "true" && replayBody.withdrawal.id === w3b.withdrawal.id && rowCount3 === 1,
+      "8d. a replay returns the STORED response verbatim (same id, Idempotent-Replayed) and creates no second row",
+      `id ${replayBody.withdrawal.id === w3b.withdrawal.id ? "same" : "DIFFERENT"} · replayed=${replayRes.headers.get("idempotent-replayed")} · rows=${rowCount3}`);
+    const liveStatus = (await (await app.request(`/withdrawals/${w3b.withdrawal.id}`, { headers: hdr(A.plaintext) })).json()) as { withdrawal: { status: string } };
+    check(liveStatus.withdrawal.status === "cancelled" && replayBody.withdrawal.status === "pending",
+      "8e. and the CURRENT status comes from GET /withdrawals/:id (cancelled) while the replayed body keeps the original (pending) — the client must not read a replay as live state",
+      `GET=${liveStatus.withdrawal.status} replayBody=${replayBody.withdrawal.status}`);
     // 8b. CONTROL: the balance number is not clamped — force withdrawn > received in the DB and read
     await prisma.withdrawal.create({ data: { keyId: A.id, toAddress: "0x" + "f".repeat(40), chain: "BEP20", amount: new Prisma.Decimal("20"), status: "sent", idempotencyKey: `forced-${RUN}` } });
     const bal3 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { allowance: string } };
     check(bal3.balance.allowance === "-16.5", "8b. CONTROL — /balance never clamps: a forced over-send reads -16.5", bal3.balance.allowance);
+  } catch (err) {
+    // ⚠️ WITHOUT THIS, A CRASH REPORTS AS A CLEAN ZERO. `process.exit()` in
+    // the `finally` below runs BEFORE the exception propagates and discards
+    // it — the first run of this suite against a real sandbox printed
+    // "0 passed, 0 failed" and exited 0 while main() was throwing on its
+    // second statement. A suite that cannot fail loudly is the defect this
+    // whole repository is about, and it was in the harness rather than the
+    // assertions.
+    fail++;
+    console.error(`\n*** THE SUITE THREW — nothing below this point ran ***\n`, err);
   } finally {
     await prisma.webhookDelivery.deleteMany({ where: { keyId: { in: made.keys } } }).catch(() => undefined);
     await prisma.reservation.deleteMany({ where: { keyId: { in: made.keys } } }).catch(() => undefined);
@@ -120,7 +151,10 @@ async function main() {
     const left = (await prisma.deposit.count({ where: { keyId: { in: made.keys } } })) + (await prisma.withdrawal.count({ where: { keyId: { in: made.keys } } })) + (await prisma.address.count({ where: { keyId: { in: made.keys } } })) + (await prisma.clientKey.count({ where: { id: { in: made.keys } } })) + (await prisma.client.count({ where: { id: { in: made.clients } } }));
     console.log(`\n${pass} passed, ${fail} failed · ${left} left behind (counted; audit rows permanent by design)`);
     if (left !== 0) fail++;
-    await prisma.$disconnect(); process.exit(fail === 0 ? 0 : 1);
+    await prisma.$disconnect(); // ⚠️ ZERO CHECKS IS **VOID**, NEVER A PASS. "0 passed, 0 failed" is the
+    // reassuring shape of a suite that never reached its assertions.
+    if (pass + fail === 0) { console.log("*** VOID — no check executed. This is NOT a pass. ***"); process.exit(1); }
+    process.exit(fail === 0 ? 0 : 1);
   }
 }
 main().catch((e) => { console.error("verify-routes-end-to-end crashed:", e); process.exit(1); });
