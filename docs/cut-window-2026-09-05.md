@@ -52,17 +52,43 @@ what a scan cursor is FOR.
 
 ### 3.1 `SEED_ENCRYPTION_KEY` CANNOT LEAVE SAMAPRIME
 
-It has **three consumers**, and only one of them is moving:
+⚠️ ***THIS SECTION FIRST SAID "THREE CONSUMERS, ONE MOVING". THAT WAS AN
+UNDERCOUNT AND IT IS CORRECTED HERE RATHER THAN QUIETLY WIDENED*** — the
+coordinator challenged the number and it did not survive. **13 files
+reference the key; SIX are inside `lib/crypto` and move, SEVEN STAY.**
+MEASURED 2026-09-05 by me, `grep -rl 'SEED_ENCRYPTION_KEY\|getSeedEncryptionKey'`
+over `lib/` and `app/`, with a control (the same probe finds `DATABASE_URL`):
 
-    lib/crypto/seed/*            the master seed at rest        MOVES to SamaPay
-    lib/vouchers/code.ts:33      getSeedEncryptionKey(...)      STAYS
-    lib/admin/provider-config-crypto.ts   ProviderConfig secrets STAYS
+    MOVES — inside lib/crypto (6)
+      config.ts · errors.ts · seed/{cli-generate,master-seed,passphrase,vault}.ts
+
+    *** STAYS — outside lib/crypto (7) ***
+      lib/vouchers/code.ts                      voucher codes
+      lib/auth/totp.ts                          2FA SECRETS
+      lib/cards/card-crypto.ts                  CARD DATA AT REST
+      lib/admin/provider-config-crypto.ts       ProviderConfig secrets
+      lib/db/merchant-provider-credentials.ts   merchant credentials
+      lib/providers/merchant-source/sync.ts     the mismatch-throw path
+      lib/providers/technorex-client.ts         (the seventh — not in the
+                                                 first corrected list either)
 
 ***SO "ONE PRIVATE KEY, ONE PLACE" IS TRUE OF THE MASTER SEED AND FALSE OF
 THE ENCRYPTION KEY.*** A cut that removes `SEED_ENCRYPTION_KEY` from
-SamaPrime's `.env` breaks voucher codes and every stored provider
-credential — silently, at the next decrypt, not at boot. **The env var
-stays in both services; only the seed moves.**
+SamaPrime's `.env` breaks **2FA enrolment, card decryption, voucher codes,
+provider secrets and merchant credentials**. **The env var stays in both
+services; only the seed moves.**
+
+⚠️ **AND THE FAILURE MODE IS WORSE THAN "NOT AT BOOT" — IT IS SCATTERED.**
+`lib/vouchers/code.ts` states the security argument itself: the key lives
+in `.env` and never in the database, so *"a stolen dump is inert"*. The
+consequence is that a missing key breaks nothing at startup and everything
+later, ONE FEATURE AT A TIME: a customer's 2FA fails on Tuesday, a card
+page throws on Wednesday, a voucher cannot be reprinted on Thursday — at
+different times, to different people, **with nothing connecting them.**
+
+Blast radius in rows, production: `provider_configs` with a stored secret
+2 · `vouchers` 2 · `crypto_addresses` 194. *(The row counts are the
+coordinator's measurement, relayed; the file list above is mine.)*
 
 ### 3.2 THE SEED IS COPIED, NOT MOVED, AND NOT DELETED IN THE WINDOW
 
