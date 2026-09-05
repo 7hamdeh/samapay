@@ -64,9 +64,12 @@ number is only trustworthy BECAUSE it was worked for:
           "never touches SEED_ENCRYPTION_KEY-adjacent code". `grep -rl`
           counted a sentence that says "I DO NOT USE THIS" as a use.
     6   the coordinator's — caught that
-    5   this pass — `merchant-source/sync.ts` is also a MENTION (two
+    5   my third pass — `merchant-source/sync.ts` is also a MENTION (two
         comments about a mismatch throw); it breaks transitively through
         merchant credentials, not as a holder of its own.
+    13  the coordinator's fourth — the right question, asked of the
+        AEAD helper's DEPENDENTS rather than of the key's mentions.
+        *** THE REFRAME FOUND THE NUMBER; THE NUMBER WAS NOT MINE. ***
 
 ***AND THE STRUCTURE IS WORTH MORE THAN ANY OF THOSE NUMBERS.*** MEASURED
 by import, not by mention — `grep -rln 'import.*getSeedEncryptionKey'`:
@@ -81,10 +84,36 @@ by import, not by mention — `grep -rln 'import.*getSeedEncryptionKey'`:
       lib/db/merchant-provider-credentials.ts merchant credentials
                                               (and sync.ts through it)
 
-⇒ **THE MIGRATION SURFACE IS TWO FILES, AND THE BLAST RADIUS IS FIVE
-FEATURES.** Those are different numbers answering different questions, and
+⇒ **THE MIGRATION SURFACE IS TWO FILES. THE BLAST RADIUS IS THIRTEEN CALL
+SITES.** Those are different numbers answering different questions, and
 conflating them is what produced every wrong count above. *Whoever does
-the cut touches two files; whoever gets paged touches five features.*
+the cut touches two files; whoever gets paged touches thirteen.*
+
+⚠️ ***AND MY "FIVE FEATURES" WAS THE LAST WRONG NUMBER IN THIS SECTION.***
+The reframe was right and its second half was too small. MEASURED — files
+importing the AEAD helper directly (CONTROL: the same probe returns 133 for
+`@/lib/db/client`, so it reads this tree):
+
+    admin provider-config screen + actions   2   app/admin/providers-config, lib/admin/actions
+    vouchers                                 1
+    OUTBOUND WEBHOOKS                        4   lib/webhooks/{deliver,dispatcher},
+                                                 lib/actions/webhooks, app/api/v1/webhooks
+    2FA SECRETS                              1   lib/auth/totp
+    CARDS                                    2   lib/cards/card-crypto, providers/card/kripicard
+    MERCHANT CREDENTIALS                     1   lib/db/merchant-provider-credentials
+    SMS (5sim)                               1   lib/providers/fivesim
+    SMM                                      1   lib/providers/smm/registry
+                                            13
+
+***SO REMOVING THE KEY WOULD ALSO STOP SMS PURCHASES, SMM ORDERS, CARD
+ISSUANCE, AND EVERY OUTBOUND WEBHOOK TO EVERY MERCHANT*** — each reads a
+provider credential through that one helper. Those are not incidental
+screens; they are most of the product's outbound integrations.
+
+**A SECOND HOP EXISTS AND IS NOT ENUMERATED HERE:** 19 further files import
+`card-crypto` or `merchant-provider-credentials`. *Stated rather than
+counted, because the decision does not need it — nothing changes about
+"the key stays" once the first hop already spans the integrations.*
 
 ***SO "ONE PRIVATE KEY, ONE PLACE" IS TRUE OF THE MASTER SEED AND FALSE OF
 THE ENCRYPTION KEY.*** A cut that removes `SEED_ENCRYPTION_KEY` from
