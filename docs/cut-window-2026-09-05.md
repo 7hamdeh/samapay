@@ -52,30 +52,44 @@ what a scan cursor is FOR.
 
 ### 3.1 `SEED_ENCRYPTION_KEY` CANNOT LEAVE SAMAPRIME
 
-⚠️ ***THIS SECTION FIRST SAID "THREE CONSUMERS, ONE MOVING". THAT WAS AN
-UNDERCOUNT AND IT IS CORRECTED HERE RATHER THAN QUIETLY WIDENED*** — the
-coordinator challenged the number and it did not survive. **13 files
-reference the key; SIX are inside `lib/crypto` and move, SEVEN STAY.**
-MEASURED 2026-09-05 by me, `grep -rl 'SEED_ENCRYPTION_KEY\|getSeedEncryptionKey'`
-over `lib/` and `app/`, with a control (the same probe finds `DATABASE_URL`):
+⚠️ ***THE COUNT IN THIS SECTION WENT 3 → 6 → 7 → 6 → AND THE COUNT WAS
+NEVER THE ANSWER.*** Four passes by two sessions, each re-measuring rather
+than accepting the last. The struck history is kept because the final
+number is only trustworthy BECAUSE it was worked for:
 
-    MOVES — inside lib/crypto (6)
-      config.ts · errors.ts · seed/{cli-generate,master-seed,passphrase,vault}.ts
+    3   mine, first pass — an undercount
+    6   the coordinator's — caught it
+    7   mine, second pass — added `lib/providers/technorex-client.ts`
+        ⇒ ***FALSE POSITIVE. Its ONE occurrence is a DISCLAIMER:***
+          "never touches SEED_ENCRYPTION_KEY-adjacent code". `grep -rl`
+          counted a sentence that says "I DO NOT USE THIS" as a use.
+    6   the coordinator's — caught that
+    5   this pass — `merchant-source/sync.ts` is also a MENTION (two
+        comments about a mismatch throw); it breaks transitively through
+        merchant credentials, not as a holder of its own.
 
-    *** STAYS — outside lib/crypto (7) ***
-      lib/vouchers/code.ts                      voucher codes
-      lib/auth/totp.ts                          2FA SECRETS
-      lib/cards/card-crypto.ts                  CARD DATA AT REST
-      lib/admin/provider-config-crypto.ts       ProviderConfig secrets
-      lib/db/merchant-provider-credentials.ts   merchant credentials
-      lib/providers/merchant-source/sync.ts     the mismatch-throw path
-      lib/providers/technorex-client.ts         (the seventh — not in the
-                                                 first corrected list either)
+***AND THE STRUCTURE IS WORTH MORE THAN ANY OF THOSE NUMBERS.*** MEASURED
+by import, not by mention — `grep -rln 'import.*getSeedEncryptionKey'`:
+
+    ONLY TWO FILES OUTSIDE lib/crypto TOUCH THE KEY DIRECTLY
+      lib/admin/provider-config-crypto.ts   the AEAD helper
+      lib/vouchers/code.ts                  voucher codes
+
+    AND THREE MORE HANG OFF THAT ONE HELPER
+      lib/auth/totp.ts                        2FA SECRETS
+      lib/cards/card-crypto.ts                CARD DATA AT REST
+      lib/db/merchant-provider-credentials.ts merchant credentials
+                                              (and sync.ts through it)
+
+⇒ **THE MIGRATION SURFACE IS TWO FILES, AND THE BLAST RADIUS IS FIVE
+FEATURES.** Those are different numbers answering different questions, and
+conflating them is what produced every wrong count above. *Whoever does
+the cut touches two files; whoever gets paged touches five features.*
 
 ***SO "ONE PRIVATE KEY, ONE PLACE" IS TRUE OF THE MASTER SEED AND FALSE OF
 THE ENCRYPTION KEY.*** A cut that removes `SEED_ENCRYPTION_KEY` from
-SamaPrime's `.env` breaks **2FA enrolment, card decryption, voucher codes,
-provider secrets and merchant credentials**. **The env var stays in both
+SamaPrime's `.env` breaks **all five: 2FA enrolment, card decryption,
+voucher codes, provider secrets and merchant credentials**. **The env var stays in both
 services; only the seed moves.**
 
 ⚠️ **AND THE FAILURE MODE IS WORSE THAN "NOT AT BOOT" — IT IS SCATTERED.**
