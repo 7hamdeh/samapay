@@ -471,11 +471,27 @@ New slices, before S5 and S7 in dependency order:
   txHash, so nothing is lost). Two red-first assertions, each naming the
   mechanism that refused: a SYP confirmation must not move the USDT
   allowance; and `verify()` called TWICE for one Sham Cash payment must
-  write ONE row, with the second refused by the INDEX (a
-  `PrismaClientKnownRequestError` P2002 surfacing as the application's own
-  `already_recorded`), proven by deleting the application-level check and
-  watching the suite stay green for the right reason. C3 must not land
-  before C2 does, or its double-credit protection is caller discipline.
+  write ONE row. **Two layers, two DISTINCT outcomes, on purpose:** the
+  application pre-check (`SELECT` before insert) refuses with
+  `already_recorded`; the index refuses with a DIFFERENT code,
+  `duplicate_event`, carrying the constraint name (`payments_channel_
+  external_ref_key`) from the driver error in its detail. P2002 is NOT
+  mapped onto `already_recorded` — the coordinator's catch, 2026-09-06: if
+  both layers produce one observable, deleting the pre-check leaves the
+  suite green for the other reason and the mutation cannot say which
+  layer held (the voucher-path incident in SamaPrime's CLAUDE.md, where 25
+  assertions survived a deleted guard until the losers were made to throw
+  a distinguishable error). So the mutation is decisive: delete the
+  pre-check → the sequential test goes RED naming `duplicate_event`;
+  restore it → `already_recorded`. And a CONCURRENT test (two `verify()`
+  calls racing) must see exactly one row and, for the loser, `duplicate_
+  event` — because under a race the pre-check LOSES (both callers pass it)
+  and only the index holds. Neither layer is dropped: the pre-check gives
+  ordinary retries a clean error without a failed transaction; the index is
+  the guarantee. Defence in depth makes the mutation more necessary, not
+  less — either layer can rot invisibly while the other carries the
+  outcome. C3 must not land before C2 does, or its double-credit
+  protection is caller discipline.
   This is a migration on a database that does not exist in production yet
   — EXPAND, rides with the first production migration.
 - **C3 — `shamcash` channel = the dahabi verifier moved behind C0's
