@@ -21,7 +21,7 @@ datasource db {
 // and is retired: a SamaPrime merchant is not a client of anything.
 enum ClientKind {
   platform // SamaPrime itself — one client, one key
-  partner  // an external site (dahabi, others) that registers on SamaPay's own site
+  partner // an external site (dahabi, others) that registers on SamaPay's own site
 }
 
 enum KeyEnvironment {
@@ -87,33 +87,33 @@ model Client {
 // key, so a row lock would serialise every withdrawal against every API
 // call the same client makes. Do not "simplify" it.
 model ClientKey {
-  id        String  @id @default(cuid())
-  clientId  String  @map("client_id")
-  client    Client  @relation(fields: [clientId], references: [id], onDelete: Restrict)
-  name      String
-  keyPrefix String  @unique @map("key_prefix") // first 12 chars of the plaintext key — the lookup
-  keyHash   String  @map("key_hash") // argon2 of the FULL plaintext key; the key is never stored
-  keyLast4  String  @map("key_last4")
-  scopes    String[] // addresses.write deposits.read withdrawals.write withdrawals.read balance.read keys.issue
-  environment KeyEnvironment @default(live)
-  rpsLimit     Int @default(10) @map("rps_limit")
-  monthlyLimit Int @default(100000) @map("monthly_limit")
-  active     Boolean   @default(true)
-  lastUsedAt DateTime? @map("last_used_at")
-  lastUsedIp String?   @map("last_used_ip")
+  id             String         @id @default(cuid())
+  clientId       String         @map("client_id")
+  client         Client         @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  name           String
+  keyPrefix      String         @unique @map("key_prefix") // first 12 chars of the plaintext key — the lookup
+  keyHash        String         @map("key_hash") // argon2 of the FULL plaintext key; the key is never stored
+  keyLast4       String         @map("key_last4")
+  scopes         String[] // addresses.write deposits.read withdrawals.write withdrawals.read balance.read keys.issue
+  environment    KeyEnvironment @default(live)
+  rpsLimit       Int            @default(10) @map("rps_limit")
+  monthlyLimit   Int            @default(100000) @map("monthly_limit")
+  active         Boolean        @default(true)
+  lastUsedAt     DateTime?      @map("last_used_at")
+  lastUsedIp     String?        @map("last_used_ip")
   // Keys come only from Ibrahim's hand or a SamaPrime admin action. Recorded
   // on the row so the audit of "who can move money" is one query.
-  issuedBy  String @map("issued_by") // 'ibrahim' | 'samaprime_admin:<userId>'
-  issuedVia String @map("issued_via") // 'cli' | 'samaprime_admin_action'
+  issuedBy       String         @map("issued_by") // 'ibrahim' | 'samaprime_admin:<userId>'
+  issuedVia      String         @map("issued_via") // 'cli' | 'samaprime_admin_action'
   // v2 rotation: the key that inherits this key's addresses and allowance.
   // Column in v1 so rotation is a data change, not a schema change.
-  successorKeyId String? @map("successor_key_id")
-  revokedAt     DateTime? @map("revoked_at")
-  revokedReason String?   @map("revoked_reason")
+  successorKeyId String?        @map("successor_key_id")
+  revokedAt      DateTime?      @map("revoked_at")
+  revokedReason  String?        @map("revoked_reason")
   // Per-client-key webhook target and secret (secret AEAD-encrypted at rest).
-  webhookUrl    String? @map("webhook_url")
-  webhookSecret String? @map("webhook_secret")
-  createdAt DateTime @default(now()) @map("created_at")
+  webhookUrl     String?        @map("webhook_url")
+  webhookSecret  String?        @map("webhook_secret")
+  createdAt      DateTime       @default(now()) @map("created_at")
 
   addresses    Address[]
   deposits     Deposit[]
@@ -131,18 +131,18 @@ model ClientKey {
 // one key and one reference for life. That is what makes "how much came
 // in for this key" answerable — the question SamaPrime could not answer.
 model Address {
-  id        String  @id @default(cuid())
-  keyId     String  @map("key_id")
-  key       ClientKey @relation(fields: [keyId], references: [id], onDelete: Restrict)
-  reference String  // the client's opaque string (its customer id, order id)
-  chain     Chain
-  address   String
-  derivationIndex Int @map("derivation_index")
+  id              String    @id @default(cuid())
+  keyId           String    @map("key_id")
+  key             ClientKey @relation(fields: [keyId], references: [id], onDelete: Restrict)
+  reference       String // the client's opaque string (its customer id, order id)
+  chain           Chain
+  address         String
+  derivationIndex Int       @map("derivation_index")
   // 192 legacy SamaPrime addresses are imported under the platform key at
   // cutover with allowance = none; this marks them so nothing ever counts
   // their history as an allowance by accident.
-  legacyImport Boolean @default(false) @map("legacy_import")
-  createdAt DateTime @default(now()) @map("created_at")
+  legacyImport    Boolean   @default(false) @map("legacy_import")
+  createdAt       DateTime  @default(now()) @map("created_at")
 
   deposits Deposit[]
 
@@ -170,19 +170,19 @@ model Address {
 //     guards with one message are one guard, so they surface DISTINCT
 //     outcomes.
 model Deposit {
-  id            String   @id @default(cuid())
-  keyId         String   @map("key_id")
-  key           ClientKey @relation(fields: [keyId], references: [id], onDelete: Restrict)
-  addressId     String   @map("address_id")
-  address       Address  @relation(fields: [addressId], references: [id], onDelete: Restrict)
+  id            String        @id @default(cuid())
+  keyId         String        @map("key_id")
+  key           ClientKey     @relation(fields: [keyId], references: [id], onDelete: Restrict)
+  addressId     String        @map("address_id")
+  address       Address       @relation(fields: [addressId], references: [id], onDelete: Restrict)
   chain         Chain
-  txHash        String   @map("tx_hash")
-  amount        Decimal  @db.Decimal(18, 6)
-  confirmations Int      @default(0)
+  txHash        String        @map("tx_hash")
+  amount        Decimal       @db.Decimal(18, 6)
+  confirmations Int           @default(0)
   status        DepositStatus @default(detected)
-  blockNumber   BigInt?  @map("block_number")
-  detectedAt    DateTime @default(now()) @map("detected_at")
-  creditedAt    DateTime? @map("credited_at") // set exactly once, on confirmed
+  blockNumber   BigInt?       @map("block_number")
+  detectedAt    DateTime      @default(now()) @map("detected_at")
+  creditedAt    DateTime?     @map("credited_at") // set exactly once, on confirmed
 
   @@unique([chain, txHash])
   @@index([keyId, status])
@@ -193,22 +193,22 @@ model Deposit {
 // ELSE. There is no second amount anywhere (reservations carry none) — two
 // calculators is the display-vs-charge divergence shape.
 model Withdrawal {
-  id             String  @id @default(cuid())
-  keyId          String  @map("key_id")
-  key            ClientKey @relation(fields: [keyId], references: [id], onDelete: Restrict)
+  id             String           @id @default(cuid())
+  keyId          String           @map("key_id")
+  key            ClientKey        @relation(fields: [keyId], references: [id], onDelete: Restrict)
   reference      String?
-  toAddress      String  @map("to_address")
+  toAddress      String           @map("to_address")
   chain          Chain
-  amount         Decimal @db.Decimal(18, 6)
-  fee            Decimal @default(0) @db.Decimal(18, 6)
+  amount         Decimal          @db.Decimal(18, 6)
+  fee            Decimal          @default(0) @db.Decimal(18, 6)
   status         WithdrawalStatus @default(pending)
-  idempotencyKey String  @map("idempotency_key")
-  txHash         String? @map("tx_hash")
+  idempotencyKey String           @map("idempotency_key")
+  txHash         String?          @map("tx_hash")
   // markRefunded's on-chain-absence proof lives beside the transition.
   evidence       Json?
-  requestedAt    DateTime  @default(now()) @map("requested_at")
-  sentAt         DateTime? @map("sent_at")
-  resolvedAt     DateTime? @map("resolved_at")
+  requestedAt    DateTime         @default(now()) @map("requested_at")
+  sentAt         DateTime?        @map("sent_at")
+  resolvedAt     DateTime?        @map("resolved_at")
 
   reservation Reservation?
 
@@ -221,14 +221,14 @@ model Withdrawal {
 // carries NO amount of its own, never enters any sum. release/expire flip
 // the withdrawal's status and stamp this row.
 model Reservation {
-  id           String  @id @default(cuid())
-  keyId        String  @map("key_id")
-  key          ClientKey @relation(fields: [keyId], references: [id], onDelete: Restrict)
-  withdrawalId String  @unique @map("withdrawal_id")
-  withdrawal   Withdrawal @relation(fields: [withdrawalId], references: [id], onDelete: Restrict)
+  id           String            @id @default(cuid())
+  keyId        String            @map("key_id")
+  key          ClientKey         @relation(fields: [keyId], references: [id], onDelete: Restrict)
+  withdrawalId String            @unique @map("withdrawal_id")
+  withdrawal   Withdrawal        @relation(fields: [withdrawalId], references: [id], onDelete: Restrict)
   status       ReservationStatus @default(held)
-  createdAt    DateTime  @default(now()) @map("created_at")
-  releasedAt   DateTime? @map("released_at")
+  createdAt    DateTime          @default(now()) @map("created_at")
+  releasedAt   DateTime?         @map("released_at")
   reason       String?
 
   @@index([keyId, status])
@@ -244,16 +244,16 @@ enum IdempotencyStatus {
 // Scope is (key, Idempotency-Key) — never global. The SamaPrime engine's
 // contract: fast claim row, work outside the transaction, write back.
 model IdempotencyKey {
-  id           String  @id @default(cuid())
-  keyId        String  @map("key_id")
-  key          ClientKey @relation(fields: [keyId], references: [id], onDelete: Restrict)
-  idemKey      String  @map("idem_key")
-  requestHash  String  @map("request_hash") @db.Char(64)
+  id           String            @id @default(cuid())
+  keyId        String            @map("key_id")
+  key          ClientKey         @relation(fields: [keyId], references: [id], onDelete: Restrict)
+  idemKey      String            @map("idem_key")
+  requestHash  String            @map("request_hash") @db.Char(64)
   status       IdempotencyStatus @default(processing)
-  statusCode   Int?    @map("status_code")
-  responseBody Json?   @map("response_body")
-  lockedAt     DateTime  @default(now()) @map("locked_at")
-  expiresAt    DateTime  @map("expires_at")
+  statusCode   Int?              @map("status_code")
+  responseBody Json?             @map("response_body")
+  lockedAt     DateTime          @default(now()) @map("locked_at")
+  expiresAt    DateTime          @map("expires_at")
 
   @@unique([keyId, idemKey])
   @@map("idempotency_keys")
@@ -267,19 +267,19 @@ enum DeliveryStatus {
 }
 
 model WebhookDelivery {
-  id         String  @id @default(cuid())
-  keyId      String  @map("key_id")
-  key        ClientKey @relation(fields: [keyId], references: [id], onDelete: Restrict)
-  eventType  String  @map("event_type") // deposit.confirmed | withdrawal.sent | withdrawal.failed
-  eventId    String  @map("event_id")
-  payload    Json
-  attempts   Int     @default(0)
-  status     DeliveryStatus @default(pending)
-  nextAttemptAt DateTime? @map("next_attempt_at")
-  lastStatusCode Int? @map("last_status_code")
-  lastError  String? @map("last_error")
-  createdAt  DateTime @default(now()) @map("created_at")
-  deliveredAt DateTime? @map("delivered_at")
+  id             String         @id @default(cuid())
+  keyId          String         @map("key_id")
+  key            ClientKey      @relation(fields: [keyId], references: [id], onDelete: Restrict)
+  eventType      String         @map("event_type") // deposit.confirmed | withdrawal.sent | withdrawal.failed
+  eventId        String         @map("event_id")
+  payload        Json
+  attempts       Int            @default(0)
+  status         DeliveryStatus @default(pending)
+  nextAttemptAt  DateTime?      @map("next_attempt_at")
+  lastStatusCode Int?           @map("last_status_code")
+  lastError      String?        @map("last_error")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  deliveredAt    DateTime?      @map("delivered_at")
 
   @@index([status, nextAttemptAt])
   @@map("webhook_deliveries")
@@ -288,18 +288,37 @@ model WebhookDelivery {
 // Hash-chained, append-only (trigger in the first migration). Every state
 // change: who (client key or admin or observer), what, when, on which row.
 model AuditEvent {
-  id        String   @id @default(cuid())
-  at        DateTime @default(now())
-  keyId     String?  @map("key_id")
-  key       ClientKey? @relation(fields: [keyId], references: [id], onDelete: Restrict)
-  actor     String   // 'client' | 'admin:<who>' | 'observer' | 'sender' | 'reconciler'
-  action    String   // address.issued deposit.detected deposit.confirmed withdrawal.requested ... key.issued key.revoked
-  subjectId String?  @map("subject_id")
-  idempotencyKey String? @map("idempotency_key")
-  params    Json?
-  prevHash  String   @map("prev_hash") @db.Char(64)
-  hash      String   @unique @db.Char(64)
+  id             String     @id @default(cuid())
+  at             DateTime   @default(now())
+  keyId          String?    @map("key_id")
+  key            ClientKey? @relation(fields: [keyId], references: [id], onDelete: Restrict)
+  actor          String // 'client' | 'admin:<who>' | 'observer' | 'sender' | 'reconciler'
+  action         String // address.issued deposit.detected deposit.confirmed withdrawal.requested ... key.issued key.revoked
+  subjectId      String?    @map("subject_id")
+  idempotencyKey String?    @map("idempotency_key")
+  params         Json?
+  prevHash       String     @map("prev_hash") @db.Char(64)
+  hash           String     @unique @db.Char(64)
 
   @@index([keyId, at])
   @@map("audit_events")
+}
+
+/// The seed vault's home. One row, id=1, mirroring SamaPrime's CryptoConfig
+/// so the window's step 4 ("seed COPIED into SamaPay's vault") is a copy of a
+/// blob rather than a re-encryption.
+///
+/// ⚠️ THE CIPHERTEXT IN THIS TABLE IS ONLY DECRYPTABLE BY CODE THAT KEEPS TWO
+/// STRINGS BYTE-IDENTICAL — the AES-GCM AAD "salamwallet-vault-v1" and the
+/// HKDF info "salamwallet-vault-key-v1". They read like brand names in a repo
+/// called SamaPay and they are cryptographic INPUTS with no recovery path.
+/// See SamaPrime CLAUDE.md RULE 2 and scripts/verify-vault-constants.ts here.
+model CryptoConfig {
+  id                  Int      @id @default(1)
+  encryptedMasterSeed String   @map("encrypted_master_seed")
+  seedFingerprint     String   @map("seed_fingerprint")
+  vaultCiphertext     String?  @map("vault_ciphertext")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  @@map("crypto_config")
 }
