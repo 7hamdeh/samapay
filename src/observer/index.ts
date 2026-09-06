@@ -25,11 +25,20 @@ export interface ObserveResult { seen: number; recorded: number; alreadyKnown: n
 /** One tick for one chain. Safe to call again with the same transfers: nothing double-writes. */
 export async function observeChain(chain: Chain, observer: ChainObserver): Promise<ObserveResult> {
   const addresses = await prisma.address.findMany({ where: { chain }, select: { id: true, address: true, keyId: true } });
-  const byAddress = new Map(addresses.map((a) => [a.address.toLowerCase(), a]));
-  const transfers = await observer.scan(chain, new Set(byAddress.keys()));
+  // ⚠️ CASE IS NOT A FREE NORMALISATION ACROSS CHAINS.
+  // BEP20 addresses are hex and case-insensitive (the mixed case is only an
+  // EIP-55 checksum). TRON addresses are BASE58 and CASE-SIGNIFICANT —
+  // lowercasing one produces a string that is not an address at all. This
+  // code lowercased both and the Tron adapter answered "Invalid address
+  // provided" on every tick, which is the good outcome; the bad one is a
+  // chain where the corrupted form is still VALID and simply matches nothing.
+  const key = (a: string) => (chain === "BEP20" ? a.toLowerCase() : a);
+  const byAddress = new Map(addresses.map((a) => [key(a.address), a]));
+  // The adapter receives addresses EXACTLY as stored, never a normalised form.
+  const transfers = await observer.scan(chain, new Set(addresses.map((a) => a.address)));
   const result: ObserveResult = { seen: transfers.length, recorded: 0, alreadyKnown: 0, confirmed: 0, unknownAddress: 0 };
   for (const t of transfers) {
-    const outcome = await recordTransfer(chain, t, byAddress.get(t.toAddress.toLowerCase()));
+    const outcome = await recordTransfer(chain, t, byAddress.get(key(t.toAddress)));
     result[outcome]++;
   }
   result.confirmed += await promoteConfirmed(chain, observer);

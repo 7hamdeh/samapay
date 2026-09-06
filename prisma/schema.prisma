@@ -343,3 +343,28 @@ model ScanCursor {
 
   @@map("scan_cursors")
 }
+
+/// A range the observer did NOT scan, recorded rather than inferred.
+///
+/// ⚠️ PORTED FROM SamaPrime's CryptoScanGap, WHICH EXISTS BECAUSE ITS CURSOR
+/// WENT DARK TWICE IN TWO DAYS — 947 blocks on a TronGrid 429, 13,319 when all
+/// three BSC endpoints rate-limited at once. Nothing was lost either time, and
+/// that was established by RE-SCANNING rather than assumed.
+///
+/// The cursor already protects the MONEY: it only ever advances to what was
+/// actually scanned, so a provider outage stalls it rather than skipping past.
+/// This table protects the DIAGNOSIS — without it, "the deposit was missed" and
+/// "the deposit never arrived" produce identical evidence.
+model ScanGap {
+  id        String    @id @default(cuid())
+  chain     Chain
+  fromBlock BigInt    @map("from_block")
+  toBlock   BigInt    @map("to_block")
+  reason    String
+  evidence  String?
+  closedAt  DateTime? @map("closed_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([chain, closedAt])
+  @@map("scan_gaps")
+}

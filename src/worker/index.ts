@@ -22,6 +22,9 @@ import { expire } from "@/allowance/index.js";
 import { submitForSending } from "@/sender/index.js";
 import { attemptDelivery, enqueue } from "@/webhooks/dispatch.js";
 import { chainAdapters } from "@/chain/registry.js";
+import { installLiveChainAdapters } from "@/chain/live.js";
+import { observeChain } from "@/observer/index.js";
+import type { Chain } from "@prisma/client";
 import { reconcileOnce } from "./reconciler.js";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info", name: "samapay-worker" });
@@ -29,6 +32,38 @@ export const GRACE_MS = 5_000;                 // a route's own submit gets this
 export const GIVE_UP_MS = 30 * 60_000;         // 30 min of failing to submit = expire, visibly
 export const TICK_MS = 5_000;
 const BATCH = 50;
+// ⚠️ THE OBSERVER RUNS ON ITS OWN CADENCE, NOT THE 5s TICK. Every observe pass
+// is chain RPC; at TICK_MS it would hammer the endpoint for nothing. A deposit
+// is not urgent to the second — it needs confirmations anyway.
+export const OBSERVE_EVERY_MS = 30_000;
+const OBSERVED_CHAINS: Chain[] = ["TRC20", "BEP20"];
+let lastObserve = 0;
+
+/**
+ * ⚠️ THIS WAS MISSING AND IT IS WHY THE WATCHER DID NOT EXIST.
+ * The adapters were ported and wired (38df555) and `installLiveChainAdapters()`
+ * was written — and NOTHING CALLED IT, and nothing called observeChain either.
+ * `tsc` is perfectly happy with a function nobody calls, and pm2 reported the
+ * process "online, 0 restarts" while it observed nothing at all. A process
+ * existing is not a process doing the job.
+ */
+async function observeDueOnce(now: number): Promise<Record<string, number> | null> {
+  if (now - lastObserve < OBSERVE_EVERY_MS) return null;
+  lastObserve = now;
+  const out: Record<string, number> = {};
+  for (const chain of OBSERVED_CHAINS) {
+    // A chain that has no addresses registered costs one cheap DB read and stops.
+    const watched = await prisma.address.count({ where: { chain } });
+    if (watched === 0) continue;
+    try {
+      const r = await observeChain(chain, chainAdapters().observer);
+      out[`${chain}_seen`] = r.seen; out[`${chain}_recorded`] = r.recorded; out[`${chain}_confirmed`] = r.confirmed;
+    } catch (e) {
+      log.error({ chain, err: e instanceof Error ? `${e.name}: ${e.message}` : String(e) }, "observe failed");
+    }
+  }
+  return Object.keys(out).length ? out : null;
+}
 
 export async function submitPendingOnce(now = new Date()): Promise<{ submitted: number; expired: number }> {
   const stale = new Date(now.getTime() - GRACE_MS);
@@ -82,9 +117,16 @@ async function loop(): Promise<never> {
       const b = await deliverDueOnce();
       const c = await confirmOutgoingOnce();
       const d = await reconcileOnce();
+      const o = await observeDueOnce(Date.now());
+      if (o) log.info({ observe: o }, "observe tick");
       if (a.submitted || a.expired || b.attempted || c.confirmed || d.refunded || d.present_on_chain) log.info({ ...a, ...b, ...c, reconcile: d }, "tick");
     } catch (e) { log.error({ err: e instanceof Error ? `${e.name}: ${e.message}` : String(e) }, "tick failed"); }
     await new Promise((r) => setTimeout(r, TICK_MS));
   }
 }
-if (process.argv[1]?.endsWith("worker/index.ts") || process.argv[1]?.endsWith("worker/index.js")) void loop();
+if (process.argv[1]?.endsWith("worker/index.ts") || process.argv[1]?.endsWith("worker/index.js")) {
+  // Swap the four refusing stubs for the real adapters BEFORE the loop starts.
+  installLiveChainAdapters();
+  log.info({ chains: OBSERVED_CHAINS, everyMs: OBSERVE_EVERY_MS }, "observer armed");
+  void loop();
+}
