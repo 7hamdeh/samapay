@@ -175,3 +175,71 @@ Against `samapay_sandbox` and a restorable copy of SamaPrime's schema:
 - **`02e0fb61`**: retired-and-deleted, or kept dormant? It has no job under #27.
 - **Whether the August paper still exists.** Everything else in this plan is
   recoverable; that is not.
+
+---
+
+# ADDENDUM — HIS SIX CONDITIONS (#30)
+
+## 🔴 CONDITION 6 — THE PROOF MY PLAN DID NOT CONTAIN
+
+> ***"after the cut, before I consider it done, prove from OUTSIDE that a
+> deposit to one of the 194 EXISTING addresses still credits correctly. NOT a
+> derivation equality — AN ACTUAL DEPOSIT."***
+
+**He is right and my plan proved the wrong half.** The equality check shows
+SamaPay *computes* the same 194 addresses. ***It says nothing about whether money
+sent to one of them is SEEN and CREDITED.*** Those are two different halves —
+derivation and observation — and **observation is precisely what changes hands at
+the cut**: SamaPrime's scanner stops, SamaPay's starts on addresses it has never
+watched.
+
+### ⚠️ AND IT CANNOT GO TO JUST ANY OF THE 194 — THOSE ARE CUSTOMERS' ADDRESSES
+
+**Sending to a customer's legacy address would credit THAT CUSTOMER with his
+money.** MEASURED — he has his own, at derivation index 0:
+
+    BEP20   0xD8d75d3Ab4DF1976C5130BaB8388E97314B0C48D
+    TRC20   TEKn1EUuuM2AHQaK6U6aocpDXFMoZdsrnK
+
+⇒ ***THE SECOND DEPOSIT GOES TO ONE OF THOSE TWO.*** They are genuinely part of
+the 194, they are genuinely legacy, and **no customer is touched.** Tron first,
+per his order.
+
+## THE HANDOVER WINDOW — MEASURED IN KIND, NOT WAVED AWAY
+
+    stop SamaPrime's scanner    read its cursor, per chain
+    import the 194              into SamaPay, legacyImport = true
+    set SamaPay's cursor        to EXACTLY that block, per chain
+    start SamaPay's observer
+
+**There IS a window, and it is a LATENCY window, not a LOSS window.** A deposit
+landing inside it is not seen by either scanner **at that moment** — and is then
+picked up by SamaPay from the handover block, because the cursor was handed over
+rather than reset. ***The blockchain is the durable record; our scanners are only
+readers of it.***
+
+⚠️ **BOTH SCANNERS MUST NOT RUN IN PARALLEL ACROSS THE CUT.** That would close
+the latency window and open a far worse one: **every legacy deposit credited
+TWICE**, once in each system, with each database's `UNIQUE(chain, tx_hash)`
+perfectly satisfied because neither can see the other's rows. **A few minutes of
+delay is the correct trade and the only safe one.**
+
+## THE OTHER FOUR
+
+**1 — both papers in hand.** Closed. *(And condition 2 depends on it.)*
+
+**2 — `02e0fb61`: RETIRE AND DELETE, but only AFTER the rehearsal proves the
+move, and KEEP BOTH ENCRYPTION KEYS until it is formally gone.** His reason is
+better than mine: *"deleting the seed before its key is worse than either."* An
+orphaned key is untidy; **an unopenable blob is unrecoverable.**
+
+**3 — REHEARSAL FIRST, result to him before production is touched**, including
+the rollback asserting **all three** properties restore, not two.
+
+**4 — derive and tell him. TRON FIRST.**
+
+**5 — two scripts, and the pre-cut one REFUSES after the import.** ***DONE***
+(`b32cf7d`): the refusal is derived from the presence of `legacyImport` rows, not
+from an argument — **there is no flag to mistype.** He overruled my patch and was
+right; I had argued that exact point for the derive scripts an hour earlier and
+failed to carry it across.
