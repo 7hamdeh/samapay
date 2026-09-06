@@ -413,6 +413,22 @@ one 100 USDT payment would read as 100,100 of something. MEASURED:
 `Withdrawal.amount` likewise; `read.ts:15-16` aggregates both with no
 channel or currency predicate.
 
+**ANSWERED BY IBRAHIM, 2026-09-06, VERBATIM, AND STRICTER THAN EITHER
+OPTION BELOW:** "ALLOWANCE PER (CHANNEL, CURRENCY) — USDT, ShamCash-SYP,
+ShamCash-USD are SEPARATE LEDGERS. CHANNELS ARE TOGGLES FROM THE PANEL,
+NOT PERMISSIONS. A verifier-confirmed inflow COVERS A PAYOUT ON ITS OWN
+CHANNEL ONLY, NEVER ACROSS." Three answers: (1) the allowance key is
+`(keyId, channel, currency)` — one channel can carry two currencies and
+they are two ledgers; a per-channel key would have merged ShamCash-SYP
+with ShamCash-USD. Separate ledgers with no crossing means NO FX INSIDE
+SAMAPAY — stated so silence is not read as an opening. (2) channels are
+per-client toggles in the panel (S4/S5), never scopes; scopes stay verbs.
+(3) verifier-asserted inflow MAY back a payout — contained by the channel
+boundary, not by a trust tier: 4reply's word pays out ShamCash and never
+USDT, and that FOLLOWS from (1) rather than being its own rule — written
+at `read.ts` so nobody "simplifies" it away. The paragraph below is the
+reasoning as it stood before his answer, kept.
+
 So allowance must become **per (key, currency)** — or per (key, channel),
 which is stricter and is the safer default while no channel can pay out
 into another: a Sham Cash inflow does not make USDT withdrawable, and the
@@ -439,7 +455,7 @@ across channels, grouped by channel, never summed across currencies.
 | S0 stack | unchanged | independent of channels |
 | S1 identity | unchanged | humans are channel-agnostic |
 | S2 email code, S3 Google | unchanged | |
-| S4 keys | unchanged in shape; SCOPES grow | `intents.write`, `payments.read` replace/extend `addresses.write`, `deposits.read`; per-channel scoping is a decision (a key limited to shamcash?) — his call, default: scopes are verbs, channels are enabled per client |
+| S4 keys | unchanged in shape; SCOPES grow | `intents.write`, `payments.read` replace/extend `addresses.write`, `deposits.read`; DECIDED 2026-09-06: "CHANNELS ARE TOGGLES FROM THE PANEL, NOT PERMISSIONS" — scopes are verbs, channels are per-client toggles in the panel, a key never carries a channel (written at `scopes.ts`) |
 | S5 reads | **RESHAPED** | per channel, per currency; "payments" not "deposits"; intents appear (5b.4) |
 | S6 webhooks | unchanged mechanism; events renamed | `payment.confirmed` with `channel`; the secret must still be written (row 9) |
 | S7 sandbox | **RESHAPED, and simpler** | a sandbox is now a CHANNEL (`sandbox`, currency `TEST`, `verify()` confirms on request) — no fake chain needed; `environment=test` keys see only that channel |
@@ -466,7 +482,8 @@ New slices, before S5 and S7 in dependency order:
   /addresses` becomes the crypto channel's `prepare()` behind it (kept
   mounted for SamaPrime until the cut is done).
 - **C2 — currency + channel on payment and payout rows; allowance per
-  (key, channel); AND `@@unique([channel, externalRef])` on payments**,
+  (key, channel, currency) — his decision, both columns, separate ledgers;
+  AND `@@unique([channel, externalRef])` on payments**,
   replacing `@@unique([chain, txHash])` (crypto's externalRef IS the
   txHash, so nothing is lost). Two red-first assertions, each naming the
   mechanism that refused: a SYP confirmation must not move the USDT

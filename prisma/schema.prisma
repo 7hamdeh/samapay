@@ -155,6 +155,20 @@ model Address {
 // *** THE ONLY WRITER OF THIS TABLE IS src/observer/. *** Asserted by a
 // verify script with a present-control, not by this comment. One credit
 // per on-chain event is STRUCTURAL: UNIQUE(chain, tx_hash).
+//
+// ⚠️ CHANNELS (Ibrahim's architecture note + decision, 2026-09-06): this row
+// becomes a PAYMENT on a channel, and two things change here, both in C2 of
+// docs/panel-survey-2026-09-06.md, neither yet applied:
+//  1. `channel` + `currency` columns, because "ALLOWANCE PER (CHANNEL,
+//     CURRENCY) — USDT, ShamCash-SYP, ShamCash-USD are SEPARATE LEDGERS"
+//     (his words). `amount` with no currency cannot be summed across them.
+//  2. UNIQUE(chain, tx_hash) is chain-shaped; a Sham Cash confirmation has
+//     neither. It becomes UNIQUE(channel, external_ref) (crypto's
+//     external_ref IS the tx hash). That index is the guarantee; the
+//     verifier's "unique id" is a promise. NEITHER GUARD IS REDUNDANT: CODE
+//     REFUSES CLEANLY ON RETRY, DB REFUSES UNDER TRUE CONCURRENCY — two
+//     guards with one message are one guard, so they surface DISTINCT
+//     outcomes.
 model Deposit {
   id            String   @id @default(cuid())
   keyId         String   @map("key_id")
