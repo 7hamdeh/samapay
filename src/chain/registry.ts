@@ -5,7 +5,13 @@
 import type { Chain } from "@prisma/client";
 import type { AddressDeriver, ChainObserver, TxExistenceProver, TxSender } from "./types.js";
 
-// ⚠️⚠️ DO NOT WIRE THE DERIVER UNTIL THE `reference` FORMAT IS DECIDED.
+// ✅ CONDITION MET 2026-09-06 — THE STOP BELOW IS RETIRED, NOT DELETED, so a
+// reader who saw it elsewhere knows it was satisfied rather than ignored.
+// Ibrahim ruled the format on 2026-09-05 (`client:tenant:kind:id`),
+// src/reference/index.ts implements it and scripts/verify-reference-format.ts
+// proves it 15/0. src/chain/live.ts now installs a real deriver.
+//
+// ~~⚠️⚠️ DO NOT WIRE THE DERIVER UNTIL THE `reference` FORMAT IS DECIDED.~~
 // An address's reference is its attribution, created at derivation time and
 // NOT RECOMPUTABLE — the $246.32 of unattributable SamaPrime deposits is
 // that exact mistake, already paid for once. The question is with Ibrahim;
