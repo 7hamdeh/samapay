@@ -317,6 +317,154 @@ would expose it is disabled" shape this repository has paid for.
 
 ---
 
+## 5b. THE ARCHITECTURE NOTE OF 2026-09-06 — RECONCILED AGAINST THIS DOCUMENT
+
+Ibrahim, verbatim (relayed by the coordinator):
+
+> "SamaPay architecture note: IT IS A PAYMENT GATEWAY WITH CHANNELS, NOT A
+> USDT WALLET ALONE. Channels = adapters: usdt (bsc/tron, ours), shamcash
+> (via 4reply for now), syriatel_cash, mtn_cash, bank. ONE CLIENT API:
+> create intent, verify by reference, webhook on confirm, allowance per
+> key. The dahabi Sham Cash verifier being built now must be shaped so it
+> moves into SamaPay as its first non-crypto channel — same interface, no
+> rewrite."
+
+Everything above §5b was written against "a crypto service with a panel
+on top". MEASURED at 836c859: zero files in `src/` name channel, shamcash,
+syriatel, mtn or 4reply (control: `chain` hits 15 files). The only adapter
+abstraction is `ChainAdapters { deriver, observer, sender, prover }`
+(`src/chain/types.ts`), four refusing stubs. "Channel" is a new
+abstraction with one intended shape and no implementation.
+
+### 5b.1 His four verbs against the routes that exist
+
+| verb | exists? | what the code has | what is missing |
+|---|---|---|---|
+| **create intent** | **NO** | the nearest thing is `POST /addresses {chain, reference}` — a standing expectation of inbound money, bound to a reference, with no amount, no expiry, no id, no status | an `Intent` (id, key, channel, reference, expected amount + currency, expiry, status, channel-specific instructions such as an address or a payee number + memo). For crypto the address IS the instruction; for Sham Cash the instruction is "pay N SYP to account X, write reference R" |
+| **verify by reference** | **PARTIAL, passive only** | `GET /balance?reference=` and `GET /deposits?reference=` READ what the observer already recorded | an active verb: for a channel with no chain, "verify" is SamaPay asking the channel's verifier (4reply today) whether a payment matching (reference, amount) exists — a call that WRITES a confirmed payment. Crypto verifies passively (observer); Sham Cash verifies on demand |
+| **webhook on confirm** | **YES, and broken** | `deposit.confirmed` enqueued by the observer, signed, retried | the secret is never written (§1 row 9), so nothing is ever delivered; event names must generalise (`payment.confirmed`, carrying `channel`) |
+| **allowance per key** | **YES** | `read.ts`: SUM(deposit.amount WHERE confirmed) − SUM(withdrawal.amount WHERE consuming), per key | it sums `amount` with NO CURRENCY. See 5b.3 — this is the one that breaks first |
+
+### 5b.2 What a channel is, as an interface — the crypto shape does NOT generalise as-is
+
+`ChainAdapters` is `deriveNext(chain) → address`, `scan(addresses) →
+transfers`, `confirmationsFor(txHash)`, `send(chain, to, amount)`,
+`exists(txHash)`. Two of the five have no Sham Cash meaning: there is
+nothing to DERIVE (the payee account is fixed, the intent is
+distinguished by the memo/reference, not by a fresh address) and nothing
+to SEND in the same sense (a cash-out is an agent action, not a broadcast).
+So the honest answer to "same interface, no rewrite" is: **not the chain
+interface.** The interface that does generalise sits one level up, at the
+INTENT, and crypto becomes one implementation of it:
+
+```
+interface Channel {
+  id: "usdt_bsc" | "usdt_tron" | "shamcash" | "syriatel_cash" | "mtn_cash" | "bank" | "sandbox"
+  currency: "USDT" | "SYP" | …                 // ONE currency per channel
+  capabilities: { collect: true; payout: boolean; passiveObserve: boolean }
+
+  // create intent → the instructions a payer follows
+  prepare(intent: { keyId; reference; amount?; expiresAt? }): Promise<Instructions>
+       // crypto:   { address }               (deriveNext under the hood)
+       // shamcash: { payee, memo: reference } (no derivation)
+
+  // verify by reference → zero or more confirmed payments for this intent
+  verify(intent): Promise<Confirmation[]>       // active: shamcash asks 4reply
+  observe?(intents): Promise<Confirmation[]>    // passive: crypto scans
+  finality(confirmation): Promise<{ final: boolean; detail }>  // confirmations, or a reversal window
+
+  // payout, where the channel has one
+  payout?(to, amount): Promise<PayoutResult>    // crypto: send; shamcash: unsupported in v1
+  proveAbsence?(ref): Promise<Evidence>         // for refunds; crypto: TxExistenceProver
+}
+```
+
+What must be TRUE of `Confirmation` for the one rule to survive: it
+carries `channel`, `externalRef` (tx hash, 4reply receipt id, bank
+statement line — the field that is UNIQUE per channel and makes "one
+credit per event" structural, today `@@unique([chain, txHash])`),
+`amount`, `currency`, `reference`, `evidence` (what the verifier saw —
+for a chain it is the chain; for Sham Cash it is a screenshot or an SMS
+parse, and the panel must say which). The invariant "the only writer of
+`deposits` is `src/observer/`" becomes "the only writer of payments is a
+CHANNEL's verify/observe, through one recording function" — still one
+door, now with a `channel` column on the row.
+
+The seams that make the dahabi verifier a move rather than a rewrite are
+therefore: it takes `(reference, expectedAmount)` and returns
+`Confirmation[]` with a channel-unique `externalRef` and its evidence;
+it never decides what the reference MEANS (shape only, `client:tenant:
+kind:id`); it reports distinguishable outcomes (`confirmed` / `not_found`
+/ `amount_mismatch` / `verifier_unavailable`) rather than a boolean — a
+`false` that means "4reply was down" is the "absent vs incapable" defect
+this repository names most; and 4reply is ONE implementation behind
+`shamcash`, replaceable, not the channel itself.
+
+### 5b.3 Allowance for a non-crypto channel — the rule generalises, the SUM does not
+
+The rule "a key may take out at most what came in under it" generalises:
+"came in" means confirmed payments recorded by a channel's verifier for
+this key, and "took out" means payouts on a channel that has them.
+`read.ts` already sums ROWS, not chain reads, so a Sham Cash confirmation
+written as a payment row would count — **and that is the defect**: it
+sums `amount` across rows with no currency. One 100,000 SYP payment and
+one 100 USDT payment would read as 100,100 of something. MEASURED:
+`Deposit.amount` is `Decimal(18,6)` with no currency column;
+`Withdrawal.amount` likewise; `read.ts:15-16` aggregates both with no
+channel or currency predicate.
+
+So allowance must become **per (key, currency)** — or per (key, channel),
+which is stricter and is the safer default while no channel can pay out
+into another: a Sham Cash inflow does not make USDT withdrawable, and the
+day it should (FX inside SamaPay) is a money decision for him, not a
+default. `GET /balance` grows a `currency`/`channel` axis and the panel
+shows one position per channel; "allowance" stays per key WITHIN a
+channel. Trust also changes shape: a chain confirmation is evidence the
+service verified itself; a Sham Cash confirmation is evidence a verifier
+(4reply) asserted — the panel labels the evidence class, and a payout
+against verifier-asserted inflow is a decision he has not made.
+
+### 5b.4 What the panel must show per channel (reshapes S5)
+
+"Deposits" stops being one list. Per client: channels enabled; per
+channel: currency, position (received / withdrawn / allowance), payments
+(with `channel`, `externalRef`, evidence class, finality), intents
+(open/expired/paid), payouts where supported. Per reference: the same
+across channels, grouped by channel, never summed across currencies.
+
+### 5b.5 Reconciliation of my own ten slices against the note
+
+| slice | verdict | why |
+|---|---|---|
+| S0 stack | unchanged | independent of channels |
+| S1 identity | unchanged | humans are channel-agnostic |
+| S2 email code, S3 Google | unchanged | |
+| S4 keys | unchanged in shape; SCOPES grow | `intents.write`, `payments.read` replace/extend `addresses.write`, `deposits.read`; per-channel scoping is a decision (a key limited to shamcash?) — his call, default: scopes are verbs, channels are enabled per client |
+| S5 reads | **RESHAPED** | per channel, per currency; "payments" not "deposits"; intents appear (5b.4) |
+| S6 webhooks | unchanged mechanism; events renamed | `payment.confirmed` with `channel`; the secret must still be written (row 9) |
+| S7 sandbox | **RESHAPED, and simpler** | a sandbox is now a CHANNEL (`sandbox`, currency `TEST`, `verify()` confirms on request) — no fake chain needed; `environment=test` keys see only that channel |
+| S8 docs | regenerated from the new route table | |
+| S9 rate limits | unchanged | |
+| S10 rotation | unchanged | keys, not channels |
+| **written against "a crypto service" and now WRONG** | §2's "what a key can do" table and §4's mapping — they describe the current routes truthfully but as the product, not as one channel | superseded by 5b.1; kept as the measured baseline |
+
+New slices, before S5 and S7 in dependency order:
+- **C0 — `Channel` interface + registry**, with the crypto adapters
+  wrapped as `usdt_bsc`/`usdt_tron` (no behaviour change; the refusing
+  stubs stay refusing) and a `sandbox` channel as the first REAL
+  implementation — which is also the test double every later suite uses.
+- **C1 — `Intent` model + `POST /intents`, `GET /intents/:id`**; `POST
+  /addresses` becomes the crypto channel's `prepare()` behind it (kept
+  mounted for SamaPrime until the cut is done).
+- **C2 — currency + channel on payment and payout rows; allowance per
+  (key, channel)**; red-first: a SYP confirmation must not move the USDT
+  allowance. This is a migration on a database that does not exist in
+  production yet — EXPAND, rides with the first production migration.
+- **C3 — `shamcash` channel = the dahabi verifier moved behind C0's
+  interface**, with `verify()` returning distinguishable outcomes and
+  4reply as its implementation; `payout: false` in v1.
+- syriatel_cash, mtn_cash, bank: named, not surveyed; nothing exists.
+
 ## 6. SLICE LIST (thin, vertical, each red-first; ordered so each is the first real consumer of the last)
 
 Preconditions that are HIS keystrokes and gate the LIVE half only
