@@ -21,26 +21,26 @@ import { PrismaClient as PayClient } from "@prisma/client";
 
 const SAMAPRIME_URL = process.env.SAMAPRIME_DATABASE_URL;
 
-// ⚠️⚠️ THIS CHECK INVERTS AT THE CUTOVER, AND A SCRIPT THAT GUESSES WHICH
-// REGIME IT IS IN WOULD GO GREEN FOR THE OPPOSITE REASON.
+// ⚠️⚠️ THIS SCRIPT IS PRE-CUT ONLY AND REFUSES TO RUN AFTER THE IMPORT.
 //
-//   PRE-CUT   the two systems watch DIFFERENT addresses. Overlap = a deposit
-//             credited twice, in two systems, with each one's UNIQUE(chain,
-//             tx_hash) perfectly satisfied because neither sees the other.
-//             ⇒ the correct assertion is DISJOINT.
-//   POST-CUT  SamaPay has IMPORTED the 194. The sets are IDENTICAL BY DESIGN
-//             and "disjoint" is now the FAILURE condition.
-//             ⇒ the correct assertion is "SamaPrime's scanner is STOPPED".
+// Its claim inverts at the cutover:
+//   PRE-CUT   the two systems watch DIFFERENT addresses. Overlap means one
+//             deposit credited TWICE, in two systems, with each one's
+//             UNIQUE(chain, tx_hash) perfectly satisfied because neither can
+//             see the other's rows.          ⇒ assert DISJOINT.
+//   POST-CUT  SamaPay has imported the 194. The sets are IDENTICAL BY DESIGN
+//             and "disjoint" becomes the FAILURE condition — a failed or
+//             partial import produces exactly the result this script calls a
+//             PASS.                          ⇒ a DIFFERENT script's job.
 //
-// So the regime is REQUIRED and never inferred. A missing or mistyped value
-// REFUSES rather than picking one — the failure mode of a typo must be "it did
-// not run", never "it asserted the opposite and passed".
-const REGIME = process.argv.find((a) => a.startsWith("--regime="))?.slice("--regime=".length);
-if (REGIME !== "pre-cut" && REGIME !== "post-cut") {
-  console.error("REFUSING: pass --regime=pre-cut or --regime=post-cut explicitly.");
-  console.error("This check asserts OPPOSITE things either side of the cutover and will not guess which.");
-  process.exit(1);
-}
+// Ibrahim, #30: "write the second one, and make the first REFUSE to run after
+// the import. A script that quietly changes what it means is the failure we
+// spent last night naming."
+//
+// It is not gated on an argument. An argument is one typo away from asserting
+// the opposite; the refusal is derived from the DATA — the presence of any
+// legacyImport address means the import has happened and this script's claim
+// is no longer the right one. See scripts/verify-address-sets-imported.ts.
 
 let pass = 0, fail = 0, voidCount = 0;
 function check(ok: boolean, label: string, detail: string) {
@@ -60,6 +60,16 @@ async function main() {
   const pay = new PayClient();
   const prime = new PayClient({ datasources: { db: { url: SAMAPRIME_URL } } });
 
+  // THE REFUSAL. Derived from the data, not from a flag.
+  const legacy = await pay.address.count({ where: { legacyImport: true } });
+  if (legacy > 0) {
+    console.error(`REFUSING: SamaPay holds ${legacy} legacyImport address(es) — the import has happened.`);
+    console.error("After the cut the two sets are IDENTICAL BY DESIGN and 'disjoint' is the FAILURE condition.");
+    console.error("This script would pass for exactly the wrong reason. Run verify-address-sets-imported.ts instead.");
+    await pay.$disconnect(); await prime.$disconnect();
+    process.exit(1);
+  }
+
   const payRows = await pay.address.findMany({ select: { address: true, chain: true } });
   const primeRows = (await prime.$queryRawUnsafe(
     "select address, chain::text as chain from crypto_addresses",
@@ -77,20 +87,10 @@ async function main() {
   const primeSet = new Set(primeRows.map((r) => `${r.chain}:${r.address.toLowerCase()}`));
   const overlap = payRows.filter((r) => primeSet.has(`${r.chain}:${r.address.toLowerCase()}`));
 
-  if (REGIME === "pre-cut") {
-    if (payRows.length === 0) {
-      markVoid("SamaPay side is empty", `0 addresses issued yet — disjointness is VACUOUSLY true and proves nothing. Re-run once SamaPay has issued at least one.`);
-    } else {
-      check(overlap.length === 0, "PRE-CUT: the two address sets are DISJOINT", `${payRows.length} vs ${primeRows.length}, overlap ${overlap.length}`);
-    }
+  if (payRows.length === 0) {
+    markVoid("SamaPay side is empty", `0 addresses issued yet — disjointness is VACUOUSLY true and proves nothing. Re-run once SamaPay has issued at least one.`);
   } else {
-    // POST-CUT: identical by design. Disjoint here would mean the import never
-    // happened, which is the opposite failure and would have read as a pass.
-    check(overlap.length === primeRows.length && primeRows.length > 0,
-      "POST-CUT: SamaPay has imported EVERY SamaPrime address",
-      `${overlap.length} of ${primeRows.length} present in SamaPay — a low number means the import is incomplete, and a ZERO would be 'disjoint' passing for exactly the wrong reason`);
-    markVoid("POST-CUT: 'SamaPrime's scanner is stopped' is NOT checked here",
-      "that is a process fact, not a database fact — it needs its own instrument and this script must not imply it holds");
+    check(overlap.length === 0, "the two address sets are DISJOINT", `${payRows.length} vs ${primeRows.length}, overlap ${overlap.length}`);
   }
 
   // ⚠️ THE CONTROL THAT MAKES THE ABOVE MEAN ANYTHING: plant a known match and
