@@ -453,13 +453,31 @@ New slices, before S5 and S7 in dependency order:
   wrapped as `usdt_bsc`/`usdt_tron` (no behaviour change; the refusing
   stubs stay refusing) and a `sandbox` channel as the first REAL
   implementation — which is also the test double every later suite uses.
+  **The `externalRef` a channel returns is a PROMISE; the guarantee is an
+  INDEX.** Today one-credit-per-event is structural only because of
+  `@@unique([chain, txHash])` — chain-shaped. A Sham Cash confirmation has
+  no chain and no txHash, so a non-crypto channel arrives with NO
+  structural protection against crediting one payment twice (a retry, a
+  duplicate webhook, an operator refreshing a page). That is the larger of
+  the two defects in 5b.3: the currency one reads a wrong number; this one
+  credits real money twice. Same rule SamaPrime earned as ONE CREDIT PER
+  REFERENCE — the code's lock is what fails, the index is what holds.
 - **C1 — `Intent` model + `POST /intents`, `GET /intents/:id`**; `POST
   /addresses` becomes the crypto channel's `prepare()` behind it (kept
   mounted for SamaPrime until the cut is done).
 - **C2 — currency + channel on payment and payout rows; allowance per
-  (key, channel)**; red-first: a SYP confirmation must not move the USDT
-  allowance. This is a migration on a database that does not exist in
-  production yet — EXPAND, rides with the first production migration.
+  (key, channel); AND `@@unique([channel, externalRef])` on payments**,
+  replacing `@@unique([chain, txHash])` (crypto's externalRef IS the
+  txHash, so nothing is lost). Two red-first assertions, each naming the
+  mechanism that refused: a SYP confirmation must not move the USDT
+  allowance; and `verify()` called TWICE for one Sham Cash payment must
+  write ONE row, with the second refused by the INDEX (a
+  `PrismaClientKnownRequestError` P2002 surfacing as the application's own
+  `already_recorded`), proven by deleting the application-level check and
+  watching the suite stay green for the right reason. C3 must not land
+  before C2 does, or its double-credit protection is caller discipline.
+  This is a migration on a database that does not exist in production yet
+  — EXPAND, rides with the first production migration.
 - **C3 — `shamcash` channel = the dahabi verifier moved behind C0's
   interface**, with `verify()` returning distinguishable outcomes and
   4reply as its implementation; `payout: false` in v1.
