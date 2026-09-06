@@ -533,6 +533,33 @@ New slices, before S5 and S7 in dependency order:
   4reply as its implementation; `payout: false` in v1.
 - syriatel_cash, mtn_cash, bank: named, not surveyed; nothing exists.
 
+### 5b.6 SEQUENCING — is the panel BLOCKED on the allowance fix, or can it ship read-only around it?
+
+Asked by the coordinator; the honest answer is split by screen.
+
+- **NOT blocked:** sign-up, sign-in, the owner record, key mint/revoke,
+  channel toggles as a stored preference, the movements list (payments and
+  payouts with their `chain` — today the only channel axis). S1–S4 and the
+  list half of S5 depend on the identity migration only.
+- **Correct BY ABSENCE, not by guard, and therefore shippable read-only
+  with a label:** the per-key position. MEASURED: `enum Chain { BEP20,
+  TRC20 }` are both USDT, no `currency` column exists on any table, and no
+  channel but usdt exists. So `read()`'s sum is a correct USDT figure for
+  every key that can exist today. The panel may show it read-only IF the
+  screen names the ledger explicitly ("USDT · usdt channel") and never
+  shows a bare number.
+- **BLOCKED, and the block must be a REFUSAL not an absence:** enabling any
+  channel other than usdt, or any currency other than USDT, before C2 is
+  applied. The channel toggle for shamcash/syriatel_cash/mtn_cash/bank must
+  be refused with a reason ("ledger split not applied") rather than hidden —
+  a hidden toggle is the "looks finished because the thing that would
+  expose it is disabled" shape. The day C2 is live, the same toggle works
+  and the position screen shows one row per (channel, currency).
+
+So: the panel is not blocked as a product; its multi-ledger half is, and
+C2 (an EXPAND migration, his keystroke, riding with the first production
+migration) is the gate — the same gate C3 already waits behind.
+
 ## 6. SLICE LIST (thin, vertical, each red-first; ordered so each is the first real consumer of the last)
 
 Preconditions that are HIS keystrokes and gate the LIVE half only
@@ -590,7 +617,15 @@ Design-lead owns the look of S2-S8; nothing above specifies one.
 
 ---
 
-## 7. WHAT NEEDS IBRAHIM, in one Arabic line each (for the coordinator to carry)
+## 7. WHAT NEEDS IBRAHIM — one line each, answerable in one word
+*(Restated 2026-09-06 after his four rulings; the earlier list follows.)*
+- **S0 — stack:** «تطبيق Next.js منفصل للوحة» أم «صفحات داخل خدمة Hono»؟ — كلمة واحدة: `Next` / `Hono`.
+- **S1 — identity migration** (Account, EmailCode, Session, AccountClient) + **C2** (channel + currency + `UNIQUE(channel, external_ref)`): both EXPAND, both ride with the first production migration — «موافق» يوم تُنشأ قاعدة الإنتاج.
+- **pay.mntad.com:** سجل DNS (لا يوجد) + vhost + PM2 — «تم» عندما تُنشأ.
+- **Google OAuth** credentials for pay.mntad.com (the old key is dead; a new client in Google Cloud) — «تم» عندما تُنشأ.
+- **Previously answered, 2026-09-06, his hand:** the minting rule; allowance per (channel, currency); channels are toggles; verifier inflow pays out on its own channel only.
+
+### The earlier list, as it stood
 - ~~تغيير قاعدة: الجملة "Not a public gateway…" في `CLAUDE.md` الخاص بـ SamaPay تتعارض مع هدف اللوحة، وتعديلها بيدك.~~ *(أُجيب 2026-09-06 بيده — القاعدة الجديدة في `CLAUDE.md`.)*
 - قاعدة بيانات SamaPay الإنتاجية + أول migration (وستحمل جداول الحسابات).
 - سجل DNS لـ `pay.mntad.com` (لا يوجد الآن) + vhost + PM2.
