@@ -329,3 +329,17 @@ model CryptoConfig {
 
   @@map("crypto_config")
 }
+
+/// The observer's cursor. `ChainObserver.scan()` is documented as persisting
+/// its own cursor, and SamaPay had nowhere to keep one — so a restart would
+/// have rescanned from scratch or, worse, from head, silently skipping every
+/// block in between. Mirrors SamaPrime's CryptoScanCursor, advanced under the
+/// same monotonic guard (lastScannedBlock < newValue) so a late tick can never
+/// move it backwards.
+model ScanCursor {
+  chain            Chain    @id
+  lastScannedBlock BigInt   @map("last_scanned_block")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  @@map("scan_cursors")
+}

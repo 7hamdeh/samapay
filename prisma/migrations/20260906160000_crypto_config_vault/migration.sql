@@ -11,3 +11,12 @@ CREATE TABLE "crypto_config" (
     CONSTRAINT "crypto_config_pkey" PRIMARY KEY ("id")
 );
 
+-- CreateTable
+CREATE TABLE "scan_cursors" (
+    "chain" "Chain" NOT NULL,
+    "last_scanned_block" BIGINT NOT NULL,
+    "updated_at" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "scan_cursors_pkey" PRIMARY KEY ("chain")
+);
+
