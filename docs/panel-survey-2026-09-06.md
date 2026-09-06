@@ -290,6 +290,12 @@ Written before the offers because the offers are easy.
     rather than merely prudent. `issuedBy` becomes `account:<id>` and
     `issuedVia` gains `panel_owner`; the value `samaprime_admin_action`
     describes a path that no longer exists and must not be written again.
+    *His confirmation, unprompted, 2026-09-06, verbatim:* "Yes — THE
+    SUPPORT-PATH BAN IS DELIBERATE. Staff help a client mint their own key;
+    STAFF NEVER MINT IT FOR THEM. 'From help' is exactly the door that
+    opens later." That sentence is the operational test for any future
+    support flow: guidance, a link, a walkthrough — yes; the mint itself —
+    never.
 
 **On `issue.ts:30-32` under the new rule.** It refuses to mint the
 `keys.issue` scope from anything but the CLI. That stays CORRECT and is
@@ -303,7 +309,11 @@ remains the only legitimate source of that scope, and the unmounted
 bearer key — is the wrong shape for the panel and must NOT be mounted as
 is: its target comes from the path, not from the caller's own account.
 S4 writes an account-authenticated sibling instead and leaves
-`admin-keys.ts` unmounted (or deletes it, with the reason).
+`admin-keys.ts` unmounted (or deletes it, with the reason). **Said
+plainly so nobody later finds an unmounted route that looks ready and
+helpfully wires it up: MOUNTING `admin-keys.ts` AS IT STANDS WOULD VIOLATE
+THE 2026-09-06 RULE** — it is the "looks finished because the thing that
+would expose it is disabled" shape this repository has paid for.
 
 ---
 
