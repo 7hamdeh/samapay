@@ -67,7 +67,7 @@ Prior documents (all read in full): **A** samaprime `docs/scratch/samapay-api-v1
 | # | prior claim | where | verdict | measured |
 |---|---|---|---|---|
 | 1 | v1 has "no dashboard, no public signup"; "GET /balance and the audit table ARE the dashboard until someone needs a screen" | A:35-36, A:224 | **SUPERSEDED** by the new goal | a screen is now the goal; nothing in A forbids it, A scoped v1 |
-| 2 | "Not a public gateway: keys issued by his hand or a SamaPrime admin action" | A:7, E:6-7 | **SUPERSEDED — and it is a RULE in E** | E is SamaPay's CLAUDE.md; a self-service panel contradicts its sentence 3. Changing E is a rule change = his keystroke (§7 asks for it) |
+| 2 | "Not a public gateway: keys issued by his hand or a SamaPrime admin action" | A:7, E:6-7 | **SUPERSEDED — and it is a RULE in E** | E is SamaPay's CLAUDE.md; a self-service panel contradicts its sentence 3. Changing E is a rule change = his keystroke. *Answered 2026-09-06, his hand:* "KEYS ARE MINTED BY THE OWNER'S HAND OR BY THE CLIENT PANEL'S OWN SIGNED-IN OWNER FOR THEIR OWN ACCOUNT — NEVER BY AN OPERATOR ON SOMEONE ELSE'S BEHALF." The old sentence is struck in E, not deleted. Note what moved: "a SamaPrime admin action" is GONE as a path, and a prohibition was ADDED |
 | 3 | "External site owners (dahabi, others) will register on SamaPay's own site later with their own accounts and mint their own keys" | D:6-8 | **CONFIRMED as the goal** | the goal is this sentence made concrete |
 | 4 | "Ignore my earlier 'store the owner's email so they find their keys later' — v1 stores whatever identifies the CLIENT" | D:8-10 | **CONFIRMED in code, and it is why §0.2 holds** | `Client` has id/name/kind/createdAt only; `samaprime_merchant_id` dropped |
 | 5 | keep the admin-keys code, unmount the route; "the mechanism is what SamaPay's own registration site will need" | D:73 | **CONFIRMED** | `app.ts:3` comment + no `app.route` for it; handlers intact |
@@ -278,6 +278,32 @@ Written before the offers because the offers are easy.
     key) produces deliveries that exhaust silently (row 9). The panel must
     issue both together or neither.
 12. **Refuse to show a rate limit the API does not enforce** (row 8).
+13. **Refuse any path that mints for an account other than the signed-in
+    one** — his rule, 2026-09-06: "NEVER BY AN OPERATOR ON SOMEONE ELSE'S
+    BEHALF." Not a UI absence: the minting function takes the acting
+    Account from the SESSION and the target Client from an AccountClient
+    membership of THAT account, never from a request parameter; there is no
+    operator/admin role in the panel that can widen it; and a red-first
+    assertion mints as account A against a client owned only by account B
+    and asserts the refusal names this rule (`not_your_account`), not a
+    generic 403. Refusals 2 and 6 are now underwritten by the same rule
+    rather than merely prudent. `issuedBy` becomes `account:<id>` and
+    `issuedVia` gains `panel_owner`; the value `samaprime_admin_action`
+    describes a path that no longer exists and must not be written again.
+
+**On `issue.ts:30-32` under the new rule.** It refuses to mint the
+`keys.issue` scope from anything but the CLI. That stays CORRECT and is
+strengthened, not widened: `keys.issue` is the operator scope (issue and
+revoke keys for ANY client), which is exactly the "operator on someone
+else's behalf" the rule forbids. The panel mints only client-money scopes
+(addresses.write, deposits.read, withdrawals.*, balance.read) for the
+signed-in owner's own client; it never needs `keys.issue`, so the CLI
+remains the only legitimate source of that scope, and the unmounted
+`admin-keys.ts` route — which mints for `:clientId` from the URL under a
+bearer key — is the wrong shape for the panel and must NOT be mounted as
+is: its target comes from the path, not from the caller's own account.
+S4 writes an account-authenticated sibling instead and leaves
+`admin-keys.ts` unmounted (or deletes it, with the reason).
 
 ---
 
@@ -308,10 +334,12 @@ gateway…") — see §7.
   refusal 9. Needs `AUTH_GOOGLE_ID/SECRET` for the panel's own OAuth client
   (a new Google Cloud credential for pay.mntad.com — his keystroke in the
   Google console).
-- **S4 — Client + key lifecycle behind ACCOUNT auth.** Mount the
-  admin-keys mechanism as account-authenticated routes; scope picker
-  excludes `keys.issue`; plaintext once; refusals 1, 2, 3, 5, 6, 10 each
-  with a red-first assertion that names the refusal (`assert which
+- **S4 — Client + key lifecycle behind ACCOUNT auth.** Reuse `issueKey`/
+  `revokeKey` behind NEW account-authenticated routes whose target client
+  is resolved from the session's AccountClient membership (never from the
+  URL); do not mount `admin-keys.ts` (see §5, refusal 13); scope picker
+  excludes `keys.issue`; plaintext once; refusals 1, 2, 3, 5, 6, 10, 13
+  each with a red-first assertion that names the refusal (`assert which
   mechanism refused`).
 - **S5 — Reads: keys list, per-key position, deposits and withdrawals per
   reference, prefix aggregation.** Needs a new `GET /withdrawals` list in
@@ -337,7 +365,7 @@ Design-lead owns the look of S2-S8; nothing above specifies one.
 ---
 
 ## 7. WHAT NEEDS IBRAHIM, in one Arabic line each (for the coordinator to carry)
-- تغيير قاعدة: الجملة "Not a public gateway: keys are issued by Ibrahim's hand or by a SamaPrime admin action only" في `CLAUDE.md` الخاص بـ SamaPay تتعارض مع هدف اللوحة، وتعديلها بيدك.
+- ~~تغيير قاعدة: الجملة "Not a public gateway…" في `CLAUDE.md` الخاص بـ SamaPay تتعارض مع هدف اللوحة، وتعديلها بيدك.~~ *(أُجيب 2026-09-06 بيده — القاعدة الجديدة في `CLAUDE.md`.)*
 - قاعدة بيانات SamaPay الإنتاجية + أول migration (وستحمل جداول الحسابات).
 - سجل DNS لـ `pay.mntad.com` (لا يوجد الآن) + vhost + PM2.
 - بيانات OAuth من Google لنطاق `pay.mntad.com` (عميل جديد في Google Cloud).
