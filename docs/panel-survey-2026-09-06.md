@@ -492,6 +492,23 @@ New slices, before S5 and S7 in dependency order:
   less — either layer can rot invisibly while the other carries the
   outcome. C3 must not land before C2 does, or its double-credit
   protection is caller discipline.
+  **His ruling, 2026-09-06, verbatim — and it is an instruction about
+  WHERE this lives:** "Two guards with one message are one guard —
+  correct, and the voucher incident is the proof. The user sees one clean
+  sentence; THE TEST READS A FIELD THE TRANSLATION CANNOT FORGE
+  (constraint name, error class, or a `refusedBy` tag). Neither guard is
+  redundant: code refuses cleanly on retry, DB refuses under true
+  concurrency. WRITE THAT AT THE GUARD, NOT IN A REPORT."
+  **ACCEPTANCE CONDITION OF C2 — THE COMMENT SHIPS WITH THE GUARD:** the
+  sentence "NEITHER GUARD IS REDUNDANT: CODE REFUSES CLEANLY ON RETRY, DB
+  REFUSES UNDER TRUE CONCURRENCY — two guards with one message are one
+  guard" is written, in his words, as a comment beside the pre-check in
+  the recording function AND beside the `@@unique([channel, externalRef])`
+  line in `schema.prisma`. The pre-check is exactly what a later reader
+  deletes as duplication: it IS redundant on every sequential path and its
+  value appears only under a race nobody reproduces by hand. This
+  paragraph does not protect it; the comment in the file does. A C2 review
+  that finds the guards without the comment is a red review.
   This is a migration on a database that does not exist in production yet
   — EXPAND, rides with the first production migration.
 - **C3 — `shamcash` channel = the dahabi verifier moved behind C0's
