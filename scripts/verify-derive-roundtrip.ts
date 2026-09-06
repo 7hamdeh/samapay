@@ -29,6 +29,13 @@ const { deriveAddress, derivePrivateKeyForSigning } = await import("@/chain/hd/d
 const { ethers } = await import("ethers");
 
 let pass = 0, fail = 0;
+// ⚠️ TEARDOWN IS GATED ON THIS AND NOTHING ELSE.
+// It was an unconditional deleteMany() in the catch handler, which meant that
+// if this script ever threw against a database holding a REAL seed — a
+// timeout on the precondition read would do it — the recovery path would have
+// DESTROYED the master seed while reporting a failed test. The precondition
+// guard protects the happy path; nothing protected the error path.
+let weCreatedIt = false;
 function check(ok: boolean, label: string, detail: string) {
   if (ok) { pass++; console.log(`[PASS] ${label} — ${detail}`); }
   else { fail++; console.log(`[FAIL] ${label} — ${detail}`); }
@@ -44,6 +51,8 @@ async function main() {
 
   const seed = crypto.randomBytes(64); // disposable
   await saveMasterSeedConfig(seed);
+  weCreatedIt = true; // ⚠️ ONLY now may teardown delete anything
+
   const fp = seedFingerprint(seed);
   check((await prisma.cryptoConfig.count()) === 1, "seed persisted, encrypted at rest", `fingerprint ${fp}`);
 
@@ -83,7 +92,7 @@ async function main() {
   check(tronAddrFromKey === first.TRC20, "TRC20 private key CORRESPONDS to the derived address", `${tronAddrFromKey}`);
 
   // TEARDOWN — destroy, then COUNT. Not "cleaned up", counted.
-  await prisma.cryptoConfig.deleteMany({});
+  if (weCreatedIt) await prisma.cryptoConfig.deleteMany({});
   const left = await prisma.cryptoConfig.count();
   check(left === 0, "DISPOSABLE SEED DESTROYED — crypto_config counted, not assumed", `${left} rows remain`);
   const addrs = await prisma.address.count();
@@ -95,4 +104,11 @@ async function main() {
   if (pass === 0) { console.log("VOID — nothing executed"); process.exit(1); }
   process.exit(fail === 0 ? 0 : 1);
 }
-main().catch(async (e) => { console.error("THREW:", e); try { await prisma.cryptoConfig.deleteMany({}); console.error("teardown ran"); } catch {} process.exit(1); });
+main().catch(async (e) => {
+  console.error("THREW:", e);
+  // Delete ONLY what this run created. A seed that was already there is not
+  // ours to clean up, and an error is the worst possible moment to guess.
+  if (weCreatedIt) { try { await prisma.cryptoConfig.deleteMany({}); console.error("teardown ran (this run's disposable seed)"); } catch {} }
+  else console.error("teardown SKIPPED — this run did not create the row; refusing to delete key material it does not own");
+  process.exit(1);
+});
