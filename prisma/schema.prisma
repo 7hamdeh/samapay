@@ -317,8 +317,15 @@ model CryptoConfig {
   id                  Int      @id @default(1)
   encryptedMasterSeed String   @map("encrypted_master_seed")
   seedFingerprint     String   @map("seed_fingerprint")
-  vaultCiphertext     String?  @map("vault_ciphertext")
   createdAt           DateTime @default(now()) @map("created_at")
+
+  /// MIRRORS SamaPrime EXACTLY. My first version invented `vaultCiphertext`
+  /// and omitted both hot-wallet columns, because I mirrored the model from a
+  /// COMMENT-TRUNCATED read of it. The window COPIES a row between these two
+  /// tables; a column that differs by name is a copy that silently drops a field.
+  vaultVerifier         String? @map("vault_verifier")
+  hotWalletAddressBep20 String? @map("hot_wallet_address_bep20")
+  hotWalletAddressTrc20 String? @map("hot_wallet_address_trc20")
 
   @@map("crypto_config")
 }
