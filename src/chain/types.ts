@@ -6,6 +6,23 @@
 // COPIED ACROSS BEFORE THAT STEP: one private key, one code home.
 import type { Chain } from "@prisma/client";
 
+/**
+ * How deep a block must be before its transfers may be treated as real.
+ *
+ * ⚠️ THIS LIVES HERE, NOT IN THE OBSERVER, BECAUSE TWO MODULES NEED IT AND A
+ * SECOND COPY IS HOW A CHECK STOPS CHECKING (Ibrahim, 2026-09-07):
+ *   - the OBSERVER waits for this depth before crediting a deposit
+ *   - the SCANNER must not look SHALLOWER than it, or it asks TronGrid for
+ *     "confirmed transfers" in a block that is not yet confirmed, gets an
+ *     empty answer that is indistinguishable from "no transfers", and
+ *     advances its cursor past a real deposit forever.
+ *
+ * That is not hypothetical: it is exactly how a 3.010000 USDT TRC20 deposit
+ * in block 86022515 was missed on 2026-09-07. The reader was correct; it
+ * asked at the wrong depth.
+ */
+export const CONFIRMATIONS_REQUIRED: Record<Chain, number> = { BEP20: 15, TRC20: 19 }; // SamaPrime's mainnet defaults
+
 export interface DerivedAddress {
   chain: Chain;
   address: string;

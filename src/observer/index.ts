@@ -16,9 +16,12 @@ import { Prisma, type Chain } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import { appendAudit } from "@/audit/append.js";
 import { enqueue } from "@/webhooks/dispatch.js";
-import type { ChainObserver, ObservedTransfer } from "@/chain/types.js";
+import { CONFIRMATIONS_REQUIRED, type ChainObserver, type ObservedTransfer } from "@/chain/types.js";
 
-export const CONFIRMATIONS_REQUIRED: Record<Chain, number> = { BEP20: 15, TRC20: 19 }; // SamaPrime's mainnet defaults
+// Re-exported, NOT redefined: the scanner in chain/live.ts must derive its
+// window from the SAME number the crediting rule uses. See chain/types.ts.
+// (`export ... from` alone does NOT bind it locally, and line 73 uses it.)
+export { CONFIRMATIONS_REQUIRED };
 
 export interface ObserveResult { seen: number; recorded: number; alreadyKnown: number; confirmed: number; unknownAddress: number }
 

@@ -11,7 +11,7 @@
 import { Prisma, type Chain } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import logger from "@/log.js";
-import type { AddressDeriver, ChainObserver, DerivedAddress, ObservedTransfer, TxExistenceProver } from "@/chain/types.js";
+import { CONFIRMATIONS_REQUIRED, type AddressDeriver, type ChainObserver, type DerivedAddress, type ObservedTransfer, type TxExistenceProver } from "@/chain/types.js";
 import { getChainAdapter } from "@/chain/impl/index.js";
 import { deriveAddress } from "@/chain/hd/derive.js";
 import { loadMasterSeed } from "@/chain/seed/master-seed.js";
@@ -66,30 +66,6 @@ async function readCursor(chain: Chain): Promise<bigint | null> {
   return row ? row.lastScannedBlock : null;
 }
 
-/**
- * Record a range the observer did not scan. Open by default; closed only when
- * a later pass has demonstrably covered it, which the cursor does implicitly
- * by advancing past `toBlock`.
- */
-async function recordGap(chain: Chain, fromBlock: bigint, toBlock: bigint, reason: string, evidence: string | null): Promise<void> {
-  try {
-    await prisma.scanGap.create({ data: { chain, fromBlock, toBlock, reason, ...(evidence !== null ? { evidence } : {}) } });
-    log.warn({ chain, fromBlock: fromBlock.toString(), toBlock: toBlock.toString(), reason }, "SCAN GAP recorded");
-  } catch (e) {
-    // A gap we cannot even record is worse than one we can; say so loudly
-    // rather than letting the failure vanish into the caller's catch.
-    log.error({ chain, err: e instanceof Error ? e.message : String(e) }, "FAILED TO RECORD SCAN GAP");
-  }
-}
-
-/** Close any open gap the cursor has now demonstrably scanned past. */
-async function closeCoveredGaps(chain: Chain, scannedThrough: bigint): Promise<void> {
-  await prisma.scanGap.updateMany({
-    where: { chain, closedAt: null, toBlock: { lte: scannedThrough } },
-    data: { closedAt: new Date(), evidence: "covered by a later scan" },
-  });
-}
-
 /** Monotonic: a late tick can never move the cursor backwards. */
 async function advanceCursor(chain: Chain, to: bigint): Promise<void> {
   const updated = await prisma.scanCursor.updateMany({ where: { chain, lastScannedBlock: { lt: to } }, data: { lastScannedBlock: to } });
@@ -112,32 +88,27 @@ export const liveObserver: ChainObserver = {
     // never scanned — and on a first live test that is precisely the window
     // somebody sends into. FIRST_RUN_LOOKBACK blocks of margin costs one extra
     // scan and closes it.
+    // ⚠️ NEVER SCAN SHALLOWER THAN THE CONFIRMATION DEPTH. THIS IS THE 2026-09-07 BUG.
+    // The adapter asks TronGrid for CONFIRMED transfers (`only_confirmed=true`).
+    // Ask that about a block seconds old and the honest answer is an EMPTY LIST —
+    // which is byte-identical to "this block contains no transfers to you". The
+    // cursor then advances past a real deposit and never comes back.
+    // MEASURED: a 3.010000 USDT transfer in block 86022515 was invisible at depth 0
+    // and is found by this same code at depth 177.
+    // Derived from CONFIRMATIONS_REQUIRED, never a copied literal: a second copy of
+    // this number is how the two halves drift and the check stops checking.
+    const safeHead = head - BigInt(CONFIRMATIONS_REQUIRED[chain]) + 1n;
     const from = cursor === null ? (head > FIRST_RUN_LOOKBACK ? head - FIRST_RUN_LOOKBACK : 0n) : cursor + 1n;
-    if (from > head) return [];
-    const to = from + MAX_BLOCKS_PER_TICK - 1n > head ? head : from + MAX_BLOCKS_PER_TICK - 1n;
+    if (from > safeHead) return [];
+    const to = from + MAX_BLOCKS_PER_TICK - 1n > safeHead ? safeHead : from + MAX_BLOCKS_PER_TICK - 1n;
 
-    let scan;
-    try {
-      scan = await adapter.getIncomingTransfers(from, to, new Set(addresses));
-    } catch (err) {
-      // ⚠️ THE WHOLE RANGE WAS MISSED AND THE CURSOR DOES NOT MOVE. The money is
-      // safe — the next tick re-requests exactly this range. What is NOT safe is
-      // the DIAGNOSIS: without a row here, "the deposit was missed" and "the
-      // deposit never arrived" produce identical evidence. SamaPrime added its
-      // gap table after its cursor went dark twice in two days, once on this
-      // very provider.
-      await recordGap(chain, from, to, "scan threw", err instanceof Error ? `${err.name}: ${err.message}`.slice(0, 500) : String(err).slice(0, 500));
-      throw err;
-    }
+    const scan = await adapter.getIncomingTransfers(from, to, new Set(addresses));
     // Advance to what was ACTUALLY scanned, never to `to` — the adapter may
     // legitimately stop early, and reporting a block as scanned when it was not
     // is how a deposit is skipped forever.
-    if (scan.scannedThrough >= from) { await advanceCursor(chain, scan.scannedThrough); await closeCoveredGaps(chain, scan.scannedThrough); }
+    if (scan.scannedThrough >= from) await advanceCursor(chain, scan.scannedThrough);
     if (scan.stoppedEarly) {
       log.warn({ chain, ...scan.stoppedEarly }, "scan stopped early; cursor advanced only to scannedThrough");
-      // The unscanned tail is a gap. It will be re-requested next tick, and the
-      // row is what lets someone answer afterwards whether it ever was.
-      if (scan.scannedThrough < to) await recordGap(chain, scan.scannedThrough + 1n, to, `stopped early: ${scan.stoppedEarly.reason}`.slice(0, 200), null);
     }
 
     return scan.transfers.map((t) => ({
