@@ -23,6 +23,7 @@ import { submitForSending } from "@/sender/index.js";
 import { attemptDelivery, enqueue } from "@/webhooks/dispatch.js";
 import { chainAdapters } from "@/chain/registry.js";
 import { installLiveChainAdapters } from "@/chain/live.js";
+import { getChainConfig } from "@/chain/impl/config.js";
 import { observeChain } from "@/observer/index.js";
 import type { Chain } from "@prisma/client";
 import { reconcileOnce } from "./reconciler.js";
@@ -56,7 +57,11 @@ async function observeDueOnce(now: number): Promise<Record<string, number> | nul
     const watched = await prisma.address.count({ where: { chain } });
     if (watched === 0) continue;
     try {
-      const r = await observeChain(chain, chainAdapters().observer);
+      // Same call chain/live.ts makes for its scan-window cap — one source,
+      // read fresh every tick so a runtime env change takes effect without a
+      // restart. See docs/confirmation-depth-divergence-2026-09-07.md.
+      const requiredConfirmations = getChainConfig(chain).confirmationsRequired;
+      const r = await observeChain(chain, chainAdapters().observer, requiredConfirmations);
       out[`${chain}_seen`] = r.seen; out[`${chain}_recorded`] = r.recorded; out[`${chain}_confirmed`] = r.confirmed;
     } catch (e) {
       log.error({ chain, err: e instanceof Error ? `${e.name}: ${e.message}` : String(e) }, "observe failed");

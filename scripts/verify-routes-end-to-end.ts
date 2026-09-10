@@ -9,12 +9,19 @@ import { prisma } from "@/db/client.js";
 import { buildApp } from "@/http/app.js";
 import { issueKey } from "@/keys/issue.js";
 import { setChainAdapters } from "@/chain/registry.js";
-import { observeChain, CONFIRMATIONS_REQUIRED } from "@/observer/index.js";
+import { observeChain } from "@/observer/index.js";
 import type { ObservedTransfer } from "@/chain/types.js";
 
 let pass = 0, fail = 0;
 function check(ok: boolean, label: string, detail = "") { if (ok) pass++; else fail++; console.log(`  ${ok ? "PASS" : "FAIL"}  ${label}${detail ? ` — ${detail}` : ""}`); }
 const RUN = Date.now();
+// Deliberately a literal, not getChainConfig("BEP20").confirmationsRequired:
+// this suite tests observeChain()'s PROMOTION LOGIC against a threshold it is
+// TOLD, not whether config resolution is correct (that's
+// scripts/verify-confirmation-depth-single-source.ts). Any value works; the
+// test asserts fewer confirmations than this doesn't promote and this-or-more
+// does.
+const REQUIRED_CONFIRMATIONS_UNDER_TEST = 15;
 
 async function main() {
   console.log(`database: ${await assertSandboxDatabase()}`);
@@ -46,16 +53,16 @@ async function main() {
 
     // 2. observer records a 10 USDT transfer ONCE even when scanned twice
     transfers.push({ chain: "BEP20", txHash: `0xtx${RUN}`, toAddress: a1b.address.address, amount: "10.000000", blockNumber: 1n, confirmations: 0 });
-    const o1 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer);
-    const o2 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer);
+    const o1 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
+    const o2 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
     check(o1.recorded === 1 && o2.recorded === 0 && o2.alreadyKnown === 1, "2. the observer records a transfer once; a second scan sees it as alreadyKnown (UNIQUE chain+tx_hash)", `${JSON.stringify(o1)} then ${JSON.stringify(o2)}`);
     const bal0 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { received: string; allowance: string } };
     check(bal0.balance.received === "0" && bal0.balance.allowance === "0", "3. a DETECTED deposit does not count: /balance still 0", JSON.stringify(bal0.balance));
 
     // 4. confirm once; balance moves exactly once
-    confirmations = CONFIRMATIONS_REQUIRED.BEP20;
-    const o3 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer);
-    const o4 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer);
+    confirmations = REQUIRED_CONFIRMATIONS_UNDER_TEST;
+    const o3 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
+    const o4 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
     const bal1 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { received: string; allowance: string; deposit_count: number } };
     check(o3.confirmed === 1 && o4.confirmed === 0 && bal1.balance.received === "10" && bal1.balance.allowance === "10" && bal1.balance.deposit_count === 1, "4. confirmed exactly once; /balance received=10 allowance=10", `confirmed ${o3.confirmed}/${o4.confirmed} balance=${JSON.stringify(bal1.balance)}`);
     const dep = (await (await app.request("/deposits", { headers: hdr(A.plaintext) })).json()) as { deposits: Array<{ status: string; counts_toward_allowance: boolean }> };

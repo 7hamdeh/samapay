@@ -11,8 +11,9 @@
 import { Prisma, type Chain } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import logger from "@/log.js";
-import { CONFIRMATIONS_REQUIRED, type AddressDeriver, type ChainObserver, type DerivedAddress, type ObservedTransfer, type TxExistenceProver } from "@/chain/types.js";
+import type { AddressDeriver, ChainObserver, DerivedAddress, ObservedTransfer, TxExistenceProver } from "@/chain/types.js";
 import { getChainAdapter } from "@/chain/impl/index.js";
+import { getChainConfig } from "@/chain/impl/config.js";
 import { deriveAddress } from "@/chain/hd/derive.js";
 import { loadMasterSeed } from "@/chain/seed/master-seed.js";
 import { transactionExistsOnChain } from "@/chain/impl/tx-existence.js";
@@ -95,9 +96,11 @@ export const liveObserver: ChainObserver = {
     // cursor then advances past a real deposit and never comes back.
     // MEASURED: a 3.010000 USDT transfer in block 86022515 was invisible at depth 0
     // and is found by this same code at depth 177.
-    // Derived from CONFIRMATIONS_REQUIRED, never a copied literal: a second copy of
-    // this number is how the two halves drift and the check stops checking.
-    const safeHead = head - BigInt(CONFIRMATIONS_REQUIRED[chain]) + 1n;
+    // Read from getChainConfig(), never a copied literal or a second constant:
+    // this MUST be the exact number promoteConfirmed() credits on (observer/
+    // index.ts), or the two halves drift and the check stops checking — see
+    // docs/confirmation-depth-divergence-2026-09-07.md, closed by this change.
+    const safeHead = head - BigInt(getChainConfig(chain).confirmationsRequired) + 1n;
     const from = cursor === null ? (head > FIRST_RUN_LOOKBACK ? head - FIRST_RUN_LOOKBACK : 0n) : cursor + 1n;
     if (from > safeHead) return [];
     const to = from + MAX_BLOCKS_PER_TICK - 1n > safeHead ? safeHead : from + MAX_BLOCKS_PER_TICK - 1n;

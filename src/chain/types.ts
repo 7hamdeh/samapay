@@ -6,22 +6,18 @@
 // COPIED ACROSS BEFORE THAT STEP: one private key, one code home.
 import type { Chain } from "@prisma/client";
 
-/**
- * How deep a block must be before its transfers may be treated as real.
- *
- * ⚠️ THIS LIVES HERE, NOT IN THE OBSERVER, BECAUSE TWO MODULES NEED IT AND A
- * SECOND COPY IS HOW A CHECK STOPS CHECKING (Ibrahim, 2026-09-07):
- *   - the OBSERVER waits for this depth before crediting a deposit
- *   - the SCANNER must not look SHALLOWER than it, or it asks TronGrid for
- *     "confirmed transfers" in a block that is not yet confirmed, gets an
- *     empty answer that is indistinguishable from "no transfers", and
- *     advances its cursor past a real deposit forever.
- *
- * That is not hypothetical: it is exactly how a 3.010000 USDT TRC20 deposit
- * in block 86022515 was missed on 2026-09-07. The reader was correct; it
- * asked at the wrong depth.
- */
-export const CONFIRMATIONS_REQUIRED: Record<Chain, number> = { BEP20: 15, TRC20: 19 }; // SamaPrime's mainnet defaults
+// ⚠️ THERE IS DELIBERATELY NO `CONFIRMATIONS_REQUIRED` CONSTANT HERE ANY MORE.
+// One used to live in this file, and `chain/impl/config.ts` carried a second,
+// identical-valued one (`MAINNET_CONFIRMATION_FLOOR`) for the env-overridable
+// path — two definitions of one money-path quantity, and nothing compared
+// them (docs/confirmation-depth-divergence-2026-09-07.md). Both the OBSERVER
+// (crediting decision) and the SCANNER (how shallow it may look — see
+// `chain/live.ts`, and the 2026-09-07 missed-deposit note there) now read the
+// SAME number from the SAME place: `getChainConfig(chain).confirmationsRequired`
+// in `chain/impl/config.ts`, which is the one that honours
+// `CRYPTO_{BSC,TRON}_CONFIRMATIONS`. `observeChain`/`promoteConfirmed` below
+// take it as an explicit parameter rather than reaching for a module-level
+// constant, so there is no second copy left to drift.
 
 export interface DerivedAddress {
   chain: Chain;

@@ -16,17 +16,21 @@ import { Prisma, type Chain } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import { appendAudit } from "@/audit/append.js";
 import { enqueue } from "@/webhooks/dispatch.js";
-import { CONFIRMATIONS_REQUIRED, type ChainObserver, type ObservedTransfer } from "@/chain/types.js";
-
-// Re-exported, NOT redefined: the scanner in chain/live.ts must derive its
-// window from the SAME number the crediting rule uses. See chain/types.ts.
-// (`export ... from` alone does NOT bind it locally, and line 73 uses it.)
-export { CONFIRMATIONS_REQUIRED };
+import type { ChainObserver, ObservedTransfer } from "@/chain/types.js";
 
 export interface ObserveResult { seen: number; recorded: number; alreadyKnown: number; confirmed: number; unknownAddress: number }
 
-/** One tick for one chain. Safe to call again with the same transfers: nothing double-writes. */
-export async function observeChain(chain: Chain, observer: ChainObserver): Promise<ObserveResult> {
+/**
+ * One tick for one chain. Safe to call again with the same transfers:
+ * nothing double-writes.
+ *
+ * `requiredConfirmations` is an explicit parameter, not a module constant —
+ * the caller (worker/index.ts) reads it from `getChainConfig(chain)
+ * .confirmationsRequired`, the SAME call `chain/live.ts` makes for its
+ * scan-window cap. There is no second definition inside this module left to
+ * drift out of sync with that one (docs/confirmation-depth-divergence-2026-09-07.md).
+ */
+export async function observeChain(chain: Chain, observer: ChainObserver, requiredConfirmations: number): Promise<ObserveResult> {
   const addresses = await prisma.address.findMany({ where: { chain }, select: { id: true, address: true, keyId: true } });
   // ⚠️ CASE IS NOT A FREE NORMALISATION ACROSS CHAINS.
   // BEP20 addresses are hex and case-insensitive (the mixed case is only an
@@ -44,7 +48,7 @@ export async function observeChain(chain: Chain, observer: ChainObserver): Promi
     const outcome = await recordTransfer(chain, t, byAddress.get(key(t.toAddress)));
     result[outcome]++;
   }
-  result.confirmed += await promoteConfirmed(chain, observer);
+  result.confirmed += await promoteConfirmed(chain, observer, requiredConfirmations);
   return result;
 }
 
@@ -66,12 +70,12 @@ async function recordTransfer(chain: Chain, t: ObservedTransfer, target: { id: s
 }
 
 /** detected → confirmed, once. The status guard in the WHERE is what makes "once" true under concurrency. */
-async function promoteConfirmed(chain: Chain, observer: ChainObserver): Promise<number> {
+async function promoteConfirmed(chain: Chain, observer: ChainObserver, requiredConfirmations: number): Promise<number> {
   const pending = await prisma.deposit.findMany({ where: { chain, status: "detected" }, select: { id: true, keyId: true, txHash: true, amount: true, addressId: true } });
   let promoted = 0;
   for (const d of pending) {
     const confirmations = await observer.confirmationsFor(chain, d.txHash);
-    if (confirmations < CONFIRMATIONS_REQUIRED[chain]) { await prisma.deposit.update({ where: { id: d.id }, data: { confirmations } }); continue; }
+    if (confirmations < requiredConfirmations) { await prisma.deposit.update({ where: { id: d.id }, data: { confirmations } }); continue; }
     await prisma.$transaction(async (tx) => {
       const flipped = await tx.deposit.updateMany({ where: { id: d.id, status: "detected" }, data: { status: "confirmed", confirmations, creditedAt: new Date() } });
       if (flipped.count !== 1) return; // someone else confirmed it first; nothing to do, nothing to audit twice
