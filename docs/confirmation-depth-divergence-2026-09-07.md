@@ -1,9 +1,26 @@
 # TWO DEFINITIONS OF ONE MONEY-PATH QUANTITY — THE OBSERVER IGNORES THE CONFIGURED CONFIRMATION DEPTH
 
-**2026-09-07, providers-rules. OPEN. Latent, not live — measured, see §3.
-NOT fixed: it was found while executing Ibrahim's four approved steps for
-the TRC20 rewind, and a fifth change riding in under an approval for four
-is the exact defect that night was about.**
+**2026-09-07, providers-rules. Filed OPEN. Latent, not live — measured, see
+§3. NOT fixed then: it was found while executing Ibrahim's four approved
+steps for the TRC20 rewind, and a fifth change riding in under an approval
+for four is the exact defect that night was about.**
+
+⚠️ **CLOSED 2026-09-10, `samaprime-com-64` (SamaPay), commit `0eaabcd`.**
+Taken as item 3 of that day's status report, per lead's instruction to close
+it before either `CRYPTO_TRON_CONFIRMATIONS` or `CRYPTO_BSC_CONFIRMATIONS` is
+ever set, not after. The duplicate was REMOVED rather than reconciled with an
+equality assertion: `chain/live.ts`'s scan-window cap and
+`observer/index.ts`'s crediting threshold both now read
+`getChainConfig(chain).confirmationsRequired` (an explicit parameter into
+`observeChain`, not a module constant either module keeps its own copy of).
+Proven by `scripts/verify-confirmation-depth-single-source.ts` — 9/0,
+including a real seed-the-defect-and-watch-it-fail run before this fix was
+trusted. The scope measured in §3 below (harmless while both env vars are
+unset) held at the moment of the fix and is no longer load-bearing: it is
+now correct regardless of whether either variable is ever set.
+
+**The section below is kept verbatim as the original finding — do not edit
+it to read as already fixed.**
 
 ## 1. THE TWO SITES
 

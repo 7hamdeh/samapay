@@ -56,6 +56,8 @@ Per TRAP 21, already written down before this entry existed:
                with a forced gap, or this acceptance is renewed with a new
                date and a reason, per the same rule.
 
-**Not picked up this cycle** — item 3 (confirmation-depth divergence) and
-the seed-move rehearsal are ahead of it in the queue, both approved by
-`samaprime-com-a0` (lead) 2026-09-10.
+**Not picked up this cycle** — item 3 (confirmation-depth divergence) is
+CLOSED same cycle (commit `0eaabcd`, see
+`docs/confirmation-depth-divergence-2026-09-07.md`'s closure note); the
+seed-move rehearsal is ahead of this item in the queue, per lead's
+instruction 2026-09-10.
