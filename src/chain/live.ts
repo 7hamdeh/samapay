@@ -18,6 +18,7 @@ import { deriveAddress } from "@/chain/hd/derive.js";
 import { loadMasterSeed } from "@/chain/seed/master-seed.js";
 import { transactionExistsOnChain } from "@/chain/impl/tx-existence.js";
 import { setChainAdapters } from "@/chain/registry.js";
+import { derivationFloor, nextIndexAboveFloor } from "@/chain/derivation-floor.js";
 
 const log = logger.child({ mod: "chain/live" });
 
@@ -46,6 +47,10 @@ export function rawToDecimalString(amountRaw: string, tokenDecimals: number): st
 // ── deriver ────────────────────────────────────────────────────────────────
 export const liveDeriver: AddressDeriver = {
   async deriveNext(chain: Chain): Promise<DerivedAddress> {
+    // ⚠️ THE FLOOR FIRST, BEFORE THE SEED IS EVEN LOADED. Under decision #80
+    // SamaPay derives from MNTAD's seed; every index at or below the floor may
+    // already be a customer's address there. Unset or invalid → refuse.
+    const floor = derivationFloor(chain);
     const seed = await loadMasterSeed();
     // The NEXT index for this chain. @@unique([chain, derivationIndex]) is what
     // actually prevents reuse — this read only picks a candidate, and a
@@ -54,7 +59,7 @@ export const liveDeriver: AddressDeriver = {
     const highest = await prisma.address.findFirst({
       where: { chain }, orderBy: { derivationIndex: "desc" }, select: { derivationIndex: true },
     });
-    const derivationIndex = (highest?.derivationIndex ?? -1) + 1;
+    const derivationIndex = nextIndexAboveFloor(highest?.derivationIndex ?? null, floor);
     const address = deriveAddress(seed, chain, derivationIndex);
     log.info({ chain, derivationIndex }, "derived address"); // never the address itself at info
     return { chain, address, derivationIndex };
@@ -154,6 +159,16 @@ export const liveProver: TxExistenceProver = {
  * withdrawal is worse than one that refuses by name up front, so it stays the
  * refusing stub until the vault path is proven end to end.
  */
+/**
+ * The API process's half: the DERIVER only (POST /addresses, POST
+ * /payment-intents). The observer and prover belong to the worker; the sender
+ * stays refusing everywhere (see below). Call after assertDerivationFloorsConfigured().
+ */
+export function installLiveDeriver(): void {
+  setChainAdapters({ deriver: liveDeriver });
+  log.warn("live deriver installed (index floor enforced).");
+}
+
 export function installLiveChainAdapters(): void {
   setChainAdapters({ deriver: liveDeriver, observer: liveObserver, prover: liveProver });
   log.warn("live chain adapters installed: deriver, observer, prover. SENDER REMAINS REFUSING (vault not proven).");
