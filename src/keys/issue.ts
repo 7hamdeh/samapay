@@ -1,11 +1,13 @@
 // Issuing and revoking keys. Called by the CLI (his hand) and by the admin
 // route (SamaPrime's admin key, scope keys.issue). Returns the plaintext
-// ONCE; nothing stores it.
+// ONCE; nothing stores it. Same for the webhook secret when a webhook URL is
+// given: plaintext returned once, AEAD ciphertext stored (webhook-secret.ts).
 import type { KeyEnvironment } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import { appendAudit } from "@/audit/append.js";
 import { isScope, type Scope } from "@/http/scopes.js";
 import { generatePlaintextKey, hashKey, keyLast4Of, keyPrefixOf } from "./generate.js";
+import { encryptWebhookSecret, generateWebhookSecret, validateWebhookUrl } from "./webhook-secret.js";
 
 export interface IssueKeyInput {
   clientId: string;
@@ -33,6 +35,12 @@ export async function issueKey(input: IssueKeyInput) {
   const client = await prisma.client.findUnique({ where: { id: input.clientId }, select: { id: true } });
   if (!client) throw new IssueKeyError("unknown_client", `client ${input.clientId} does not exist`);
   const environment: KeyEnvironment = input.environment ?? "live";
+  // A webhook URL brings its own secret, generated HERE and nowhere else: the
+  // plaintext is returned once (below) and the column only ever receives the
+  // AEAD ciphertext. Validated BEFORE any row is written.
+  const webhookUrl = input.webhookUrl ? validateWebhookUrl(input.webhookUrl) : null;
+  const webhookSecret = webhookUrl ? generateWebhookSecret() : null;
+  const webhookSecretCiphertext = webhookSecret ? encryptWebhookSecret(webhookSecret) : null;
 
   // Prefix collision is possible (12 chars, 4 random); loop rather than fail.
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -45,14 +53,15 @@ export async function issueKey(input: IssueKeyInput) {
       const created = await tx.clientKey.create({
         data: {
           clientId: client.id, name: input.name, keyPrefix, keyHash, keyLast4: keyLast4Of(plaintext),
-          scopes, environment, issuedBy: input.issuedBy, issuedVia: input.issuedVia, webhookUrl: input.webhookUrl ?? null,
+          scopes, environment, issuedBy: input.issuedBy, issuedVia: input.issuedVia, webhookUrl, webhookSecret: webhookSecretCiphertext,
         },
         select: { id: true, clientId: true, name: true, keyPrefix: true, keyLast4: true, scopes: true, environment: true, createdAt: true },
       });
-      await appendAudit(tx, { keyId: created.id, actor: input.issuedVia === "cli" ? `cli:${input.issuedBy}` : `admin:${input.issuedBy}`, action: "key.issued", subjectId: created.id, params: { scopes, environment, name: input.name } });
+      await appendAudit(tx, { keyId: created.id, actor: input.issuedVia === "cli" ? `cli:${input.issuedBy}` : `admin:${input.issuedBy}`, action: "key.issued", subjectId: created.id, params: { scopes, environment, name: input.name, webhookUrl } });
       return created;
     });
-    return { ...row, plaintext };
+    // `webhookSecret` is the PLAINTEXT, returned once like `plaintext`; null when no URL was given.
+    return { ...row, plaintext, webhookSecret };
   }
   throw new Error("could not allocate a unique key prefix after 5 attempts");
 }

@@ -6,6 +6,8 @@
 // here would be the thing this comment exists to refuse.
 export const SCOPES = [
   "addresses.write", "deposits.read", "withdrawals.write", "withdrawals.read", "balance.read",
+  // S2 slice 1: a merchant's gateway key creates and reads its own payment intents.
+  "payment_intents.write", "payment_intents.read",
   // held only by the SamaPrime server's admin key: it can issue and revoke
   // keys and can NEVER move money — that is what keeps "no privileged path" true.
   "keys.issue",
