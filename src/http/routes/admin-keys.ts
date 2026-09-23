@@ -2,7 +2,8 @@
 //
 // This was the surface SamaPrime's merchant-enable action called to mint a
 // key per merchant. The 2026-09-04 model correction retired that caller
-// outright: SamaPrime is ONE client with ONE key, minted from the CLI by
+// outright: SamaPrime was ONE client with ONE key (superseded by #80, 2026-09-23:
+// one client + key PER MERCHANT, still minted from the CLI), minted from the CLI by
 // Ibrahim's own hand (scripts/issue-key.ts). So this route has NO CALLER —
 // and a mounted route with no caller is attack surface for nothing, plus
 // the "looks finished because the thing that would expose it is disabled"

@@ -12,6 +12,13 @@
 // underneath it. Build to his form; if any older spec text still shows the
 // two-part one, it is stale.
 //
+// ⚠️ SUPERSEDED IN PART BY DECISION #80 (Ibrahim, 2026-09-23): each MNTAD
+// merchant is now its OWN client (one account + key per merchant), not a
+// tenant of a single SamaPrime client. The four-part SHAPE is unchanged and
+// still enforced; only the "merchants are tenants of one client" reading above
+// is historical. A merchant client may still use the tenant segment for its
+// own sub-division.
+//
 // *** WHAT SAMAPAY ENFORCES, AND WHAT IT REFUSES TO KNOW. ***
 // It validates the SHAPE — four segments, no delimiter inside one, none
 // empty — because that is what makes his three properties TRUE rather than

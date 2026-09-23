@@ -14,14 +14,18 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// A CLIENT IS A WHOLE SYSTEM, NEVER ONE OF ITS MERCHANTS. Ibrahim,
-// 2026-09-04: "SamaPrime is ONE client of SamaPay with ONE key; it
-// distributes internally to its merchants by reference — a merchant never
-// knows SamaPay exists." `merchant` was a value here until that correction
-// and is retired: a SamaPrime merchant is not a client of anything.
+// ONE CLIENT PER MERCHANT — decision #80 (Ibrahim, 2026-09-23) and the S2
+// slice-1 spec: every merchant has its own pre-provisioned SamaPay account
+// (a Client) with its own live key, webhook URL and webhook secret; the
+// merchant's received crypto is that account's gateway balance. This
+// SUPERSEDES the 2026-09-04 wording that stood here ("SamaPrime is ONE client
+// of SamaPay with ONE key; it distributes internally to its merchants by
+// reference — a merchant never knows SamaPay exists"). `merchant` returns as a
+// value for that reason. Merchant identity is the KEY, never a request body.
 enum ClientKind {
-  platform // SamaPrime itself — one client, one key
+  platform // legacy: the single SamaPrime client of the 2026-09-04 model
   partner // an external site (dahabi, others) that registers on SamaPay's own site
+  merchant // one pre-provisioned account per MNTAD merchant (#80)
 }
 
 enum KeyEnvironment {
@@ -73,7 +77,8 @@ model Client {
   // SamaPrime merchant belongs in this table.
   createdAt DateTime   @default(now()) @map("created_at")
 
-  keys ClientKey[]
+  keys    ClientKey[]
+  intents PaymentIntent[]
 
   @@map("clients")
 }
@@ -110,7 +115,10 @@ model ClientKey {
   successorKeyId String?        @map("successor_key_id")
   revokedAt      DateTime?      @map("revoked_at")
   revokedReason  String?        @map("revoked_reason")
-  // Per-client-key webhook target and secret (secret AEAD-encrypted at rest).
+  // Per-client-key webhook target and secret. `webhook_secret` holds AEAD
+  // CIPHERTEXT ONLY (src/keys/webhook-secret.ts, "v1:" prefix) — never the
+  // plaintext, which is printed once by the CLI. The dispatcher DECRYPTS it
+  // and refuses to sign with anything that does not decrypt.
   webhookUrl     String?        @map("webhook_url")
   webhookSecret  String?        @map("webhook_secret")
   createdAt      DateTime       @default(now()) @map("created_at")
@@ -122,6 +130,7 @@ model ClientKey {
   idempotency  IdempotencyKey[]
   deliveries   WebhookDelivery[]
   audit        AuditEvent[]
+  intents      PaymentIntent[]
 
   @@index([clientId, active])
   @@map("client_keys")
@@ -145,6 +154,7 @@ model Address {
   createdAt       DateTime  @default(now()) @map("created_at")
 
   deposits Deposit[]
+  intent   PaymentIntent?
 
   @@unique([chain, address])
   @@unique([chain, derivationIndex])
@@ -367,4 +377,61 @@ model ScanGap {
 
   @@index([chain, closedAt])
   @@map("scan_gaps")
+}
+
+// ── PAYMENT INTENTS (S2 slice 1) ────────────────────────────────────────────
+// A fixed-amount request to be paid on-chain. Each intent owns ONE freshly
+// derived address (never reused, index above the configured floor — see
+// src/chain/derivation-floor.ts). The observer advances the status from the
+// deposits at that address; `amount_received` is NOT stored — it is read from
+// confirmed deposits, the one calculator (src/intents/advance.ts).
+//   requires_payment → processing → succeeded | succeeded_late
+//                    → expired | expired_partial → (late payment) succeeded_late
+enum PaymentIntentStatus {
+  requires_payment
+  processing
+  succeeded
+  succeeded_late
+  expired
+  expired_partial
+}
+
+model PaymentIntent {
+  id          String              @id // pi_…
+  clientId    String              @map("client_id")
+  client      Client              @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  // The creating key: its webhook URL/secret receive this intent's events.
+  keyId       String              @map("key_id")
+  key         ClientKey           @relation(fields: [keyId], references: [id], onDelete: Restrict)
+  addressId   String              @unique @map("address_id")
+  address     Address             @relation(fields: [addressId], references: [id], onDelete: Restrict)
+  chain       Chain
+  amount      Decimal             @db.Decimal(18, 6)
+  reference   String // the store's own id for this payment; opaque here
+  status      PaymentIntentStatus @default(requires_payment)
+  expiresAt   DateTime            @map("expires_at")
+  succeededAt DateTime?           @map("succeeded_at")
+  expiredAt   DateTime?           @map("expired_at")
+  createdAt   DateTime            @default(now()) @map("created_at")
+  updatedAt   DateTime            @updatedAt @map("updated_at")
+
+  events PaymentIntentEvent[]
+
+  @@index([clientId, reference])
+  @@index([status, expiresAt])
+  @@map("payment_intents")
+}
+
+// EXACTLY ONE EVENT PER (intent, type) — structural, by the unique below; the
+// webhook delivery for it is enqueued in the same transaction with
+// event_id = this row's id.
+model PaymentIntentEvent {
+  id        String        @id // evt_…
+  intentId  String        @map("intent_id")
+  intent    PaymentIntent @relation(fields: [intentId], references: [id], onDelete: Restrict)
+  type      String // payment_intent.succeeded | payment_intent.expired
+  createdAt DateTime      @default(now()) @map("created_at")
+
+  @@unique([intentId, type])
+  @@map("payment_intent_events")
 }

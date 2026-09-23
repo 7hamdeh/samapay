@@ -5,6 +5,15 @@ own domain. It owns all crypto. SamaPrime is its first HTTP client with
 no privileged path; every merchant is a client with its own key; dahabi
 is the second client.
 
+**Decision #80 (Ibrahim, 2026-09-23) supersedes the 2026-09-04 wording "SamaPrime
+is ONE client; merchants are tenants"** wherever it still appears in comments:
+one pre-provisioned account (`Client`, kind `merchant`) + one live key per
+MNTAD merchant, webhook URL + AEAD-encrypted webhook secret on the key, keys
+minted by Ibrahim via `scripts/issue-key.ts`. ONE seed (MNTAD's `a4434b0b`)
+lives here; the index floor (`src/chain/derivation-floor.ts`) keeps SamaPay's
+derivations above every index MNTAD issued. Seed `02e0fb61` is written off:
+no code keeps it readable or special-cases it.
+
 **KEYS — IBRAHIM'S RULE, TYPED BY HIS HAND 2026-09-06, VERBATIM:**
 > "KEYS ARE MINTED BY THE OWNER'S HAND OR BY THE CLIENT PANEL'S OWN
 > SIGNED-IN OWNER FOR THEIR OWN ACCOUNT — NEVER BY AN OPERATOR ON SOMEONE

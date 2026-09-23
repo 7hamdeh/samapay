@@ -54,6 +54,22 @@ async function main() {
   if (!m || m !== d || !/^\/tmp\/throwaway-pg-[^/]+\/pgdata$/.test(d)) refuse(`cluster proof failed (marker=${m} server=${d})`);
   console.log(`[throwaway-sandbox] cluster proof OK: ${d}`);
 
+  // --check-migrations: prove the migration FILES reproduce schema.prisma
+  // exactly. Prisma replays every migrations/*/migration.sql into a SHADOW
+  // database — here an empty database on this same disposable cluster — and
+  // diffs the result against the datamodel. --exit-code: 0 = identical,
+  // 2 = drift (printed). This is the only place migration SQL executes in a
+  // test run; nothing is applied to any database that outlives the cluster.
+  if (scripts[0] === "--check-migrations") {
+    await prisma.$executeRawUnsafe("CREATE DATABASE throwaway_shadow");
+    await prisma.$disconnect();
+    const shadow = new URL(url.toString());
+    shadow.pathname = "/throwaway_shadow";
+    const r = spawnSync("./node_modules/.bin/prisma", ["migrate", "diff", "--from-migrations", "prisma/migrations", "--to-schema-datamodel", "prisma/schema.prisma", "--shadow-database-url", shadow.toString(), "--script", "--exit-code"], { stdio: "inherit" });
+    console.log(`[throwaway-sandbox] migrations-vs-schema diff exit ${r.status} (0 = the files reproduce the schema exactly)`);
+    process.exit(r.status === 0 ? 0 : 1);
+  }
+
   await prisma.$executeRawUnsafe("CREATE DATABASE throwaway_sandbox");
   await prisma.$disconnect();
   const sandbox = new URL(url.toString());
