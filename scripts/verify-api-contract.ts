@@ -415,10 +415,14 @@ async function main() {
     const BR = await iss(cA.id, "brake", ALL);
     await prisma.clientKey.update({ where: { id: BR.id }, data: { rpsLimit: 100_000 } });
     const brWrong = BR.plaintext.slice(0, 12) + "z".repeat(BR.plaintext.length - 12);
+    // Timing-honest: each failed verify costs one argon2 (~0.1 s) and the bucket refills 1/s, so
+    // the 11th or 12th wrong secret may still reach argon2. The claim is: at least the first 10
+    // are verified, the brake engages within a few more, and from then on it answers 429.
     const brakeCodes: string[] = [];
-    for (let i = 0; i < 12; i++) brakeCodes.push(String((await call("GET", "/v1/payment-intents", brWrong)).code));
+    for (let i = 0; i < 20 && !brakeCodes.includes("rate_limited"); i++) brakeCodes.push(String((await call("GET", "/v1/payment-intents", brWrong)).code));
+    const firstLimited = brakeCodes.indexOf("rate_limited");
     const brRight = await call("GET", "/v1/payment-intents", BR.plaintext);
-    check(brakeCodes.slice(0, 10).every((x) => x === "invalid_key") && brakeCodes.slice(10).every((x) => x === "rate_limited") && brRight.status === 429 && Number(brRight.res.headers.get("retry-after")) >= 1,
+    check(firstLimited >= 10 && firstLimited <= 13 && brakeCodes.slice(0, firstLimited).every((x) => x === "invalid_key") && brRight.status === 429 && Number(brRight.res.headers.get("retry-after")) >= 1,
       "Q-M1 after 10 failed verifies on one prefix the prefix is 429 BEFORE argon2 (the real holder too, while it lasts — the stated trade-off)", brakeCodes.join(","));
     const brOther = await call("GET", "/v1/payment-intents", A.plaintext);
     check(brOther.status === 200, "Q-M1 the brake is per prefix: other keys are unaffected", `${brOther.status}`);
