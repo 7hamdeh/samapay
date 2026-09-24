@@ -13,17 +13,21 @@ import { Prisma, type Chain, type PaymentIntentStatus } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import { logger } from "@/log.js";
 import { getChainConfig } from "@/chain/impl/config.js";
-import { createIntent, INTENT_SELECT, renderPaymentIntent, type IntentRow } from "@/intents/index.js";
+import { INTENT_SELECT, renderPaymentIntent, type IntentRow } from "@/intents/index.js";
 import { bearerAuth, scope } from "../auth.js";
 import { ApiError, fieldsOf } from "../errors.js";
 import { idempotent } from "../idempotency.js";
 
-// ── G2's createIntent (src/intents); replaceable only so the verify script can inject a fake ──
+// ── PORT: G2's createIntent. The COMPOSITION ROOT (src/server.ts bootApi)
+// installs it; the server refuses to start while it is unwired
+// (assertApiPortsWired). Unwired, a request is a 500 internal that logs why —
+// never a 503 that would read as a normal derivation outage.
 export interface CreateIntentInput { amount: string; chain: Chain; reference: string; expiresInSec: number }
 export type CreateIntentFn = (clientId: string, keyId: string, input: CreateIntentInput) => Promise<{ id: string }>;
-let createIntentImpl: CreateIntentFn = createIntent;
-/** Wiring point for G2's createIntent (and for the verify script's fake). */
+let createIntentImpl: CreateIntentFn | null = null;
+/** Wiring point: src/server.ts installs G2's createIntent; the verify script installs a fake. */
 export function setCreateIntent(fn: CreateIntentFn): void { createIntentImpl = fn; }
+export function createIntentWired(): boolean { return createIntentImpl !== null; }
 
 // ── Validation (§5 amount rules, §4 reference) ──
 // Order matters: a missing/ill-typed field is 400 validation_failed; a
@@ -76,6 +80,7 @@ function mapCreateError(e: unknown): never {
   }
   if (name === "ReferenceInvalid") throw new ApiError("reference_invalid", "reference must be 1-200 characters of [A-Za-z0-9:_-].");
   if (name === "ReferenceConflict") throw new ApiError("reference_conflict", "A payment intent with this reference already exists with a different amount or chain.");
+  // IntentKeyMismatch is a caller bug (auth resolved key + client): falls through to 500 internal.
   if (name === "AmountOutOfRange") throw new ApiError("amount_out_of_range", "amount is outside this account's allowed range for a payment intent.");
   if (name === "UnsupportedChain") throw new ApiError("unsupported_chain", "This chain is not enabled for this account.");
   if (name === "DerivationUnavailable") throw new ApiError("derivation_unavailable", "Address derivation is unavailable; nothing was created. Retry later.");
@@ -117,10 +122,12 @@ paymentIntents.post("/", scope("payment_intents.write"), idempotent, async (c) =
   if (existing) return c.json(renderIntent(existing), 200);
 
   let created: { id: string };
+  if (!createIntentImpl) throw new Error("port not wired: createIntent (src/server.ts bootApi must install it)");
   try { created = await createIntentImpl(key.clientId, key.id, { amount, chain: chain as Chain, reference, expiresInSec }); }
   catch (e) {
-    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-      // Lost the UNIQUE(client_id, reference) race: the winner's row decides.
+    if ((e instanceof Error && e.name === "ReferenceConflict") || (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002")) {
+      // Lost the UNIQUE(client_id, reference) race (G2 answers ReferenceConflict,
+      // or the raw P2002): the winner's row decides — 200 the same, 409 a different one.
       const winner = await existingForReference(key.clientId, reference, amount, chain as Chain);
       if (winner) return c.json(renderIntent(winner), 200);
     }

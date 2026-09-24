@@ -4,7 +4,9 @@
 // (no port, no chain): the ONLY double is the chain adapter (deterministic
 // derivations above the floor, a transfer list and a confirmation count we
 // control). createIntent (G2), the observer (G2), enqueueEvent/getEvent (G3),
-// balance (G6) and every route (G1) are the production code.
+// balance (G6) and every route (G1) are the production code, composed by the
+// real entry point (src/server.ts bootApi). Balance checks carried over from
+// G6's stop-gap version of this file: pending vs available, never clamped.
 //
 //   top-up address → intent (real createIntent) → transfer seen → processing →
 //   confirmed → succeeded → deposit.confirmed + payment_intent.succeeded events
@@ -19,9 +21,10 @@
 //   bash /www/wwwroot/samaprime.com/scripts/throwaway-pg.sh \
 //     ./node_modules/.bin/tsx scripts/throwaway-sandbox.ts scripts/verify-routes-end-to-end.ts
 import { isDeepStrictEqual } from "node:util";
+import { Prisma } from "@prisma/client";
 import { assertSandboxDatabase } from "@/db/guard.js";
 import { prisma } from "@/db/client.js";
-import { buildApp } from "@/http/app.js";
+import { bootApi } from "@/server.js";
 import { issueKey } from "@/keys/issue.js";
 import { setChainAdapters } from "@/chain/registry.js";
 import { observeChain } from "@/observer/index.js";
@@ -45,14 +48,14 @@ type Json = Record<string, unknown> & { error?: { code: string } };
 
 async function main() {
   console.log(`database: ${await assertSandboxDatabase()}`);
-  const app = buildApp();
-  setEventSink(enqueueEvent); // the composition the worker does
+  const app = bootApi();          // THE API composition root (ports wired, live deriver installed — replaced below)
+  setEventSink(enqueueEvent);     // the composition the worker does
   const made = { clients: [] as string[], keys: [] as string[] };
 
   let nextIndex = 2_000_000 + (RUN % 100_000) * 10;
   const transfers: ObservedTransfer[] = []; let confirmations = 0;
   const fakeObserver = { async scan() { return transfers; }, async confirmationsFor() { return confirmations; } };
-  setChainAdapters({
+  setChainAdapters({ // after bootApi: the fake chain replaces the live deriver
     deriver: { async deriveNext(chain) { const i = nextIndex++; return { chain, address: `TE2E${RUN}${i}`, derivationIndex: i }; } },
     observer: fakeObserver,
   });
@@ -92,6 +95,9 @@ async function main() {
     transfers.push({ chain: "TRC20", txHash: `e2etx${RUN}a`, toAddress: String(pi.address), amount: "12.5", blockNumber: 10n, confirmations: 0 });
     transfers.push({ chain: "TRC20", txHash: `e2etx${RUN}b`, toAddress: String(t1.json.address), amount: "3.25", blockNumber: 10n, confirmations: 0 });
     await tick();
+    const bal0 = await req("GET", "/v1/balance", A.plaintext);
+    const trc0 = (bal0.json.chains as Record<string, { available: string; pending: string }> | undefined)?.TRC20;
+    check(trc0?.available === "0" && trc0?.pending === "15.75", "3a. /v1/balance: DETECTED deposits count in pending (12.5 + 3.25), not in available", JSON.stringify(bal0.json.chains));
     const g3 = await req("GET", `/v1/payment-intents/${pi.id}`, A.plaintext);
     check(g3.json.status === "processing" && g3.json.amount_received === "0", "3. a detected, unconfirmed transfer → processing, amount_received still 0", `${g3.json.status} ${g3.json.amount_received}`);
 
@@ -134,6 +140,12 @@ async function main() {
     const trc = (bal.json.chains as Record<string, { available: string }> | undefined)?.TRC20;
     check(bal.status === 200 && bal.json.object === "balance" && trc?.available === "15.75", "7. GET /v1/balance: TRC20 available = 12.5 + 3.25", JSON.stringify(bal.json));
 
+    // 7b. CONTROL — available is never clamped: force a consuming withdrawal larger than received.
+    await prisma.withdrawal.create({ data: { keyId: A.id, toAddress: "T" + "f".repeat(33), chain: "TRC20", amount: new Prisma.Decimal("20"), status: "sent", idempotencyKey: `forced-${RUN}` } });
+    const bal2 = await req("GET", "/v1/balance", A.plaintext);
+    const trc2 = (bal2.json.chains as Record<string, { available: string }> | undefined)?.TRC20;
+    check(trc2?.available === "-4.25", "7b. CONTROL — /v1/balance never clamps: a forced 20 over-send reads -4.25", JSON.stringify(bal2.json.chains));
+
     // 8. ISOLATION — client B sees none of it
     const iB = await req("GET", `/v1/payment-intents/${pi.id}`, B.plaintext);
     const dB = await req("GET", `/v1/deposits/${dep.id}`, B.plaintext);
@@ -145,7 +157,7 @@ async function main() {
 
     // 9. Phase 0: no withdrawal route
     const w = await req("POST", "/v1/withdrawals", A.plaintext, { to: "T" + "x".repeat(33), amount: "1", chain: "TRC20" });
-    check(w.status === 404 && (await prisma.withdrawal.count({ where: { keyId: A.id } })) === 0, "9. Phase 0 refuses withdrawals: POST /v1/withdrawals is 404, no row", `${w.status}`);
+    check(w.status === 404 && (await prisma.withdrawal.count({ where: { keyId: A.id, idempotencyKey: { not: `forced-${RUN}` } } })) === 0, "9. Phase 0 refuses withdrawals: POST /v1/withdrawals is 404, no row written by the API", `${w.status}`);
   } catch (err) {
     // ⚠️ WITHOUT THIS, A CRASH REPORTS AS A CLEAN ZERO (the finally's exit discards it).
     fail++;
@@ -155,6 +167,7 @@ async function main() {
     const eventIds = (await prisma.event.findMany({ where: { clientId: { in: made.clients } }, select: { id: true } })).map((e) => e.id);
     await prisma.webhookDelivery.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
     await prisma.event.deleteMany({ where: { id: { in: eventIds } } }).catch(() => undefined);
+    await prisma.withdrawal.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
     await prisma.deposit.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
     await prisma.paymentIntent.deleteMany({ where: { clientId: { in: made.clients } } }).catch(() => undefined);
     await prisma.idempotencyKey.deleteMany({ where: { keyId: keys } }).catch(() => undefined);

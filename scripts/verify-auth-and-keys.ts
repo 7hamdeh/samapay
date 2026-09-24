@@ -100,6 +100,13 @@ async function main() {
     check(r7c.status === 401 && b7c.error?.code === "invalid_key", "7b. a WRONG secret on the revoked key's prefix is invalid_key — revocation is never told to a stranger", `${r7c.status} ${b7c.error?.code}`);
     const r7d = await app.request("/v1/balance", { headers: { authorization: `Bearer ${successor.plaintext}` } });
     check(r7d.status === 200, "7c. the successor key is served", `${r7d.status}`);
+    // 7d. contract §2: sk_test_ keys on NON-production only. The same test key, in production mode, is refused.
+    const priorMode = process.env.CRYPTO_MODE;
+    process.env.CRYPTO_MODE = "mainnet";
+    const r7e = await app.request("/v1/balance", { headers: { authorization: `Bearer ${successor.plaintext}` } });
+    if (priorMode === undefined) delete process.env.CRYPTO_MODE; else process.env.CRYPTO_MODE = priorMode;
+    const b7e = (await res5json(r7e)) as { error?: { code: string } };
+    check(r7e.status === 401 && b7e.error?.code === "invalid_key", "7d. the same sk_test_ key in production mode (CRYPTO_MODE=mainnet) → 401 invalid_key", `${r7e.status} ${b7e.error?.code}`);
 
     const rows = await prisma.auditEvent.findMany({ orderBy: { at: "asc" }, select: { at: true, keyId: true, actor: true, action: true, subjectId: true, idempotencyKey: true, params: true, prevHash: true, hash: true } });
     let prev = GENESIS_HASH, broken = 0;
