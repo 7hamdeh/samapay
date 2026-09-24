@@ -31,6 +31,9 @@ import crypto from "node:crypto";
 process.env.SEED_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
 process.env.SAMAPAY_DERIVATION_FLOOR_TRC20 = "1000";
 process.env.SAMAPAY_DERIVATION_FLOOR_BEP20 = "1000";
+// Mainnet CONFIG (depths 19 / 15, the production numbers) — read, never dialled:
+// nothing here or in the two CLIs opens an RPC connection.
+process.env.CRYPTO_MODE = "mainnet";
 
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -46,8 +49,9 @@ import { getChainConfig } from "@/chain/impl/config.js";
 import { check, summary } from "./lib/check.js";
 
 const RUN = Date.now().toString(36);
-// Temp files under $TMPDIR (point it at a scratch folder when running).
-const DIR = mkdtempSync(join(tmpdir(), "verify-legacy-handoff-"));
+// Input files under $VERIFY_TMP (a scratch folder), else the OS temp dir. Not
+// TMPDIR: tsx puts its IPC socket there and a long path overflows sun_path.
+const DIR = mkdtempSync(join(process.env.VERIFY_TMP ?? tmpdir(), "verify-legacy-handoff-"));
 const IMPORT = "scripts/import-legacy-addresses.ts";
 const WATCH = "scripts/ops/start-legacy-watch.ts";
 
@@ -159,12 +163,13 @@ async function main() {
   const cFile = file("cursors.json", { TRC20: Number(650n + d.TRC20), BEP20: 800, stoppedAt });
   r = run(WATCH, [`--cursors=${cFile}`]);
   check(r.code === 0 && /TRC20: WOULD SET cursor 700 -> 650; re-scan 50/.test(r.out) && (await snap()) === initial, "9. dry run prints the rewind (TRC20 700 -> 650, 50 blocks) and writes nothing", `exit ${r.code}`);
+  check(r.out.includes(`network: mainnet; confirmation depth TRC20 ${d.TRC20}, BEP20 ${d.BEP20}`), "9b. the dry run prints the network and the depth it subtracts, per chain");
 
   // 10. apply: ahead moves back to the MIN, behind stays, both stamped
   r = run(WATCH, [`--cursors=${cFile}`, "--apply"]);
   const after = await snap();
   check(r.code === 0 && after === JSON.stringify({ BEP20: { block: "500", stamped: true }, TRC20: { block: "650", stamped: true } }),
-    "10. --apply: TRC20 (ahead) moves BACK to MNTAD 653 − depth = 650; BEP20 (behind, 500 < 797) STAYS at 500; legacy watch stamped on both", after);
+    `10. --apply: TRC20 (ahead, 700) moves BACK to MNTAD ${650n + d.TRC20} − depth ${d.TRC20} = 650; BEP20 (behind, 500 < 800 − ${d.BEP20}) STAYS at 500; legacy watch stamped on both`, after);
 
   // 11. re-runnable from the saved file, no change — also after the observer moved on
   r = run(WATCH, [`--cursors=${cFile}`, "--apply"]);
