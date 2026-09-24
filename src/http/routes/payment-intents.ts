@@ -13,17 +13,21 @@ import { Prisma, type Chain, type PaymentIntentStatus } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import { logger } from "@/log.js";
 import { getChainConfig } from "@/chain/impl/config.js";
-import { createIntent, INTENT_SELECT, renderPaymentIntent, type IntentRow } from "@/intents/index.js";
+import { INTENT_SELECT, renderPaymentIntent, type IntentRow } from "@/intents/index.js";
 import { bearerAuth, scope } from "../auth.js";
 import { ApiError, fieldsOf } from "../errors.js";
 import { idempotent } from "../idempotency.js";
 
-// ── G2's createIntent (src/intents); replaceable only so the verify script can inject a fake ──
+// ── PORT: G2's createIntent. The COMPOSITION ROOT (src/server.ts bootApi)
+// installs it; the server refuses to start while it is unwired
+// (assertApiPortsWired). Unwired, a request is a 500 internal that logs why —
+// never a 503 that would read as a normal derivation outage.
 export interface CreateIntentInput { amount: string; chain: Chain; reference: string; expiresInSec: number }
 export type CreateIntentFn = (clientId: string, keyId: string, input: CreateIntentInput) => Promise<{ id: string }>;
-let createIntentImpl: CreateIntentFn = createIntent;
-/** Wiring point for G2's createIntent (and for the verify script's fake). */
+let createIntentImpl: CreateIntentFn | null = null;
+/** Wiring point: src/server.ts installs G2's createIntent; the verify script installs a fake. */
 export function setCreateIntent(fn: CreateIntentFn): void { createIntentImpl = fn; }
+export function createIntentWired(): boolean { return createIntentImpl !== null; }
 
 // ── Validation (§5 amount rules, §4 reference) ──
 // Order matters: a missing/ill-typed field is 400 validation_failed; a
@@ -118,6 +122,7 @@ paymentIntents.post("/", scope("payment_intents.write"), idempotent, async (c) =
   if (existing) return c.json(renderIntent(existing), 200);
 
   let created: { id: string };
+  if (!createIntentImpl) throw new Error("port not wired: createIntent (src/server.ts bootApi must install it)");
   try { created = await createIntentImpl(key.clientId, key.id, { amount, chain: chain as Chain, reference, expiresInSec }); }
   catch (e) {
     if ((e instanceof Error && e.name === "ReferenceConflict") || (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002")) {

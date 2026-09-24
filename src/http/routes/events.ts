@@ -7,18 +7,21 @@
 import { Hono } from "hono";
 import { bearerAuth, scope } from "../auth.js";
 import { ApiError } from "../errors.js";
-import { getEvent } from "@/events/index.js";
 
-// ── G3's getEvent (src/events); replaceable only so the verify script can inject a fake ──
+// ── PORT: G3's getEvent, installed by the composition root (src/server.ts
+// bootApi), which refuses to start while it is unwired. Unwired, a request is
+// a 500 internal — never a 404 that would read as "no such event".
 export type GetEventFn = (clientId: string, id: string) => Promise<object | null>;
-let getEventImpl: GetEventFn = getEvent;
-/** Wiring point for G3's getEvent (and for the verify script's fake). */
+let getEventImpl: GetEventFn | null = null;
+/** Wiring point: src/server.ts installs G3's getEvent; the verify script installs a fake. */
 export function setGetEvent(fn: GetEventFn): void { getEventImpl = fn; }
+export function getEventWired(): boolean { return getEventImpl !== null; }
 
 export const events = new Hono();
 events.use("*", bearerAuth);
 
 events.get("/:id", scope("events.read"), async (c) => {
+  if (!getEventImpl) throw new Error("port not wired: getEvent (src/server.ts bootApi must install it)");
   const event = await getEventImpl(c.get("key").clientId, c.req.param("id"));
   if (!event) throw new ApiError("not_found", "No such event.");
   return c.json(event, 200);

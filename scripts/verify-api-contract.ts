@@ -38,6 +38,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
   console.log(`database: ${await assertSandboxDatabase()}`);
+  // ── the composition root, BEFORE anything is wired (Q G2-review H2) ──
+  const srv = (await loadWiring("@/server.js")) as { assertApiPortsWired?: () => void; bootApi?: () => { request: (p: string, i?: RequestInit) => Response | Promise<Response> } };
+  let unwired = "";
+  try { if (!srv.assertApiPortsWired) throw new Error("absent"); srv.assertApiPortsWired(); } catch (e) { unwired = e instanceof Error ? e.message : String(e); }
+  check(/createIntent/.test(unwired) && /getEvent/.test(unwired), "BOOT — assertApiPortsWired refuses while createIntent and getEvent are unwired, naming both", unwired);
   const app = buildApp();
   const made = { clients: [] as string[], keys: [] as string[] };
 
@@ -55,8 +60,8 @@ async function main() {
   setHealthReaders({ observerLagBlocks: async () => ({ TRC20: null, BEP20: null }) });
   // chain double for POST /addresses: deterministic, never a real derivation
   let deriverDown = false; let deriveDelayMs = 0; const gateTransfers: ObservedTransfer[] = [];
-  setChainAdapters({ deriver: { async deriveNext(chain) { if (deriverDown) throw new ChainUnavailable("verify"); if (deriveDelayMs) await sleep(deriveDelayMs); const i = nextIndex++; return { chain, address: `AVERIFY${RUN}${i}`, derivationIndex: i }; } } });
-  setCreateIntent(async (clientId: string, keyId: string, input: CreateIntentInput) => {
+  const fakeDeriver = { async deriveNext(chain: "TRC20" | "BEP20") { if (deriverDown) throw new ChainUnavailable("verify"); if (deriveDelayMs) await sleep(deriveDelayMs); const i = nextIndex++; return { chain, address: `AVERIFY${RUN}${i}`, derivationIndex: i }; } };
+  const fakeCreateIntent = async (clientId: string, keyId: string, input: CreateIntentInput) => {
     createCalls++;
     if (createDelayMs) await sleep(createDelayMs);
     if (createThrows) throw createThrows;
@@ -66,7 +71,8 @@ async function main() {
     const row = await prisma.paymentIntent.create({ data: { id: `pi_verify${RUN}${i}`, clientId, keyId, addressId: address.id, chain: input.chain, amount: new Prisma.Decimal(raceWinnerAmount ?? input.amount), reference: input.reference, expiresAt: new Date(Date.now() + input.expiresInSec * 1000) } });
     if (raceWinnerAmount !== null) throw named("ReferenceConflict");
     return { id: row.id };
-  });
+  };
+  const installFakes = () => { setChainAdapters({ deriver: fakeDeriver }); setCreateIntent(fakeCreateIntent); };
   const named = (name: string, msg = name) => Object.assign(new Error(msg), { name });
 
   try {
@@ -96,6 +102,24 @@ async function main() {
     };
     const good = { amount: "12.5", chain: "TRC20", reference: `store-${RUN}-1` };
     let seq = 0; const idem = () => `verify-${RUN}-${++seq}`;
+
+    // ── BOOT: the REAL entry point wires the ports (src/server.ts bootApi) ──
+    process.env.SAMAPAY_DERIVATION_FLOOR_TRC20 = "1000";
+    process.env.SAMAPAY_DERIVATION_FLOOR_BEP20 = "1000";
+    let booted: ReturnType<NonNullable<typeof srv.bootApi>> | null = null; let bootErr = "";
+    try { booted = srv.bootApi ? srv.bootApi() : null; } catch (e) { bootErr = e instanceof Error ? e.message : String(e); }
+    let wiredAfterBoot = true; try { srv.assertApiPortsWired?.(); } catch { wiredAfterBoot = false; }
+    check(!!booted && wiredAfterBoot, "BOOT — bootApi() (the server entry point) boots and leaves every port wired", bootErr);
+    if (booted) {
+      const bp = await booted.request("/v1/payment-intents", { method: "POST", headers: hdr(A.plaintext, `boot-${RUN}`), body: JSON.stringify(good) });
+      const bpj = (await bp.json().catch(() => ({}))) as Json;
+      // Real createIntent + the live deriver on a cluster with NO seed: a clean 503. Unwired would be 500 internal.
+      check(bp.status === 503 && bpj.error?.code === "derivation_unavailable", "BOOT — POST /v1/payment-intents reaches G2's createIntent (no seed here → 503 derivation_unavailable, not the unwired 500)", `${bp.status} ${bpj.error?.code}`);
+      const be = await booted.request(`/v1/events/evt_${RUN}none`, { headers: hdr(A.plaintext) });
+      const bej = (await be.json().catch(() => ({}))) as Json;
+      check(be.status === 404 && bej.error?.code === "not_found", "BOOT — GET /v1/events/:id reaches G3's getEvent (unknown id → 404, not the unwired 500)", `${be.status} ${bej.error?.code}`);
+    }
+    installFakes(); // everything below proves the HTTP layer against fakes
 
     // ── §1 request id ──
     const r0 = await call("GET", "/v1/payment-intents", null);

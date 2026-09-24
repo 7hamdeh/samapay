@@ -12,7 +12,6 @@ import type { Chain } from "@prisma/client";
 import { logger } from "@/log.js";
 import { derivationStatus, vaultStatus } from "@/chain/seed/vault-proof.js";
 import { legacyWatchStatus, observerLagBlocks } from "@/observer/index.js";
-import { getChainAdapter } from "@/chain/impl/index.js";
 
 // G4's readers decrypt the seed row to prove it; /health is unauthenticated,
 // so a caller must not be able to make every request pay that cost. Cached
@@ -33,13 +32,13 @@ export interface HealthReaders {
   observerLagBlocks(): Promise<PerChain<number | null>>;
   vault(): Promise<"proven" | "unproven">;
   derivation(): Promise<"ready" | "unavailable">;
-  legacyWatch(): Promise<PerChain<string | null>>;
+  legacyWatch(): Promise<PerChain<Date | null>>;
 }
 
 let readers: HealthReaders = {
   // G2. The head read is a live RPC call: cached like the seed readers, so an
   // unauthenticated caller cannot turn /health into an RPC amplifier.
-  observerLagBlocks: cached(() => observerLagBlocks((chain) => getChainAdapter(chain).getLatestBlock())),
+  observerLagBlocks: cached(() => observerLagBlocks()),
   vault: cached(vaultStatus),           // G4
   derivation: cached(derivationStatus), // G4
   legacyWatch: legacyWatchStatus,       // G2
@@ -66,6 +65,6 @@ health.get("/", async (c) => {
     vault: vault.ok ? vault.value : "unproven",
     derivation: derivation.ok ? derivation.value : "unavailable",
   };
-  if (legacy.ok) body.legacy_watch = { TRC20: legacy.value.TRC20, BEP20: legacy.value.BEP20 };
+  if (legacy.ok) body.legacy_watch = { TRC20: legacy.value.TRC20?.toISOString() ?? null, BEP20: legacy.value.BEP20?.toISOString() ?? null };
   return c.json(body, 200);
 });
