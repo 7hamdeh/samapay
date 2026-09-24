@@ -216,6 +216,17 @@ console.log("\n── LIBRARY: vault proof");
   const pinnedThis = await derivationStatus();
   delete process.env.SAMAPAY_EXPECTED_SEED_FINGERPRINT;
   check(pinnedOther === "unavailable" && pinnedThis === "ready", "SAMAPAY_EXPECTED_SEED_FINGERPRINT set: ready only when the row equals it", `${pinnedOther},${pinnedThis}`);
+  const unsetPin = await derivationStatus();
+  const malformed: string[] = [];
+  for (const v of [NEW_FP.toUpperCase(), ` ${NEW_FP}`, `${NEW_FP}0`, NEW_FP.slice(0, 7), "not-hex!"]) {
+    process.env.SAMAPAY_EXPECTED_SEED_FINGERPRINT = v;
+    malformed.push(`${JSON.stringify(v)}=${await derivationStatus()}`);
+  }
+  process.env.SAMAPAY_EXPECTED_SEED_FINGERPRINT = "";
+  const emptyPin = await derivationStatus();
+  delete process.env.SAMAPAY_EXPECTED_SEED_FINGERPRINT;
+  check(unsetPin === "ready" && emptyPin === "ready", "SAMAPAY_EXPECTED_SEED_FINGERPRINT unset (or empty, as `KEY=` in .env) keeps today's behaviour: ready", `unset=${unsetPin}, empty=${emptyPin}`);
+  check(malformed.every((m) => m.endsWith("=unavailable")), "SAMAPAY_EXPECTED_SEED_FINGERPRINT malformed (uppercase, padded, 9/7 chars, non-hex) FAILS CLOSED: unavailable, never ready", malformed.join(" "));
 
   // /health is polled every ~10 s: it must never load the seed, never re-arm the wipe.
   wipeMasterSeedCache();
