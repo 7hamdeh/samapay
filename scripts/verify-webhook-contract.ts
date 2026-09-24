@@ -1,4 +1,4 @@
-// COVERS: src/webhooks/dispatch.ts src/webhooks/sign.ts src/events/envelope.ts src/events/index.ts
+// COVERS: src/webhooks/dispatch.ts src/webhooks/sign.ts src/webhooks/redrive.ts src/events/envelope.ts src/events/index.ts scripts/ops/redrive-deliveries.ts
 //
 // Phase 0, G3 — the webhook + event contract (/root/pay-mntad-api-contract.md
 // §4 Event, §7 Webhooks), RED-FIRST. Every check is observed from the
@@ -11,13 +11,19 @@
 //   C. retry schedule 1m,5m,30m,2h,6h,12h,24h, then exhausted, then silence
 //   D. the 10 s timeout, against a receiver that never answers
 //   E. enqueueEvent exactly once under concurrency (one event, one delivery)
-//   F. deposit.confirmed ONLY for non-intent, non-disabled addresses
+//   F. deposit.confirmed for EVERY confirmed deposit, intent addresses included
+//      (contract v1.1 A1), except watch-disabled addresses and legacy_import
+//      addresses on a chain SamaPay does not watch yet (lead, 2026-09-24)
 //   G. getEvent: the owner reads it; another client gets nothing
+//   H. dispatch goes to the client's CURRENT active key (v1.1 A6)
+//   I. the delivery claim: two workers never send the same attempt (v1.1 A7)
+//   J. redrive: exhausted deliveries re-queued, dry run by default (v1.1 A5/A9)
 //
 // Throwaway only: SEED_ENCRYPTION_KEY is generated in this process; no real
 // key, seed or .env is read; no chain is touched.
 import crypto from "node:crypto";
 import http from "node:http";
+import { spawnSync } from "node:child_process";
 import type { AddressInfo } from "node:net";
 process.env.SEED_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
 
@@ -43,18 +49,23 @@ type EventsModule = typeof import("@/events/index.js");
 async function loadEvents(): Promise<EventsModule | null> {
   try { return await import("@/events/index.js"); } catch (e) { console.log(`  (events module not loadable: ${(e as Error).message.slice(0, 120)})`); return null; }
 }
+type RedriveModule = typeof import("@/webhooks/redrive.js");
+async function loadRedrive(): Promise<RedriveModule | null> {
+  try { return await import("@/webhooks/redrive.js"); } catch (e) { console.log(`  (redrive module not loadable: ${(e as Error).message.slice(0, 120)})`); return null; }
+}
 
 // ── the stub receiver ───────────────────────────────────────────────────────
-interface Received { headers: http.IncomingHttpHeaders; body: string; at: number }
-let mode: "ok" | "fail" | "hang" = "ok";
+interface Received { url: string; headers: http.IncomingHttpHeaders; body: string; at: number }
+let mode: "ok" | "fail" | "hang" | "slow" = "ok";
 const received: Received[] = [];
 const hanging: http.ServerResponse[] = [];
 const server = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c: Buffer) => { body += c.toString("utf8"); });
   req.on("end", () => {
-    received.push({ headers: req.headers, body, at: Date.now() });
+    received.push({ url: req.url ?? "", headers: req.headers, body, at: Date.now() });
     if (mode === "hang") { hanging.push(res); return; }
+    if (mode === "slow") { setTimeout(() => { res.statusCode = 200; res.end("slow"); }, 700); return; }
     res.statusCode = mode === "ok" ? 200 : 500;
     res.end(mode);
   });
@@ -66,6 +77,8 @@ async function main() {
   const port = (server.address() as AddressInfo).port;
   const hook = `http://127.0.0.1:${port}/hook`;
   const events = await loadEvents();
+  const redrive = await loadRedrive();
+  const testStart = new Date();
 
   // ── A. signing (pure) ────────────────────────────────────────────────────
   const secret = "whsec_" + "a".repeat(43), rotated = "whsec_" + "b".repeat(43);
@@ -99,7 +112,14 @@ async function main() {
   let idx = 900_000 + Math.floor(Math.random() * 50_000);
   const mkAddress = async (reference: string) => prisma.address.create({ data: { keyId: keyA.id, reference, chain: "TRC20", address: `T${RUN}${idx}`.padEnd(34, "x"), derivationIndex: idx++ }, select: { id: true, address: true } });
   const mkDeposit = async (addressId: string) => prisma.deposit.create({ data: { keyId: keyA.id, addressId, chain: "TRC20", txHash: `0x${crypto.randomBytes(32).toString("hex")}`, amount: new Prisma.Decimal("5"), confirmations: 20, status: "confirmed", blockNumber: 1n, creditedAt: new Date() }, select: { id: true, txHash: true } });
-  const depSnapshot = (id: string, txHash: string, address: string, reference: string) => ({ id: `dep_${id}`, object: "deposit", status: "confirmed", chain: "TRC20", tx_hash: txHash, amount: "5", confirmations: 20, address, reference, payment_intent_id: null, detected_at: new Date().toISOString(), confirmed_at: new Date().toISOString() });
+  const depSnapshot = (id: string, txHash: string, address: string, reference: string, paymentIntentId: string | null = null) => ({ id: `dep_${id}`, object: "deposit", status: "confirmed", chain: "TRC20", tx_hash: txHash, amount: "5", confirmations: 20, address, reference, payment_intent_id: paymentIntentId, detected_at: new Date().toISOString(), confirmed_at: new Date().toISOString() });
+  const enqueueDeposit = async (addr: { id: string; address: string }, reference: string, paymentIntentId: string | null = null) => {
+    const d = await mkDeposit(addr.id);
+    const snap = depSnapshot(d.id, d.txHash, addr.address, reference, paymentIntentId);
+    const out = events ? await prisma.$transaction((tx) => events.enqueueEvent(tx, { type: "deposit.confirmed", objectKind: "deposit", objectId: snap.id, snapshot: snap })) : null;
+    return { d, snap, out, deliveryId: out && out.status !== "suppressed" ? out.deliveryId : null };
+  };
+  const makeDue = (id: string) => prisma.webhookDelivery.update({ where: { id }, data: { nextAttemptAt: new Date(Date.now() - 1000) } });
   const eventsFor = (objectId: string) => (prisma as unknown as { event: { count(a: unknown): Promise<number> } }).event.count({ where: { objectId } }).catch(() => -1);
 
   try {
@@ -135,6 +155,7 @@ async function main() {
     let last: { outcome: string } = { outcome: "none" };
     if (d2) {
       for (let i = 0; i < 8; i++) {
+        if (i > 0) await makeDue(d2); // the test does not wait 24 h; the claim requires the attempt to be DUE
         const t0 = Date.now();
         last = await dispatch.attemptDelivery(d2);
         const row = await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: d2 }, select: { nextAttemptAt: true } });
@@ -146,9 +167,15 @@ async function main() {
     const exRow = d2 ? await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: d2 }, select: { status: true, attempts: true, nextAttemptAt: true } }) : null;
     check(last.outcome === "exhausted" && exRow?.status === "exhausted" && exRow.attempts === 8 && exRow.nextAttemptAt === null, "C2. the 8th failure (after the 24h retry) is exhausted, with no next attempt", JSON.stringify(exRow));
     const posts = received.length;
-    if (d2) await dispatch.attemptDelivery(d2);
+    if (d2) { await makeDue(d2); await dispatch.attemptDelivery(d2); }
     check(posts === 8 && received.length === 8, "C3. an exhausted delivery is never POSTed again", `posts ${posts} → ${received.length}`);
     check(JSON.stringify(dispatch.RETRY_SCHEDULE_MS) === JSON.stringify(CONTRACT_SCHEDULE) && dispatch.MAX_ATTEMPTS === 8, "C4. the exported schedule IS the contract's (one source for C1)", JSON.stringify(dispatch.RETRY_SCHEDULE_MS));
+
+    const notDue = await enqueueDeposit(await mkAddress(`samaprime:m1:user:notdue`), "samaprime:m1:user:notdue");
+    if (notDue.deliveryId) await prisma.webhookDelivery.update({ where: { id: notDue.deliveryId }, data: { nextAttemptAt: new Date(Date.now() + 5 * MIN) } });
+    received.length = 0; mode = "ok";
+    const ndOut = notDue.deliveryId ? await dispatch.attemptDelivery(notDue.deliveryId) : { outcome: "none" };
+    check(ndOut.outcome === "not_claimed" && received.length === 0, "C5. an attempt that is not DUE yet is not sent (a stale worker cannot jump the schedule)", `outcome=${ndOut.outcome} posts=${received.length}`);
 
     // ── D. the 10 s timeout ─────────────────────────────────────────────────
     const plain3 = await mkAddress(`samaprime:m1:user:u3`);
@@ -182,33 +209,38 @@ async function main() {
     const rolled = events ? await prisma.$transaction(async (tx) => { await events.enqueueEvent(tx, { type: "deposit.confirmed", objectKind: "deposit", objectId: `dep_${(await mkDeposit(plain4.id)).id}`, snapshot: snap4 }); return "no-throw"; }).catch((e: Error) => e.constructor.name) : "none";
     check(rolled !== "no-throw", "E3. CONTROL — a snapshot whose id is not the objectId is refused", rolled);
 
-    // ── F. deposit.confirmed only for non-intent, non-disabled addresses ────
+    // ── F. deposit.confirmed for every confirmed deposit (v1.1 A1) ─────────
     const intentAddr = await mkAddress(`pi-owner`);
     const piId = `pi_g3${RUN}${idx}`;
     await prisma.paymentIntent.create({ data: { id: piId, clientId: clientA.id, keyId: keyA.id, addressId: intentAddr.id, chain: "TRC20", amount: new Prisma.Decimal("5"), reference: "store:intent:1", expiresAt: new Date(Date.now() + H) } });
-    const depI = await mkDeposit(intentAddr.id);
-    const snapI = depSnapshot(depI.id, depI.txHash, intentAddr.address, "pi-owner");
-    const outI = events ? await prisma.$transaction((tx) => events.enqueueEvent(tx, { type: "deposit.confirmed", objectKind: "deposit", objectId: snapI.id, snapshot: snapI })) : null;
-    const nI = await eventsFor(snapI.id);
-    const dvI = await prisma.webhookDelivery.count({ where: { keyId: keyA.id, eventType: "deposit.confirmed", payload: { path: ["data", "object", "id"], equals: snapI.id } } });
-    check(outI?.status === "suppressed" && outI.reason === "intent_address" && nI === 0 && dvI === 0, "F1. a deposit to an INTENT address produces NO deposit.confirmed (no event, no delivery)", `${JSON.stringify(outI)} events=${nI} deliveries=${dvI}`);
-    // The OLD enqueue path (the observer's call today) still creates a row; the rule holds at SEND time.
+    const fi = await enqueueDeposit(intentAddr, "pi-owner", piId);
+    const nI = await eventsFor(fi.snap.id);
+    const dvI = fi.deliveryId ? await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: fi.deliveryId }, select: { payload: true } }) : null;
+    const dvIObj = (dvI?.payload as { data?: { object?: { payment_intent_id?: unknown } } } | undefined)?.data?.object;
+    check(fi.out?.status === "created" && nI === 1 && dvIObj?.payment_intent_id === piId, "F1. a deposit to an INTENT address DOES produce deposit.confirmed, with data.object.payment_intent_id set (A1)", `${JSON.stringify(fi.out)} events=${nI} pi=${String(dvIObj?.payment_intent_id)}`);
+    const piEvt = events ? await prisma.$transaction((tx) => events.enqueueEvent(tx, { type: "payment_intent.succeeded", objectKind: "payment_intent", objectId: piId, snapshot: { id: piId, object: "payment_intent", status: "succeeded" } })) : null;
+    check(piEvt?.status === "created", "F2. the same intent also gets its payment_intent.succeeded (status/UX event)", JSON.stringify(piEvt));
+    const disabled = await mkAddress(`samaprime:m1:user:disabled`);
+    await prisma.address.update({ where: { id: disabled.id }, data: { watchDisabledAt: new Date() } });
+    const fd = await enqueueDeposit(disabled, "samaprime:m1:user:disabled");
+    check(fd.out?.status === "suppressed" && fd.out.reason === "watch_disabled" && (await eventsFor(fd.snap.id)) === 0, "F3. a deposit to a watch-DISABLED address produces no deposit.confirmed", JSON.stringify(fd.out));
+    const legacy = await mkAddress(`samaprime:m1:user:legacy`);
+    await prisma.address.update({ where: { id: legacy.id }, data: { legacyImport: true } });
+    await prisma.scanCursor.upsert({ where: { chain: "TRC20" }, create: { chain: "TRC20", lastScannedBlock: 1n, legacyWatchEnabledAt: null }, update: { legacyWatchEnabledAt: null } });
+    const fl = await enqueueDeposit(legacy, "samaprime:m1:user:legacy");
+    check(fl.out?.status === "suppressed" && fl.out.reason === "legacy_not_watched" && (await eventsFor(fl.snap.id)) === 0, "F4. a legacy_import address on a chain whose legacy watch is NOT enabled produces nothing (MNTAD's scanner still owns it)", JSON.stringify(fl.out));
+    await prisma.scanCursor.update({ where: { chain: "TRC20" }, data: { legacyWatchEnabledAt: new Date() } });
+    const fl2 = await enqueueDeposit(legacy, "samaprime:m1:user:legacy");
+    check(fl2.out?.status === "created", "F5. CONTROL — the same legacy address after legacy_watch_enabled_at is set DOES produce one", JSON.stringify(fl2.out));
+    // The OLD enqueue path (the observer's call on this base) holds the same rule at SEND time.
     mode = "ok"; received.length = 0;
-    const legacyId = await dispatch.enqueue(keyA.id, "deposit.confirmed", `dep_${depI.id}`, { deposit_id: depI.id });
+    const legacyDep = await mkDeposit(disabled.id);
+    const legacyId = await dispatch.enqueue(keyA.id, "deposit.confirmed", `dep_${legacyDep.id}`, { deposit_id: legacyDep.id });
     const legacyOut = await dispatch.attemptDelivery(legacyId);
     const legacyRow = await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: legacyId }, select: { status: true, nextAttemptAt: true } });
-    check(received.length === 0 && legacyOut.outcome === "suppressed" && legacyRow.status !== "pending" && legacyRow.nextAttemptAt === null, "F2. via the OLD enqueue path an intent-address deposit.confirmed is never POSTed and never retried", `posts=${received.length} outcome=${legacyOut.outcome} status=${legacyRow.status}`);
-    const disabled = await mkAddress(`samaprime:m1:user:disabled`);
-    await (prisma.address.update as unknown as (a: unknown) => Promise<unknown>)({ where: { id: disabled.id }, data: { watchDisabledAt: new Date() } }).catch((e: Error) => console.log(`  (watchDisabledAt not settable: ${e.message.slice(0, 100)})`));
-    const depD = await mkDeposit(disabled.id);
-    const snapD = depSnapshot(depD.id, depD.txHash, disabled.address, "samaprime:m1:user:disabled");
-    const outD = events ? await prisma.$transaction((tx) => events.enqueueEvent(tx, { type: "deposit.confirmed", objectKind: "deposit", objectId: snapD.id, snapshot: snapD })) : null;
-    check(outD?.status === "suppressed" && outD.reason === "watch_disabled" && (await eventsFor(snapD.id)) === 0, "F3. a deposit to a watch-DISABLED address produces no deposit.confirmed", JSON.stringify(outD));
-    check(enq?.status === "created", "F4. CONTROL — the plain top-up address (B1) DID produce one; F1/F3 are not an enqueue that never works");
-    const piEvt = events ? await prisma.$transaction((tx) => events.enqueueEvent(tx, { type: "payment_intent.succeeded", objectKind: "payment_intent", objectId: piId, snapshot: { id: piId, object: "payment_intent", status: "succeeded" } })) : null;
-    check(piEvt?.status === "created", "F5. the intent address still gets its payment_intent.succeeded (the only event for it)", JSON.stringify(piEvt));
+    check(received.length === 0 && legacyOut.outcome === "suppressed" && legacyRow.status === "failed" && legacyRow.nextAttemptAt === null, "F6. via the OLD enqueue path a watch-disabled deposit.confirmed is never POSTed and never retried", `posts=${received.length} outcome=${legacyOut.outcome} status=${legacyRow.status}`);
     const mismatch = events ? await prisma.$transaction((tx) => events.enqueueEvent(tx, { type: "deposit.confirmed", objectKind: "payment_intent", objectId: piId, snapshot: { id: piId, object: "payment_intent" } })).then(() => "no-throw").catch((e: Error) => e.constructor.name) : "none";
-    check(mismatch !== "no-throw", "F6. CONTROL — a type that does not belong to the object kind is refused", mismatch);
+    check(mismatch !== "no-throw", "F7. CONTROL — a type that does not belong to the object kind is refused", mismatch);
 
     // ── G. getEvent scoping ─────────────────────────────────────────────────
     const own = events && enq && enq.status !== "suppressed" ? await events.getEvent(clientA.id, enq.eventId) : null;
@@ -217,6 +249,60 @@ async function main() {
     check(!!own && own.id === enq?.eventId && own.object === "event" && canon(own) === (got?.body ? canon(JSON.parse(got.body)) : ""), "G1. the owner's getEvent returns the same envelope the webhook carried", JSON.stringify(own).slice(0, 80));
     check(foreign === null, "G2. another client's getEvent is null (the route answers 404 — no existence oracle)", String(foreign));
     check(unknown === null, "G3. an unknown id is null, the same answer as another client's", String(unknown));
+
+    // ── H. dispatch to the client's CURRENT active key (A6) ─────────────────
+    const keyA2 = await issueKey({ clientId: clientA.id, name: "a-rotated", scopes: ["deposits.read"], issuedBy: "verify", issuedVia: "cli", webhookUrl: `http://127.0.0.1:${port}/hook2` });
+    await prisma.clientKey.update({ where: { id: keyA.id }, data: { active: false, revokedAt: new Date(), revokedReason: "rotated", successorKeyId: keyA2.id } });
+    const hr = await enqueueDeposit(await mkAddress(`samaprime:m1:user:rot`), "samaprime:m1:user:rot"); // the address/deposit stay on the OLD key
+    mode = "ok"; received.length = 0;
+    const hOut = hr.deliveryId ? await dispatch.attemptDelivery(hr.deliveryId) : { outcome: "none" };
+    const hGot = received[0];
+    check(hOut.outcome === "delivered" && hGot?.url === "/hook2", "H1. a delivery enqueued under the revoked key goes to the client's CURRENT key URL", `outcome=${hOut.outcome} url=${hGot?.url}`);
+    check(!!hGot && sign.verifySignature(keyA2.webhookSecret ?? "", hGot.body, String(hGot.headers["x-samapay-signature"])) && !sign.verifySignature(plainSecret, hGot.body, String(hGot.headers["x-samapay-signature"])), "H2. …signed with the CURRENT key's secret, not the revoked key's");
+    await prisma.clientKey.update({ where: { id: keyA2.id }, data: { active: false } });
+    const hn = await enqueueDeposit(await mkAddress(`samaprime:m1:user:nokey`), "samaprime:m1:user:nokey");
+    received.length = 0;
+    const hnOut = hn.deliveryId ? await dispatch.attemptDelivery(hn.deliveryId) : { outcome: "none" };
+    const hnRow = hn.deliveryId ? await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: hn.deliveryId }, select: { status: true, lastError: true, nextAttemptAt: true } }) : null;
+    check(received.length === 0 && hnOut.outcome === "retry" && hnRow?.status === "pending" && !!hnRow.nextAttemptAt && /no active key/.test(hnRow.lastError ?? ""), "H3. a client with NO active key: nothing sent, the delivery stays on the retry schedule (never lost)", `outcome=${hnOut.outcome} ${JSON.stringify(hnRow)}`);
+    await prisma.clientKey.update({ where: { id: keyA2.id }, data: { active: true } });
+
+    // ── I. the delivery claim (A7) ──────────────────────────────────────────
+    const ic = await enqueueDeposit(await mkAddress(`samaprime:m1:user:claim`), "samaprime:m1:user:claim");
+    mode = "slow"; received.length = 0;
+    const racers = ic.deliveryId ? await Promise.all(Array.from({ length: 4 }, () => dispatch.attemptDelivery(ic.deliveryId as string))) : [];
+    const won = racers.filter((r) => r.outcome === "delivered").length, lost = racers.filter((r) => r.outcome === "not_claimed").length;
+    check(received.length === 1 && won === 1 && lost === 3, "I1. four workers attempt one due delivery at once: exactly ONE POST, one delivered, three not_claimed", `posts=${received.length} ${racers.map((r) => r.outcome).join(",")}`);
+    mode = "ok";
+    const held = await enqueueDeposit(await mkAddress(`samaprime:m1:user:held`), "samaprime:m1:user:held");
+    if (held.deliveryId) await prisma.webhookDelivery.update({ where: { id: held.deliveryId }, data: { status: "sending", claimedAt: new Date() } }).catch((e: Error) => console.log(`  (claim columns not settable: ${e.message.slice(-120)})`));
+    received.length = 0;
+    const heldOut = held.deliveryId ? await dispatch.attemptDelivery(held.deliveryId) : { outcome: "none" };
+    check(heldOut.outcome === "not_claimed" && received.length === 0, "I2. a delivery another worker claimed moments ago is not sent again", `outcome=${heldOut.outcome} posts=${received.length}`);
+    if (held.deliveryId) await prisma.webhookDelivery.update({ where: { id: held.deliveryId }, data: { claimedAt: new Date(Date.now() - 2 * MIN) } }).catch((e: Error) => console.log(`  (claim columns not settable: ${e.message.slice(-120)})`));
+    const staleOut = held.deliveryId ? await dispatch.attemptDelivery(held.deliveryId) : { outcome: "none" };
+    check(staleOut.outcome === "delivered" && received.length === 1, "I3. a claim older than the stale window (a crashed worker) is reclaimed and delivered", `outcome=${staleOut.outcome} posts=${received.length}`);
+
+    // ── J. redrive (A5/A9) ──────────────────────────────────────────────────
+    const exBefore = d2 ? await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: d2 }, select: { status: true, attempts: true } }) : null;
+    const cli = spawnSync("./node_modules/.bin/tsx", ["scripts/ops/redrive-deliveries.ts", `--since=${testStart.toISOString()}`], { encoding: "utf8", env: process.env });
+    const exAfterCli = d2 ? await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: d2 }, select: { status: true, attempts: true } }) : null;
+    check(cli.status === 0 && /DRY RUN/.test(cli.stdout) && !!d2 && cli.stdout.includes(d2) && exBefore?.status === "exhausted" && exAfterCli?.status === "exhausted" && exAfterCli.attempts === 8, "J1. the CLI without --apply is a DRY RUN: it lists the exhausted delivery and changes nothing", `exit=${cli.status} ${cli.stdout.split("\n").slice(0, 3).join(" | ")} ${cli.stderr.slice(0, 200)}`);
+    const noSince = spawnSync("./node_modules/.bin/tsx", ["scripts/ops/redrive-deliveries.ts", "--apply"], { encoding: "utf8", env: process.env });
+    check(noSince.status !== 0 && exAfterCli?.status === "exhausted", "J2. CONTROL — the CLI refuses without --since", `exit=${noSince.status}`);
+    const future = redrive ? await redrive.redriveDeliveries({ since: new Date(Date.now() + H), apply: true, actor: "verify" }) : null;
+    check(future?.candidates.length === 0 && future.requeued === 0, "J3. --since after the row's creation selects nothing", JSON.stringify(future));
+    const applied = redrive ? await redrive.redriveDeliveries({ since: testStart, apply: true, actor: "verify" }) : null;
+    const reRow = d2 ? await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: d2 }, select: { status: true, attempts: true, nextAttemptAt: true } }) : null;
+    check(!!applied && !!d2 && applied.candidates.includes(d2) && applied.requeued === applied.candidates.length && reRow?.status === "pending" && reRow.attempts === 0 && !!reRow.nextAttemptAt && reRow.nextAttemptAt.getTime() <= Date.now(), "J4. --apply re-queues the exhausted delivery: pending, attempts 0, due now", `${JSON.stringify(applied)} ${JSON.stringify(reRow)}`);
+    const again2 = redrive ? await redrive.redriveDeliveries({ since: testStart, apply: true, actor: "verify" }) : null;
+    check(again2?.requeued === 0 && again2.candidates.length === 0, "J5. re-running --apply re-queues nothing (idempotent)", JSON.stringify(again2));
+    const deliveredStill = deliveryId ? await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: deliveryId }, select: { status: true } }) : null;
+    const failedStill = await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: legacyId }, select: { status: true } });
+    check(deliveredStill?.status === "delivered" && failedStill.status === "failed", "J6. delivered and suppressed (failed) deliveries are never redriven", `${deliveredStill?.status} ${failedStill.status}`);
+    mode = "ok"; received.length = 0;
+    const redelivered = d2 ? await dispatch.attemptDelivery(d2) : { outcome: "none" };
+    check(redelivered.outcome === "delivered" && received.length === 1, "J7. the redriven delivery is then sent normally", `outcome=${redelivered.outcome}`);
   } catch (err) {
     check(false, "THE SUITE THREW — nothing below this point ran", String(err instanceof Error ? err.stack : err));
   } finally {
