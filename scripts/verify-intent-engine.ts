@@ -24,6 +24,8 @@
 //     range is scanned for the legacy address instead of being skipped.
 //  R. (Q B1) through the REAL src/chain/live.ts: a transfer whose insert
 //     fails once is NOT behind the cursor — the next tick records it.
+//  P. a poison transfer is quarantined into scan_gaps after 3 failed ticks;
+//     the good transfer behind it is recorded and the cursor moves on.
 //  S. (Q M1) 200 abandoned intents do not starve a newer one (sweep + expiry).
 //  W. (Q H2) the worker's composition root refuses to boot with a port unwired.
 //  M. (A7) amounts truncated to 6 dp (never half-up); a zero deposit never
@@ -132,6 +134,38 @@ async function main() {
     Object.assign(t, saved);
     check(t1.name !== "NO THROW" && c1 === 100n, "R1. the insert fails once → the tick throws and the cursor STAYS at 100 (not advanced past block 150)", `tick ${t1.name}, cursor ${c1}`);
     check(t2.name === "NO THROW" && rows === 1 && c2 === 1000n - BigInt(getChainConfig("TRC20").confirmationsRequired) + 1n, "R2. the next tick re-scans, records the 5 USDT transfer, THEN advances the cursor to the safe head", `tick ${t2.name}, rows ${rows}, cursor ${c2}`);
+  }
+
+  // ── P. a POISON transfer (deterministic insert failure) is quarantined, the batch goes on ──
+  console.log("\nP. poison transfer → scan_gaps after 3 ticks; the good transfer behind it is recorded");
+  {
+    process.env.CRYPTO_MODE = "mainnet";
+    const pc = await prisma.client.create({ data: { name: `verify-poison-${RUN}`, kind: "merchant" }, select: { id: true } });
+    const pk = await prisma.clientKey.create({ data: { clientId: pc.id, name: "poison", keyPrefix: `vpo_${RUN}`.slice(0, 12).padEnd(12, "x"), keyHash: "x", keyLast4: "0000", scopes: [], environment: "test", issuedBy: "verify", issuedVia: "cli" }, select: { id: true } });
+    const ADDR = `TQpoison${RUN}`; const BAD = `poisonbad${RUN}`.padEnd(64, "0"); const GOOD = `poisongood${RUN}`.padEnd(64, "0");
+    await prisma.address.create({ data: { keyId: pk.id, clientId: pc.id, reference: `probe:m:user:p${RUN}`, chain: "TRC20", address: ADDR, derivationIndex: 900_001 } });
+    await prisma.scanCursor.upsert({ where: { chain: "TRC20" }, create: { chain: "TRC20", lastScannedBlock: 1000n }, update: { lastScannedBlock: 1000n } });
+    const t = tronAdapter as unknown as Record<string, unknown>;
+    const saved = { getLatestBlock: t.getLatestBlock, getConfirmations: t.getConfirmations, getIncomingTransfers: t.getIncomingTransfers };
+    t.getLatestBlock = async () => 2000n;
+    t.getConfirmations = async () => 0;
+    t.getIncomingTransfers = async (from: bigint, to: bigint, addrs: Set<string>) => ({
+      transfers: [
+        { txHash: BAD, toAddress: ADDR, amountRaw: "12x", blockNumber: 1100n }, // malformed: fails every time
+        { txHash: GOOD, toAddress: ADDR, amountRaw: "7000000", blockNumber: 1200n },
+      ].filter((x) => x.blockNumber >= from && x.blockNumber <= to && addrs.has(x.toAddress)),
+      scannedThrough: to,
+    });
+    const cur = async () => (await prisma.scanCursor.findUniqueOrThrow({ where: { chain: "TRC20" }, select: { lastScannedBlock: true } })).lastScannedBlock;
+    const ticks: string[] = []; const cursors: bigint[] = [];
+    for (let k = 0; k < 4; k++) { ticks.push((await thrown(() => observeChain("TRC20", liveObserver, REQ))).name); cursors.push(await cur()); }
+    Object.assign(t, saved);
+    const safe = 2000n - BigInt(getChainConfig("TRC20").confirmationsRequired) + 1n;
+    const good = await prisma.deposit.count({ where: { txHash: GOOD } });
+    const gaps = await prisma.scanGap.findMany({ where: { chain: "TRC20", reason: "poison_transfer", evidence: { contains: BAD } }, select: { fromBlock: true, toBlock: true, closedAt: true, evidence: true } });
+    check(ticks[0] !== "NO THROW" && ticks[1] !== "NO THROW" && cursors[0] === 1000n && cursors[1] === 1000n, "P1. ticks 1-2: the poison transfer fails, the tick throws, the cursor HOLDS (record-first still wins below the threshold)", `${ticks.slice(0, 2).join(",")} cursor ${cursors.slice(0, 2).join(",")}`);
+    check(ticks[2] === "NO THROW" && good === 1 && cursors[2] === safe, "P2. tick 3: the poison is quarantined, the GOOD transfer behind it is recorded, the cursor moves on", `${ticks[2]}, good rows ${good}, cursor ${cursors[2]}`);
+    check(gaps.length === 1 && gaps[0]?.fromBlock === 1100n && gaps[0]?.toBlock === 1100n && gaps[0]?.closedAt === null && (gaps[0]?.evidence ?? "").includes("12x"), "P3. exactly ONE open scan_gaps row at block 1100 carrying the tx and the error evidence (existing columns only)", JSON.stringify(gaps.map((g) => ({ f: g.fromBlock.toString(), open: g.closedAt === null }))));
   }
 
   const client = await prisma.client.create({ data: { name: `verify-intents-${RUN}`, kind: "merchant", enabledChains: ["TRC20"], feeBps: 100 }, select: { id: true } });

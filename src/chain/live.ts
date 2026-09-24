@@ -116,14 +116,16 @@ export const liveObserver: ChainObserver = {
       log.warn({ chain, ...scan.stoppedEarly }, "scan stopped early; cursor will advance only to scannedThrough");
     }
 
-    const transfers = scan.transfers.map((t) => ({
-      chain,
-      txHash: t.txHash,
-      toAddress: t.toAddress,
-      amount: rawToDecimalString(t.amountRaw, adapter.tokenDecimals),
-      blockNumber: t.blockNumber,
-      confirmations: Number(head - t.blockNumber + 1n),
-    }));
+    // ONE malformed amount must not fail the whole batch here: it is passed on
+    // as a non-decimal marker, the observer's truncateAmount refuses THAT
+    // transfer, and after repeated failures it is quarantined into scan_gaps
+    // (src/observer) while every other transfer in the range is recorded.
+    const transfers = scan.transfers.map((t) => {
+      let amount: string;
+      try { amount = rawToDecimalString(t.amountRaw, adapter.tokenDecimals); }
+      catch (e) { log.error({ chain, txHash: t.txHash, amountRaw: t.amountRaw, err: (e as Error).message }, "unconvertible transfer amount"); amount = `invalid-raw:${t.amountRaw}`; }
+      return { chain, txHash: t.txHash, toAddress: t.toAddress, amount, blockNumber: t.blockNumber, confirmations: Number(head - t.blockNumber + 1n) };
+    });
     return { transfers, scannedThrough: scan.scannedThrough >= from ? scan.scannedThrough : null };
   },
 

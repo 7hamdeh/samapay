@@ -42,8 +42,25 @@ import type { ChainObserver, ObservedTransfer, ScanBatch } from "@/chain/types.j
 import { DEPOSIT_RENDER_SELECT, publicDepositId, renderDeposit } from "@/render/deposit.js";
 import { cursorLockKey } from "@/chain/cursor.js";
 import { getChainAdapter } from "@/chain/impl/index.js";
+import logger from "@/log.js";
 
-export interface ObserveResult { seen: number; recorded: number; alreadyKnown: number; confirmed: number; unknownAddress: number; intentsAdvanced: number }
+const log = logger.child({ mod: "observer" });
+
+export interface ObserveResult { seen: number; recorded: number; alreadyKnown: number; confirmed: number; unknownAddress: number; intentsAdvanced: number; quarantined: number }
+
+// ── POISON TRANSFERS (Q's recheck, lead ruling 2026-09-25) ────────────────────
+// Record-first (B1) means ONE transfer whose insert fails DETERMINISTICALLY
+// (a malformed amount, say) would hold the chain's cursor for ever and stall
+// every later deposit. After POISON_AFTER consecutive tick failures on the
+// same (chain, tx), the transfer is QUARANTINED: a scan_gaps row (existing
+// columns only — from/to = its block, reason, evidence = the tx and the error)
+// is written ON THE LOCK TRANSACTION, so it commits together with the cursor
+// advance past it, and an error-level alert is logged. The money is not lost:
+// the gap stays OPEN (closed_at NULL) for manual handling. The count is per
+// process; a restart only means a few more retries before quarantine.
+export const POISON_AFTER = 3;
+export const POISON_GAP_REASON = "poison_transfer";
+const failures = new Map<string, number>();
 
 // The per-chain cursor lock is src/chain/cursor.ts's (G5): ONE definition for the tick and the handoff.
 export { cursorLockKey };
@@ -95,14 +112,25 @@ export async function observeChain(chain: Chain, observer: ChainObserver, requir
     // The adapter receives addresses EXACTLY as stored, never a normalised form.
     const scanned = await observer.scan(chain, new Set(addresses.map((a) => a.address)));
     const batch: ScanBatch = Array.isArray(scanned) ? { transfers: scanned, scannedThrough: null } : scanned;
-    const result: ObserveResult = { seen: batch.transfers.length, recorded: 0, alreadyKnown: 0, confirmed: 0, unknownAddress: 0, intentsAdvanced: 0 };
+    const result: ObserveResult = { seen: batch.transfers.length, recorded: 0, alreadyKnown: 0, confirmed: 0, unknownAddress: 0, intentsAdvanced: 0, quarantined: 0 };
     // RECORD FIRST. Any failure throws out of the tick with the cursor where it
     // was, and the next tick scans the same range again — UNIQUE(chain, tx_hash)
     // makes the re-scan safe (Q's review B1).
     for (const t of batch.transfers) {
       inTime();
-      const outcome = await recordTransfer(chain, t, byAddress.get(key(t.toAddress)));
-      result[outcome]++;
+      const fkey = `${chain}:${t.txHash}`;
+      try {
+        const outcome = await recordTransfer(chain, t, byAddress.get(key(t.toAddress)));
+        result[outcome]++;
+        failures.delete(fkey);
+      } catch (e) {
+        const n = (failures.get(fkey) ?? 0) + 1;
+        failures.set(fkey, n);
+        if (n < POISON_AFTER) throw e; // not yet: no advance, the next tick re-scans
+        await quarantineTransfer(lockTx, chain, t, e, n);
+        failures.delete(fkey);
+        result.quarantined++;
+      }
     }
     // THEN the cursor — only now that every transfer in the range is recorded or already known.
     inTime();
@@ -112,6 +140,15 @@ export async function observeChain(chain: Chain, observer: ChainObserver, requir
     result.intentsAdvanced = (await advanceIntentsForChain(chain, { now: new Date(), confirmationsRequired: requiredConfirmations })).advanced;
     return result;
   }, { timeout: TICK_TIMEOUT_MS, maxWait: LOCK_WAIT_MS });
+}
+
+/** A scan_gaps row for a transfer that failed POISON_AFTER ticks in a row. Idempotent per (chain, block, tx). */
+async function quarantineTransfer(lockTx: Prisma.TransactionClient, chain: Chain, t: ObservedTransfer, e: unknown, failuresSoFar: number): Promise<void> {
+  const error = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+  const evidence = JSON.stringify({ txHash: t.txHash, toAddress: t.toAddress, amount: t.amount, blockNumber: t.blockNumber.toString(), failures: failuresSoFar, error: error.slice(0, 1000) });
+  const open = await lockTx.scanGap.findFirst({ where: { chain, fromBlock: t.blockNumber, toBlock: t.blockNumber, reason: POISON_GAP_REASON, closedAt: null, evidence: { contains: t.txHash } }, select: { id: true } });
+  if (!open) await lockTx.scanGap.create({ data: { chain, fromBlock: t.blockNumber, toBlock: t.blockNumber, reason: POISON_GAP_REASON, evidence } });
+  log.error({ actor: "observer", action: "deposit.quarantine", result: "scan_gap_opened", chain, txHash: t.txHash, block: t.blockNumber.toString(), failures: failuresSoFar, err: error }, "ALERT: transfer could not be recorded after repeated ticks; quarantined in scan_gaps for manual handling, cursor moves past it");
 }
 
 /** Monotonic: a late tick can never move the cursor backwards. On the LOCK transaction. */
