@@ -1,15 +1,14 @@
 // GET /v1/balance → the contract §4 Balance object, per chain, for the
-// calling KEY (the allowance is per key — THE ONE RULE; a merchant has one
-// live key):
+// calling key's CLIENT (contract v1.1 A6 — survives a key rotation):
 //   { object:"balance", currency:"USDT",
 //     chains:{ TRC20:{available,pending}, BEP20:{available,pending} }, fee_bps }
 // available = confirmed − stamped fees − consuming withdrawals; pending =
-// detected, gross. Straight from allowance.readByChain(); never clamped,
+// detected, gross. Straight from allowance.readClientByChain(); never clamped,
 // never rounded. `fee_bps` is the client's CURRENT rate — the one the next
 // confirmation will be stamped with, not a recomputation of past fees.
 import { Hono } from "hono";
 import { prisma } from "@/db/client.js";
-import { read, readByChain, readByReference, BALANCE_CHAINS } from "@/allowance/index.js";
+import { read, readClientByChain, readByReference, BALANCE_CHAINS } from "@/allowance/index.js";
 import { bearerAuth, requireScope } from "../auth.js";
 import { ApiError } from "../errors.js";
 
@@ -17,9 +16,9 @@ export function positionBody(p: Awaited<ReturnType<typeof read>>) {
   return { key_id: p.keyId, received: p.received.toString(), fees: p.fees.toString(), withdrawn: p.withdrawn.toString(), allowance: p.allowance.toString(), deposit_count: p.depositCount, withdrawal_count: p.withdrawalCount };
 }
 
-export async function balanceBody(keyId: string, clientId: string) {
+export async function balanceBody(clientId: string) {
   const [byChain, client] = await Promise.all([
-    readByChain(keyId),
+    readClientByChain(clientId),
     prisma.client.findUnique({ where: { id: clientId }, select: { feeBps: true } }),
   ]);
   if (!client) throw new ApiError("not_found", "No such client.");
@@ -41,5 +40,5 @@ balance.get("/", async (c) => {
     const p = await readByReference(key.id, reference);
     return c.json({ reference_position: { key_id: p.keyId, reference: p.reference, received: p.received.toString(), withdrawn: p.withdrawn.toString(), deposit_count: p.depositCount, withdrawal_count: p.withdrawalCount, note: "reconciliation only — the allowance is per key, not per reference" } }, 200);
   }
-  return c.json(await balanceBody(key.id, key.clientId), 200);
+  return c.json(await balanceBody(key.clientId), 200);
 });
