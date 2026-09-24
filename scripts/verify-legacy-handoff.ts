@@ -22,6 +22,9 @@
 //          8 a target below a legacy deposit SamaPay already recorded (rewinding
 //            past existing legacy history) is refused on BOTH chains
 //          8b not mainnet → refused unless --rehearsal
+//          8d/8e (and 0/0b for the import) G4's ops gate: non-production needs
+//            --rehearsal, --apply needs a fresh --backup
+//          F  the shared cursor fixture (M3's real CLI output) parses and runs
 //          9 dry run writes nothing; prints network + TRC20/BEP20 depth
 //         10 apply: a cursor AHEAD moves back to the MIN, one BEHIND stays;
 //            legacy_watch_enabled_at stamped on both, one transaction
@@ -37,7 +40,7 @@ process.env.SAMAPAY_DERIVATION_FLOOR_BEP20 = "1000";
 process.env.CRYPTO_MODE = "mainnet";
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as bip39 from "bip39";
@@ -56,8 +59,14 @@ const DIR = mkdtempSync(join(process.env.VERIFY_TMP ?? tmpdir(), "verify-legacy-
 const IMPORT = "scripts/import-legacy-addresses.ts";
 const WATCH = "scripts/ops/start-legacy-watch.ts";
 
-function run(script: string, args: string[], env: Record<string, string> = {}): { code: number | null; out: string } {
-  const r = spawnSync("./node_modules/.bin/tsx", [script, ...args], { env: { ...process.env, LOG_LEVEL: "silent", ...env }, encoding: "utf8" });
+// Both CLIs sit behind G4's ops gate (src/chain/seed/ops-gate.ts): anywhere but
+// production needs --rehearsal, and --apply needs a fresh --backup. run() adds
+// both unless `gated` is false, so the gate's own refusals can be probed.
+let BACKUP = "";
+const BACKUP_DIR = join(DIR, "backups");
+function run(script: string, args: string[], env: Record<string, string> = {}, gated = true): { code: number | null; out: string } {
+  const full = gated ? [...args, "--rehearsal", ...(args.includes("--apply") ? [`--backup=${BACKUP}`] : [])] : args;
+  const r = spawnSync("./node_modules/.bin/tsx", [script, ...full], { env: { ...process.env, LOG_LEVEL: "silent", SAMAPAY_OPS_REHEARSAL_BACKUP_DIR: BACKUP_DIR, ...env }, encoding: "utf8" });
   const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
   console.log(out.split("\n").filter(Boolean).map((l) => `      | ${l}`).join("\n"));
   return { code: r.status, out };
@@ -67,8 +76,10 @@ function file(name: string, content: unknown): string {
   writeFileSync(p, typeof content === "string" ? content : JSON.stringify(content));
   return p;
 }
+// Rows under the two merchants the main scenario uses (check 1 writes under its own, C).
+let SCENARIO_KEYS: string[] = [];
 async function legacyRows() {
-  return prisma.address.findMany({ where: { legacyImport: true }, orderBy: [{ chain: "asc" }, { derivationIndex: "asc" }], select: { chain: true, address: true, derivationIndex: true, keyId: true, clientId: true, reference: true } });
+  return prisma.address.findMany({ where: { legacyImport: true, keyId: { in: SCENARIO_KEYS } }, orderBy: [{ chain: "asc" }, { derivationIndex: "asc" }], select: { chain: true, address: true, derivationIndex: true, keyId: true, clientId: true, reference: true } });
 }
 async function cursors() {
   const rows = await prisma.scanCursor.findMany({ select: { chain: true, lastScannedBlock: true, legacyWatchEnabledAt: true } });
@@ -84,11 +95,23 @@ async function main() {
   if (await prisma.cryptoConfig.findUnique({ where: { id: 1 } })) throw new Error("crypto_config already has a row — this script needs a fresh throwaway database");
   const seed = await bip39.mnemonicToSeed(bip39.generateMnemonic(256));
   await saveMasterSeedConfig(seed);
+  // A rehearsal backup in the exact shape samapay-backup.sh writes, stamped AFTER
+  // the crypto_config write (the gate orders against it): > 10 KiB + .sha256 sidecar.
+  await new Promise((res) => setTimeout(res, 1_100));
+  mkdirSync(BACKUP_DIR);
+  const stamp = new Date(Math.floor(Date.now() / 1000) * 1000).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  const stampName = `samapay-${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}T${stamp.slice(9, 15)}Z.dump.gpg`;
+  BACKUP = join(BACKUP_DIR, stampName);
+  const dump = crypto.randomBytes(12_000);
+  writeFileSync(BACKUP, dump);
+  writeFileSync(`${BACKUP}.sha256`, `${crypto.createHash("sha256").update(dump).digest("hex")}\n`);
 
   const mA = `mA${RUN}`, mB = `mB${RUN}`;
   const keyA = await mkKey("merchant", "a");
   const keyB = await mkKey("merchant", "b");
   const partner = await mkKey("partner", "p");
+  const keyC = await mkKey("merchant", "c");
+  SCENARIO_KEYS = [keyA.id, keyB.id];
   const spec: Array<[Chain, number, string, string]> = [
     ["TRC20", 3, mA, "u1"], ["TRC20", 7, mA, "u2"], ["TRC20", 112, mB, "u3"],
     ["BEP20", 3, mA, "u1"], ["BEP20", 9, mB, "u4"], ["BEP20", 122, mB, "u5"],
@@ -97,12 +120,20 @@ async function main() {
   const goodFile = file("export.json", good);
   const keys = [`--key=${mA}:${keyA.id}`, `--key=${mB}:${keyB.id}`];
 
-  // ── 1. re-derivation mismatch ────────────────────────────────────────────
-  const lying = good.map((r, i) => (i === 4 ? { ...r, address: deriveAddress(seed, r.chain, r.derivationIndex + 1) } : r));
-  let r = run(IMPORT, [`--in=${file("lying.json", lying)}`, ...keys, "--apply"]);
-  let rows = await legacyRows();
+  // ── 0. the ops gate ──────────────────────────────────────────────────────
+  let r = run(IMPORT, [`--in=${goodFile}`, ...keys], {}, false);
+  check(r.code === 3 && /expected production database/.test(r.out), "0. without --rehearsal, on a non-production database: REFUSED by the where-am-I gate", `exit ${r.code}`);
+  r = run(IMPORT, [`--in=${goodFile}`, ...keys, "--apply", "--rehearsal"], {}, false);
+  check(r.code === 3 && /--backup/.test(r.out) && (await prisma.address.count({ where: { legacyImport: true } })) === 0, "0b. --apply without --backup: REFUSED, nothing written", `exit ${r.code}`);
+
+  // ── 1. re-derivation mismatch — its OWN merchant C and indexes, so a failure here cannot cascade ──
+  const cSpec: Array<[Chain, number]> = [["TRC20", 20], ["TRC20", 21], ["TRC20", 22], ["BEP20", 20], ["BEP20", 21], ["BEP20", 22]];
+  const lying = cSpec.map(([chain, idx], i) => ({ chain, address: deriveAddress(seed, chain, i === 4 ? idx + 100 : idx), derivationIndex: idx, userId: `c${i}`, merchantId: `mC${RUN}` }));
+  r = run(IMPORT, [`--in=${file("lying.json", lying)}`, `--key=mC${RUN}:${keyC.id}`, "--apply"]);
   check(r.code === 3 && /re-derive/.test(r.out), "1. an address that does not re-derive at its index is REFUSED (exit 3, names re-derivation)", `exit ${r.code}`);
-  check(rows.length === 0, "1b. ... and NOTHING was written — not even the five good rows", `${rows.length} rows`);
+  const cRows = await prisma.address.count({ where: { keyId: keyC.id } });
+  check(cRows === 0, "1b. ... and NOTHING was written — not even the five good rows", `${cRows} rows`);
+  let rows = await legacyRows();
 
   // ── 2. key mapping ───────────────────────────────────────────────────────
   r = run(IMPORT, [`--in=${goodFile}`, keys[0]!, "--apply"]);
@@ -160,23 +191,41 @@ async function main() {
   r = run(WATCH, [`--cursors=${file("c-back.json", { TRC20: Number(599n + d.TRC20), BEP20: 800, stoppedAt })}`, "--apply"]);
   check(r.code === 3 && /backwards/.test(r.out) && (await snap()) === initial, "8. TRC20 target 599 < a legacy deposit SamaPay recorded at 600: REFUSED, and BEP20 NOT touched either (one transaction)", `exit ${r.code}`);
 
-  // 9. dry run
   const cFile = file("cursors.json", { TRC20: Number(650n + d.TRC20), BEP20: 800, stoppedAt });
+  // 8d. the ops gate on the watch CLI
+  r = run(WATCH, [`--cursors=${cFile}`], {}, false);
+  check(r.code === 3 && /expected production database/.test(r.out) && (await snap()) === initial, "8d. start-legacy-watch without --rehearsal on a non-production database: REFUSED", `exit ${r.code}`);
+  r = run(WATCH, [`--cursors=${cFile}`, "--apply", "--rehearsal"], {}, false);
+  check(r.code === 3 && /--backup/.test(r.out) && (await snap()) === initial, "8e. start-legacy-watch --apply without --backup: REFUSED, nothing written", `exit ${r.code}`);
+
+  // F. THE SHARED FIXTURE — the file MNTAD's real stop-legacy-scanner.ts wrote in M3's GREEN
+  // run (MNTAD p0/m3 7406d8e1), copied byte-identical. Both suites pin this sha256.
+  const FIXTURE = "scripts/fixtures/s2-legacy-cursors.json";
+  const fixtureRaw = readFileSync(FIXTURE);
+  check(crypto.createHash("sha256").update(fixtureRaw).digest("hex") === "b14c9340ab7314a3fd6580b5fe5fc3b29d27486fba2d7485cb70ce03d57fa9bf", "F1. the shared cursor fixture is byte-identical to M3's (sha256 pinned in both suites)");
+  const { parseCursorFile } = await import("@/chain/cursor.js");
+  const parsedFixture = await Promise.resolve().then(() => parseCursorFile(fixtureRaw.toString("utf8"))).catch((e) => String(e));
+  check(typeof parsedFixture === "object" && parsedFixture.TRC20 === 70000010 && parsedFixture.BEP20 === 40000010 && parsedFixture.stoppedAt === "2026-09-24T22:32:38.217Z",
+    "F2. parseCursorFile accepts M3's real output: JSON integers, trailing Z, trailing newline", JSON.stringify(parsedFixture));
+  r = run(WATCH, [`--cursors=${FIXTURE}`]);
+  check(r.code === 0 && /TRC20: WOULD SET cursor 700 -> 700/.test(r.out) && /BEP20: WOULD SET cursor 500 -> 500/.test(r.out) && (await snap()) === initial, "F3. the CLI itself takes the fixture: dry run, both cursors stay (MNTAD far ahead), nothing written", `exit ${r.code}`);
+
+  // 9. dry run
   // 8b. not mainnet → refused unless --rehearsal (the depth would be testnet's 3)
-  r = run(WATCH, [`--cursors=${cFile}`, "--apply"], { CRYPTO_MODE: "testnet" });
+  r = run(WATCH, [`--cursors=${cFile}`, "--apply"], { CRYPTO_MODE: "testnet" }, false);
   check(r.code === 3 && /not mainnet/.test(r.out) && r.out.includes("network: testnet") && (await snap()) === initial, "8b. CRYPTO_MODE=testnet without --rehearsal: REFUSED (exit 3) after printing the mode, nothing written", `exit ${r.code}`);
-  r = run(WATCH, [`--cursors=${cFile}`, "--rehearsal"], { CRYPTO_MODE: "testnet", CRYPTO_TRON_TESTNET_USDT_CONTRACT: "rehearsal-not-dialled", CRYPTO_BSC_TESTNET_USDT_CONTRACT: "rehearsal-not-dialled" });
+  r = run(WATCH, [`--cursors=${cFile}`], { CRYPTO_MODE: "testnet", CRYPTO_TRON_TESTNET_USDT_CONTRACT: "rehearsal-not-dialled", CRYPTO_BSC_TESTNET_USDT_CONTRACT: "rehearsal-not-dialled" });
   check(r.code === 0 && r.out.includes("network: testnet") && (await snap()) === initial, "8c. ... with --rehearsal the testnet dry run proceeds (and still writes nothing)", `exit ${r.code}`);
   r = run(WATCH, [`--cursors=${cFile}`]);
   check(r.code === 0 && /TRC20: WOULD SET cursor 700 -> 650; re-scan 50/.test(r.out) && (await snap()) === initial, "9. dry run prints the rewind (TRC20 700 -> 650, 50 blocks) and writes nothing", `exit ${r.code}`);
-  check(r.out.includes(`network: mainnet; confirmation depth TRC20 ${d.TRC20}, BEP20 ${d.BEP20}`), "9b. the dry run prints the network and the depth it subtracts, per chain");
+  check(r.out.includes(`network: mainnet (REHEARSAL); confirmation depth TRC20 ${d.TRC20}, BEP20 ${d.BEP20}`), "9b. the dry run prints the network and the depth it subtracts, per chain");
 
   // 10. apply: ahead moves back to the MIN, behind stays, both stamped
   r = run(WATCH, [`--cursors=${cFile}`, "--apply"]);
   const after = await snap();
   check(r.code === 0 && after === JSON.stringify({ BEP20: { block: "500", stamped: true }, TRC20: { block: "650", stamped: true } }),
     `10. --apply: TRC20 (ahead, 700) moves BACK to MNTAD ${650n + d.TRC20} − depth ${d.TRC20} = 650; BEP20 (behind, 500 < 800 − ${d.BEP20}) STAYS at 500; legacy watch stamped on both`, after);
-  check(r.out.includes(`network: mainnet; confirmation depth TRC20 ${d.TRC20}, BEP20 ${d.BEP20}`), "10b. --apply prints the same network + per-chain depth line as the dry run");
+  check(r.out.includes(`network: mainnet (REHEARSAL); confirmation depth TRC20 ${d.TRC20}, BEP20 ${d.BEP20}`), "10b. --apply prints the same network + per-chain depth line as the dry run");
 
   // 11. re-runnable from the saved file, no change — also after the observer moved on
   r = run(WATCH, [`--cursors=${cFile}`, "--apply"]);
