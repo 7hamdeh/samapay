@@ -13,6 +13,12 @@ import { advanceIntent } from "./advance.js";
 const log = logger.child({ mod: "intents/sweep" });
 
 const BATCH = 200;
+// ⚠️ ROUND-ROBIN, NOT "THE OLDEST 200". expired_partial intents stay in this
+// set for ever (a late payment must still complete them), so a fixed "oldest
+// first" page fills up with abandoned ones and every newer intent is never
+// looked at again (Q's review M1). Each tick takes the next page by id and
+// wraps; every open intent is re-decided within ceil(open / BATCH) ticks.
+const pageAfter = new Map<Chain, string>();
 
 export async function advanceIntentsForChain(chain: Chain, opts: { now: Date; confirmationsRequired: number }): Promise<{ checked: number; advanced: number }> {
   const open = await prisma.paymentIntent.findMany({
@@ -20,9 +26,12 @@ export async function advanceIntentsForChain(chain: Chain, opts: { now: Date; co
       chain,
       status: { in: ["requires_payment", "processing", "expired", "expired_partial"] },
       address: { watchDisabledAt: null, deposits: { some: { status: { not: "orphaned" }, amount: { gt: 0 } } } },
+      ...(pageAfter.has(chain) ? { id: { gt: pageAfter.get(chain) as string } } : {}),
     },
-    orderBy: { createdAt: "asc" }, take: BATCH, select: { id: true },
+    orderBy: { id: "asc" }, take: BATCH, select: { id: true },
   });
+  const last = open[open.length - 1];
+  if (open.length === BATCH && last) pageAfter.set(chain, last.id); else pageAfter.delete(chain);
   let advanced = 0;
   for (const { id } of open) {
     // One intent that cannot advance (its transaction rolled back) must not

@@ -22,6 +22,10 @@
 //  L. (A11) a tick and a concurrent cursor rewind+legacy-enable never
 //     interleave: the tick holds the cursor advisory lock, so the rewound
 //     range is scanned for the legacy address instead of being skipped.
+//  R. (Q B1) through the REAL src/chain/live.ts: a transfer whose insert
+//     fails once is NOT behind the cursor — the next tick records it.
+//  S. (Q M1) 200 abandoned intents do not starve a newer one (sweep + expiry).
+//  W. (Q H2) the worker's composition root refuses to boot with a port unwired.
 //  M. (A7) amounts truncated to 6 dp (never half-up); a zero deposit never
 //     moves an intent; (A1) deposit.confirmed for every deposit with the fee.
 import { Prisma, type Chain } from "@prisma/client";
@@ -35,6 +39,11 @@ import { expireIntentsOnce } from "@/worker/intents-expire.js";
 import { advanceIntent, createIntent, setEventSink, type EnqueueEventInput, type IntentStatus } from "@/intents/index.js";
 import { enqueueEvent } from "@/events/index.js";
 import { legacyWatchStatus, observerLagBlocks } from "@/observer/index.js";
+import { liveObserver } from "@/chain/live.js";
+import { tronAdapter } from "@/chain/impl/tron.js";
+import { DEPOSIT_RENDER_SELECT, renderDeposit } from "@/render/deposit.js";
+import { advanceIntentsForChain } from "@/intents/index.js";
+import { getChainConfig } from "@/chain/impl/config.js";
 import { check, checkOver, summary, thrown } from "./lib/check.js";
 
 const RUN = Date.now().toString(36);
@@ -90,6 +99,40 @@ async function main() {
   process.env.SAMAPAY_DERIVATION_FLOOR_TRC20 = String(FLOOR);
   process.env.SAMAPAY_DERIVATION_FLOOR_BEP20 = String(FLOOR);
   setEventSink(fakeEnqueue);
+
+  // ── R. B1 through the REAL live scanner (Q's probe) — first, so the one-shot trigger meets our insert ──
+  console.log("\nR. cursor is advanced only AFTER the transfers are recorded (real live.ts)");
+  {
+    process.env.CRYPTO_MODE = "mainnet";
+    const rc = await prisma.client.create({ data: { name: `verify-probe-${RUN}`, kind: "merchant" }, select: { id: true } });
+    const rk = await prisma.clientKey.create({ data: { clientId: rc.id, name: "probe", keyPrefix: `vpr_${RUN}`.slice(0, 12).padEnd(12, "x"), keyHash: "x", keyLast4: "0000", scopes: [], environment: "test", issuedBy: "verify", issuedVia: "cli" }, select: { id: true } });
+    const ADDR = `TQprobe${RUN}`; const TX = `probe${RUN}`.padEnd(64, "0");
+    await prisma.address.create({ data: { keyId: rk.id, clientId: rc.id, reference: `probe:m:user:${RUN}`, chain: "TRC20", address: ADDR, derivationIndex: 900_000 } });
+    await prisma.scanCursor.upsert({ where: { chain: "TRC20" }, create: { chain: "TRC20", lastScannedBlock: 100n }, update: { lastScannedBlock: 100n } });
+    const t = tronAdapter as unknown as Record<string, unknown>;
+    const saved = { getLatestBlock: t.getLatestBlock, getConfirmations: t.getConfirmations, getIncomingTransfers: t.getIncomingTransfers };
+    t.getLatestBlock = async () => 1000n;
+    t.getConfirmations = async () => 0;
+    t.getIncomingTransfers = async (from: bigint, to: bigint, addrs: Set<string>) => ({
+      transfers: 150n >= from && 150n <= to && addrs.has(ADDR) ? [{ txHash: TX, toAddress: ADDR, amountRaw: "5000000", blockNumber: 150n }] : [],
+      scannedThrough: to,
+    });
+    // ONE-SHOT: a sequence, because nextval() survives the rollback the RAISE causes (a marker ROW would be
+    // rolled back with it and the "transient" failure would fire for ever).
+    await prisma.$executeRawUnsafe(`CREATE SEQUENCE g2_probe_seq`);
+    await prisma.$executeRawUnsafe(`CREATE OR REPLACE FUNCTION g2_probe_fail_once() RETURNS trigger AS $$ BEGIN IF nextval('g2_probe_seq') = 1 THEN RAISE EXCEPTION 'g2 probe: transient failure'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql`);
+    await prisma.$executeRawUnsafe(`CREATE TRIGGER g2_probe_trg BEFORE INSERT ON deposits FOR EACH ROW EXECUTE FUNCTION g2_probe_fail_once()`);
+    const cur = async () => (await prisma.scanCursor.findUniqueOrThrow({ where: { chain: "TRC20" }, select: { lastScannedBlock: true } })).lastScannedBlock;
+    const t1 = await thrown(() => observeChain("TRC20", liveObserver, REQ));
+    const c1 = await cur();
+    const t2 = await thrown(() => observeChain("TRC20", liveObserver, REQ));
+    const c2 = await cur();
+    const rows = await prisma.deposit.count({ where: { txHash: TX } });
+    await prisma.$executeRawUnsafe(`DROP TRIGGER g2_probe_trg ON deposits`);
+    Object.assign(t, saved);
+    check(t1.name !== "NO THROW" && c1 === 100n, "R1. the insert fails once → the tick throws and the cursor STAYS at 100 (not advanced past block 150)", `tick ${t1.name}, cursor ${c1}`);
+    check(t2.name === "NO THROW" && rows === 1 && c2 === 1000n - BigInt(getChainConfig("TRC20").confirmationsRequired) + 1n, "R2. the next tick re-scans, records the 5 USDT transfer, THEN advances the cursor to the safe head", `tick ${t2.name}, rows ${rows}, cursor ${c2}`);
+  }
 
   const client = await prisma.client.create({ data: { name: `verify-intents-${RUN}`, kind: "merchant", enabledChains: ["TRC20"], feeBps: 100 }, select: { id: true } });
   const key = await prisma.clientKey.create({ data: { clientId: client.id, name: "intents", keyPrefix: `vie_${RUN}`.slice(0, 12).padEnd(12, "x"), keyHash: "not-a-real-hash", keyLast4: "0000", scopes: [], environment: "test", issuedBy: "verify", issuedVia: "cli" }, select: { id: true } });
@@ -330,9 +373,51 @@ async function main() {
   const myAddrs = await prisma.address.findMany({ where: { keyId: key.id, intent: { isNot: null } }, select: { clientId: true } });
   checkOver(myAddrs.length, myAddrs.every((a) => a.clientId === client.id), "M5. every intent address createIntent wrote carries client_id (A12)");
   const lw = await legacyWatchStatus();
-  check(lw.TRC20 instanceof Date && lw.BEP20 instanceof Date, "H1. legacyWatchStatus() → a Date per chain once enabled", JSON.stringify(lw));
+  check(typeof lw.TRC20 === "string" && typeof lw.BEP20 === "string" && !Number.isNaN(Date.parse(lw.BEP20 ?? "")), "H1. legacyWatchStatus() → an ISO string per chain once enabled (G1 health.ts's PerChain<string|null>)", JSON.stringify(lw));
   const lag = await observerLagBlocks(async (c) => (c === "BEP20" ? 250n : 0n));
   check(lag.BEP20 === 40, "H2. observerLagBlocks(head) = head − cursor (BEP20 250 − 210 = 40)", JSON.stringify(lag));
+
+  // ── A13: the webhook snapshot IS G1's renderDeposit of the same row ─────
+  const snapCall = calls.find((c) => c.type === "deposit.confirmed" && c.objectId === `dep_${topDep?.id}`);
+  const nowRow = await prisma.deposit.findUniqueOrThrow({ where: { id: topDep?.id ?? "" }, select: DEPOSIT_RENDER_SELECT });
+  check(JSON.stringify(snapCall?.snapshot) === JSON.stringify(renderDeposit(nowRow)), "D6. (A13) deposit.confirmed snapshot === renderDeposit(row) — the one renderer GET /v1/deposits/:id uses");
+
+  // ── S. starvation (Q M1) ─────────────────────────────────────────────────
+  console.log("\nS. 200 abandoned intents never starve a newer one");
+  {
+    const sc = await prisma.client.create({ data: { name: `verify-starve-${RUN}`, kind: "merchant" }, select: { id: true } });
+    const sk = await prisma.clientKey.create({ data: { clientId: sc.id, name: "starve", keyPrefix: `vst_${RUN}`.slice(0, 12).padEnd(12, "x"), keyHash: "x", keyLast4: "0000", scopes: [], environment: "test", issuedBy: "verify", issuedVia: "cli" }, select: { id: true } });
+    const old = new Date(Date.now() - 2 * 86_400_000);
+    const bulk = async (chain: Chain, base: number, status: "expired_partial" | "processing", dep: "confirmed" | "detected") => {
+      const n = 200;
+      const ids = Array.from({ length: n }, (_, i) => `pi_s${RUN}${chain}${i}`);
+      const addrIds = Array.from({ length: n }, (_, i) => `adr${RUN}${chain}${i}`);
+      await prisma.address.createMany({ data: ids.map((id, i) => ({ id: addrIds[i] as string, keyId: sk.id, clientId: sc.id, chain, reference: `payment_intent:${id}`, address: `S${RUN}${chain}${i}`, derivationIndex: base + i })) });
+      await prisma.paymentIntent.createMany({ data: ids.map((id, i) => ({ id, clientId: sc.id, keyId: sk.id, addressId: addrIds[i] as string, chain, amount: new Prisma.Decimal(5), reference: `starve_${RUN}_${chain}_${i}`, status, expiresAt: new Date(old.getTime() + 3_600_000), createdAt: old, expiredAt: status === "expired_partial" ? new Date(old.getTime() + 3_600_000) : null })) });
+      await prisma.deposit.createMany({ data: ids.map((_, i) => ({ keyId: sk.id, clientId: sc.id, addressId: addrIds[i] as string, chain, txHash: `st${RUN}${chain}${i}`, amount: new Prisma.Decimal(1), confirmations: dep === "confirmed" ? 20 : 1, status: dep, detectedAt: old, creditedAt: dep === "confirmed" ? old : null })) });
+    };
+    await bulk("TRC20", 700_000, "expired_partial", "confirmed");
+    const iNew = await mk("5");
+    pay(iNew.address.address, "5");
+    await tick();
+    for (let k = 0; k < 2 && (await statusOf(iNew.id)) !== "succeeded"; k++) await advanceIntentsForChain(CHAIN, { now: new Date(), confirmationsRequired: REQ });
+    check((await statusOf(iNew.id)) === "succeeded", "S1. with 200 older abandoned expired_partial intents open, a newly paid intent still reaches succeeded within ceil(n/200)+1 sweeps", await statusOf(iNew.id));
+
+    await bulk("BEP20", 800_000, "processing", "detected"); // in-time deposits that never confirm: due for ever
+    const iDue = await mk("5", { createdAgoSec: 7200 });
+    for (let k = 0; k < 3 && (await statusOf(iDue.id)) !== "expired"; k++) await expireIntentsOnce({ confirmationsRequired: () => REQ });
+    check((await statusOf(iDue.id)) === "expired", "S2. with 200 older stuck-processing intents due, a newer unpaid intent still expires within ceil(n/200)+1 runs", await statusOf(iDue.id));
+  }
+
+  // ── W. composition root (Q H2) ────────────────────────────────────────────
+  console.log("\nW. the worker refuses to boot with a port unwired");
+  setChainAdapters({ observer: chainAdapters().observer }); // the test fake: NOT the live observer
+  // Imported here, not at the top: an entry point that lacks the composition root must FAIL these checks, not crash the suite.
+  const worker = (await import("@/worker/index.js")) as { assertWorkerComposed?: () => void; composeWorker?: () => void };
+  const w1 = await thrown(async () => { if (!worker.assertWorkerComposed) throw new Error("no assertWorkerComposed exported"); worker.assertWorkerComposed(); });
+  check(w1.name === "WorkerNotComposed", "W1. a fake/unwired observer → assertWorkerComposed throws WorkerNotComposed", w1.name);
+  const w2 = await thrown(async () => { if (!worker.composeWorker) throw new Error("no composeWorker exported"); worker.composeWorker(); });
+  check(w2.name === "NO THROW", "W2. composeWorker() (live adapters + G3's enqueueEvent) passes its own boot assertion", w2.name);
 
   // ── the floor across everything this run created ───────────────────────
   const intentAddrs = await prisma.address.findMany({ where: { keyId: key.id, intent: { isNot: null } }, select: { derivationIndex: true } });
