@@ -68,7 +68,7 @@ function file(name: string, content: unknown): string {
   return p;
 }
 async function legacyRows() {
-  return prisma.address.findMany({ where: { legacyImport: true }, orderBy: [{ chain: "asc" }, { derivationIndex: "asc" }], select: { chain: true, address: true, derivationIndex: true, keyId: true, reference: true } });
+  return prisma.address.findMany({ where: { legacyImport: true }, orderBy: [{ chain: "asc" }, { derivationIndex: "asc" }], select: { chain: true, address: true, derivationIndex: true, keyId: true, clientId: true, reference: true } });
 }
 async function cursors() {
   const rows = await prisma.scanCursor.findMany({ select: { chain: true, lastScannedBlock: true, legacyWatchEnabledAt: true } });
@@ -76,7 +76,7 @@ async function cursors() {
 }
 async function mkKey(kind: "merchant" | "partner", tag: string) {
   const client = await prisma.client.create({ data: { name: `vlh-${tag}-${RUN}`, kind }, select: { id: true } });
-  return prisma.clientKey.create({ data: { clientId: client.id, name: tag, keyPrefix: `v${tag}${RUN}`.slice(0, 12).padEnd(12, "x"), keyHash: "not-a-real-hash", keyLast4: "0000", scopes: [], environment: "test", issuedBy: "verify", issuedVia: "cli" }, select: { id: true } });
+  return prisma.clientKey.create({ data: { clientId: client.id, name: tag, keyPrefix: `v${tag}${RUN}`.slice(0, 12).padEnd(12, "x"), keyHash: "not-a-real-hash", keyLast4: "0000", scopes: [], environment: "test", issuedBy: "verify", issuedVia: "cli" }, select: { id: true, clientId: true } });
 }
 
 async function main() {
@@ -117,10 +117,10 @@ async function main() {
   // ── 4. apply ─────────────────────────────────────────────────────────────
   r = run(IMPORT, [`--in=${goodFile}`, ...keys, "--expect=6", "--apply"]);
   rows = await legacyRows();
-  const want = good.map((g) => ({ chain: g.chain, address: g.address, derivationIndex: g.derivationIndex, keyId: g.merchantId === mA ? keyA.id : keyB.id, reference: `samaprime:${g.merchantId}:user:${g.userId}` }))
+  const want = good.map((g) => ({ chain: g.chain, address: g.address, derivationIndex: g.derivationIndex, keyId: g.merchantId === mA ? keyA.id : keyB.id, clientId: g.merchantId === mA ? keyA.clientId : keyB.clientId, reference: `samaprime:${g.merchantId}:user:${g.userId}` }))
     .sort((a, b) => a.chain.localeCompare(b.chain) || a.derivationIndex - b.derivationIndex);
   check(r.code === 0 && /inserted 6/.test(r.out), "4. --apply inserts 6", `exit ${r.code}`);
-  check(JSON.stringify(rows) === JSON.stringify(want), "4b. every row EXACTLY: address, index, its OWN merchant's key, reference samaprime:<merchantId>:user:<userId>, legacy_import", JSON.stringify(rows[0]));
+  check(JSON.stringify(rows) === JSON.stringify(want), "4b. every row EXACTLY: address, index, its OWN merchant's key AND that key's client_id (v1.1 A12), reference samaprime:<merchantId>:user:<userId>, legacy_import", JSON.stringify(rows[0]));
   check(Object.keys(await cursors()).length === 0, "4c. the import never touches scan_cursors (watching starts only at 5b)");
 
   // ── 5. idempotent ────────────────────────────────────────────────────────
