@@ -2,10 +2,9 @@
 //   { ok, observer_lag_blocks:{TRC20,BEP20}, vault:"proven|unproven",
 //     derivation:"ready|unavailable", legacy_watch:{TRC20: iso|null, BEP20: iso|null} }
 // The READERS belong to their owners — observer lag and legacy watch to G2,
-// vault and derivation to G4 — and are wired in at integration through
-// setHealthReaders(). Until then the defaults answer the SAFE value
-// (unproven / unavailable / lag unknown), never an optimistic one;
-// legacy_watch is read from scan_cursors directly.
+// vault and derivation to G4 (wired below). Until G2's land (setHealthReaders)
+// lag answers unknown (null), never an optimistic number, and legacy_watch
+// is read from scan_cursors directly.
 // MNTAD's start-legacy-scanner reads `legacy_watch` and refuses while it is
 // set, so a reader failure must never read as "not watching": it makes the
 // whole answer ok:false, and that field is left out rather than null.
@@ -13,6 +12,21 @@ import { Hono } from "hono";
 import type { Chain } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import { logger } from "@/log.js";
+import { derivationStatus, vaultStatus } from "@/chain/seed/vault-proof.js";
+
+// G4's readers decrypt the seed row to prove it; /health is unauthenticated,
+// so a caller must not be able to make every request pay that cost. Cached
+// for a few seconds — a status that is 10 s stale is still the truth an
+// operator needs, and it never reports better than the last real read.
+const SEED_STATUS_TTL_MS = 10_000;
+function cached<T>(f: () => Promise<T>): () => Promise<T> {
+  let at = 0; let value: Promise<T> | null = null;
+  return () => {
+    const now = Date.now();
+    if (!value || now - at > SEED_STATUS_TTL_MS) { at = now; value = f(); value.catch(() => { value = null; }); }
+    return value;
+  };
+}
 
 type PerChain<T> = Record<Chain, T>;
 export interface HealthReaders {
@@ -24,8 +38,8 @@ export interface HealthReaders {
 
 let readers: HealthReaders = {
   async observerLagBlocks() { return { TRC20: null, BEP20: null }; },
-  async vault() { return "unproven"; },
-  async derivation() { return "unavailable"; },
+  vault: cached(vaultStatus),           // G4
+  derivation: cached(derivationStatus), // G4
   // Read straight from G6's column until G2's reader is wired: the stamp IS the fact.
   async legacyWatch() {
     const rows = await prisma.scanCursor.findMany({ select: { chain: true, legacyWatchEnabledAt: true } });
