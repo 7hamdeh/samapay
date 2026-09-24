@@ -5,6 +5,7 @@
 //   - each merchant's addresses go under THAT merchant's key (a `merchant`
 //     client), not one platform key — M1 refuses a deposit.confirmed whose
 //     reference names a merchant other than the credential's;
+//   - client_id = the key's client (v1.1 A12), written on every row;
 //   - reference `samaprime:<merchantId>:user:<userId>` (src/reference format),
 //     no longer `legacy:none`;
 //   - EVERY address must re-derive from the seed in crypto_config (the imported
@@ -32,7 +33,7 @@
 //     not a `merchant` client's key;
 //   - an existing row at the same (chain, address) or (chain, index) differs in
 //     ANY field from what this run would write (address, index, key,
-//     reference, legacy_import) — never overwritten, never "fixed".
+//     client_id, reference, legacy_import) — never overwritten, never "fixed".
 // IDEMPOTENT: rows already present exactly as planned are skipped; a second
 // run writes 0.
 //
@@ -80,7 +81,7 @@ function sameAddress(chain: Chain, a: string, b: string): boolean {
   return chain === "BEP20" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
-interface Planned { chain: Chain; address: string; derivationIndex: number; keyId: string; reference: string }
+interface Planned { chain: Chain; address: string; derivationIndex: number; keyId: string; clientId: string; reference: string }
 
 async function main(): Promise<number> {
   const file = flag("in");
@@ -114,14 +115,17 @@ async function main(): Promise<number> {
     keyFor.set(m[1]!, m[2]!);
   }
   const merchants = [...new Set(rows.map((r) => r.merchantId))];
+  // v1.1 A12: every address row carries its key's client_id, resolved here from the key itself.
+  const clientFor = new Map<string, string>();
   const unmapped = merchants.filter((mId) => !keyFor.has(mId));
   if (unmapped.length) throw new Refused(`no --key for merchant(s) ${unmapped.join(", ")} — every legacy address must go under its own merchant's key`);
   for (const mId of merchants) {
     const keyId = keyFor.get(mId)!;
-    const key = await prisma.clientKey.findUnique({ where: { id: keyId }, select: { active: true, revokedAt: true, client: { select: { kind: true } } } });
+    const key = await prisma.clientKey.findUnique({ where: { id: keyId }, select: { active: true, revokedAt: true, clientId: true, client: { select: { kind: true } } } });
     if (!key) throw new Refused(`key ${keyId} (merchant ${mId}) does not exist`);
     if (!key.active || key.revokedAt) throw new Refused(`key ${keyId} (merchant ${mId}) is inactive or revoked`);
     if (key.client.kind !== "merchant") throw new Refused(`key ${keyId} (merchant ${mId}) belongs to a ${key.client.kind} client, not a merchant`);
+    clientFor.set(mId, key.clientId);
   }
 
   // ── re-derivation: every address from the stored seed, before any write ─
@@ -137,7 +141,7 @@ async function main(): Promise<number> {
       console.error(`  MISMATCH ${r.chain} index ${r.derivationIndex}: file ${r.address.slice(0, 10)}… does not re-derive`);
       continue;
     }
-    planned.push({ chain: r.chain, address: derived, derivationIndex: r.derivationIndex, keyId: keyFor.get(r.merchantId)!, reference: buildReference({ client: "samaprime", tenant: r.merchantId, kind: "user", id: r.userId }) });
+    planned.push({ chain: r.chain, address: derived, derivationIndex: r.derivationIndex, keyId: keyFor.get(r.merchantId)!, clientId: clientFor.get(r.merchantId)!, reference: buildReference({ client: "samaprime", tenant: r.merchantId, kind: "user", id: r.userId }) });
   }
   wipeMasterSeedCache();
   if (mismatches) throw new Refused(`${mismatches} address(es) do not re-derive from the stored seed at their index`);
@@ -151,11 +155,11 @@ async function main(): Promise<number> {
       for (const p of planned) {
         const existing = await tx.address.findMany({
           where: { chain: p.chain, OR: [{ derivationIndex: p.derivationIndex }, { address: { equals: p.address, mode: p.chain === "BEP20" ? "insensitive" : "default" } }] },
-          select: { address: true, derivationIndex: true, keyId: true, reference: true, legacyImport: true },
+          select: { address: true, derivationIndex: true, keyId: true, clientId: true, reference: true, legacyImport: true },
         });
         if (existing.length === 0) { toInsert.push(p); continue; }
-        const same = existing.length === 1 && existing.every((e) => sameAddress(p.chain, e.address, p.address) && e.derivationIndex === p.derivationIndex && e.keyId === p.keyId && e.reference === p.reference && e.legacyImport);
-        if (!same) throw new Refused(`${p.chain} index ${p.derivationIndex}: an existing row differs from the planned one (address/index/key/reference/legacy_import) — refusing to overwrite`);
+        const same = existing.length === 1 && existing.every((e) => sameAddress(p.chain, e.address, p.address) && e.derivationIndex === p.derivationIndex && e.keyId === p.keyId && e.clientId === p.clientId && e.reference === p.reference && e.legacyImport);
+        if (!same) throw new Refused(`${p.chain} index ${p.derivationIndex}: an existing row differs from the planned one (address/index/key/client/reference/legacy_import) — refusing to overwrite`);
         present += 1;
       }
       if (toInsert.length) {
@@ -164,7 +168,7 @@ async function main(): Promise<number> {
       }
       if (!apply) { inserted = toInsert.length; throw new DryRunRollback(); }
       for (const p of toInsert) {
-        const row = await tx.address.create({ data: { keyId: p.keyId, reference: p.reference, chain: p.chain, address: p.address, derivationIndex: p.derivationIndex, legacyImport: true }, select: { id: true } });
+        const row = await tx.address.create({ data: { keyId: p.keyId, clientId: p.clientId, reference: p.reference, chain: p.chain, address: p.address, derivationIndex: p.derivationIndex, legacyImport: true }, select: { id: true } });
         await appendAudit(tx, { keyId: p.keyId, actor: `admin:${by}`, action: "address.legacy_imported", subjectId: row.id, params: { chain: p.chain, derivationIndex: p.derivationIndex, reference: p.reference } });
       }
       inserted = toInsert.length;
