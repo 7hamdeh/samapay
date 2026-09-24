@@ -38,9 +38,16 @@ async function main() {
     const client = await prisma.client.create({ data: { name: `verify-e2e-${RUN}`, kind: "platform" } }); made.clients.push(client.id);
     const scopes = ["addresses.write", "deposits.read", "withdrawals.write", "withdrawals.read", "balance.read"];
     const A = await issueKey({ clientId: client.id, name: "A", scopes, issuedBy: "verify", issuedVia: "cli" });
-    const B = await issueKey({ clientId: client.id, name: "B", scopes, issuedBy: "verify", issuedVia: "cli" });
+    // B is ANOTHER CLIENT's key: since contract v1.1 A6 the balance (and every
+    // read) is per CLIENT, so a second key of the SAME client would see A's money
+    // by design — isolation is between clients.
+    const client2 = await prisma.client.create({ data: { name: `verify-e2e-b-${RUN}`, kind: "platform" } }); made.clients.push(client2.id);
+    const B = await issueKey({ clientId: client2.id, name: "B", scopes, issuedBy: "verify", issuedVia: "cli" });
     made.keys.push(A.id, B.id);
     const hdr = (k: string, idem?: string) => ({ authorization: `Bearer ${k}`, "content-type": "application/json", ...(idem ? { "idempotency-key": idem } : {}) });
+    // GET /balance is the contract §4 object; this suite moves BEP20 only.
+    type Bal = { object: string; chains: { BEP20: { available: string; pending: string }; TRC20: { available: string; pending: string } } };
+    const bep = async (k: string) => { const b = (await (await app.request("/balance", { headers: hdr(k) })).json()) as Bal; return b.chains.BEP20; };
 
     // 1. address issued to A, bound to a reference; same (reference, chain) reuses
     const a1 = await app.request("/addresses", { method: "POST", headers: hdr(A.plaintext, `addr-${RUN}`), body: JSON.stringify({ chain: "BEP20", reference: "samaprime:verify:user:cust1" }) });
@@ -56,15 +63,15 @@ async function main() {
     const o1 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
     const o2 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
     check(o1.recorded === 1 && o2.recorded === 0 && o2.alreadyKnown === 1, "2. the observer records a transfer once; a second scan sees it as alreadyKnown (UNIQUE chain+tx_hash)", `${JSON.stringify(o1)} then ${JSON.stringify(o2)}`);
-    const bal0 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { received: string; allowance: string } };
-    check(bal0.balance.received === "0" && bal0.balance.allowance === "0", "3. a DETECTED deposit does not count: /balance still 0", JSON.stringify(bal0.balance));
+    const bal0 = await bep(A.plaintext);
+    check(bal0.available === "0" && bal0.pending === "10", "3. a DETECTED deposit is not available: /balance BEP20 available 0, pending 10", JSON.stringify(bal0));
 
     // 4. confirm once; balance moves exactly once
     confirmations = REQUIRED_CONFIRMATIONS_UNDER_TEST;
     const o3 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
     const o4 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
-    const bal1 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { received: string; allowance: string; deposit_count: number } };
-    check(o3.confirmed === 1 && o4.confirmed === 0 && bal1.balance.received === "10" && bal1.balance.allowance === "10" && bal1.balance.deposit_count === 1, "4. confirmed exactly once; /balance received=10 allowance=10", `confirmed ${o3.confirmed}/${o4.confirmed} balance=${JSON.stringify(bal1.balance)}`);
+    const bal1 = await bep(A.plaintext);
+    check(o3.confirmed === 1 && o4.confirmed === 0 && bal1.available === "10" && bal1.pending === "0", "4. confirmed exactly once; /balance BEP20 available=10 pending=0", `confirmed ${o3.confirmed}/${o4.confirmed} balance=${JSON.stringify(bal1)}`);
     const dep = (await (await app.request("/deposits", { headers: hdr(A.plaintext) })).json()) as { deposits: Array<{ status: string; counts_toward_allowance: boolean }> };
     check(dep.deposits.length === 1 && dep.deposits[0]?.status === "confirmed" && dep.deposits[0]?.counts_toward_allowance === true, "4b. GET /deposits shows it confirmed and counting");
     const webhook = await prisma.webhookDelivery.count({ where: { keyId: A.id, eventType: "deposit.confirmed" } });
@@ -90,16 +97,16 @@ async function main() {
     check(w2.status === 409 && w2b.error.code === "allowance_exceeded" && w2b.error.details.received === "10" && w2b.error.details.withdrawn === "6.5" && w2b.error.details.requested === "3.500001" && rows2 === 1, "6. over-allowance refused 409 allowance_exceeded with received/withdrawn/requested; no row written", JSON.stringify(w2b.error?.details));
 
     // 7. isolation: key B sees none of it
-    const balB = (await (await app.request("/balance", { headers: hdr(B.plaintext) })).json()) as { balance: { received: string; deposit_count: number } };
+    const balB = await bep(B.plaintext);
     const depB = (await (await app.request("/deposits", { headers: hdr(B.plaintext) })).json()) as { deposits: unknown[] };
     const wdB = await app.request(`/withdrawals/${w1b.withdrawal.id}`, { headers: hdr(B.plaintext) });
-    check(balB.balance.received === "0" && balB.balance.deposit_count === 0 && depB.deposits.length === 0 && wdB.status === 404, "7. ISOLATION — key B: balance 0, no deposits, A's withdrawal is 404", `${wdB.status}`);
+    check(balB.available === "0" && balB.pending === "0" && depB.deposits.length === 0 && wdB.status === 404, "7. ISOLATION — another client's key B: balance 0, no deposits, A's withdrawal is 404", `${JSON.stringify(balB)} ${wdB.status}`);
 
     // 8. the sender stub is refused (rejected) and the row is `failed` — still CONSUMING (allowance unchanged)
     await new Promise((r) => setTimeout(r, 300));
     const w1s = await prisma.withdrawal.findUniqueOrThrow({ where: { id: w1b.withdrawal.id }, select: { status: true } });
-    const bal2 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { allowance: string } };
-    check(w1s.status === "failed" && bal2.balance.allowance === "3.5", "8. a failed (pre-broadcast) send keeps CONSUMING: status=failed, allowance still 3.5 (restore needs evidence)", `status=${w1s.status} allowance=${bal2.balance.allowance}`);
+    const bal2 = await bep(A.plaintext);
+    check(w1s.status === "failed" && bal2.available === "3.5", "8. a failed (pre-broadcast) send keeps CONSUMING: status=failed, available still 3.5 (restore needs evidence)", `status=${w1s.status} available=${bal2.available}`);
     // 8c. finding 1: with NO chain (ChainUnavailable) a request is RELEASED with a reason, not left pending
     setChainAdapters({ sender: { async send() { throw new (await import("@/chain/registry.js")).ChainUnavailable("send"); } } });
     const w3 = await app.request("/withdrawals", { method: "POST", headers: hdr(A.plaintext, `wd3-${RUN}`), body: JSON.stringify({ to: "0x" + "a".repeat(40), amount: "1", chain: "BEP20" }) });
@@ -107,8 +114,8 @@ async function main() {
     await new Promise((r) => setTimeout(r, 300));
     const w3s = await prisma.withdrawal.findUniqueOrThrow({ where: { id: w3b.withdrawal.id }, select: { status: true, reservation: { select: { status: true, reason: true } } } });
     const cancelledHook = await prisma.webhookDelivery.count({ where: { keyId: A.id, eventType: "withdrawal.cancelled" } });
-    const bal4 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { allowance: string } };
-    check(w3.status === 202 && w3s.status === "cancelled" && w3s.reservation?.reason === "chain_unavailable" && cancelledHook === 1 && bal4.balance.allowance === "3.5", "8c. ChainUnavailable → cancelled with reason chain_unavailable + webhook; allowance restored to 3.5, nothing left pending", `status=${w3s.status} reason=${w3s.reservation?.reason} hooks=${cancelledHook} allowance=${bal4.balance.allowance}`);
+    const bal4 = await bep(A.plaintext);
+    check(w3.status === 202 && w3s.status === "cancelled" && w3s.reservation?.reason === "chain_unavailable" && cancelledHook === 1 && bal4.available === "3.5", "8c. ChainUnavailable → cancelled with reason chain_unavailable + webhook; available restored to 3.5, nothing left pending", `status=${w3s.status} reason=${w3s.reservation?.reason} hooks=${cancelledHook} available=${bal4.available}`);
     // ⚠️ 8d WAS ASSERTING A BEHAVIOUR THAT CONTRADICTS IDEMPOTENCY.
     // There are TWO replay layers: the middleware (keyed on the
     // Idempotency-Key) and allowance.reserve (keyed on the same string in
@@ -134,8 +141,8 @@ async function main() {
       `GET=${liveStatus.withdrawal.status} replayBody=${replayBody.withdrawal.status}`);
     // 8b. CONTROL: the balance number is not clamped — force withdrawn > received in the DB and read
     await prisma.withdrawal.create({ data: { keyId: A.id, toAddress: "0x" + "f".repeat(40), chain: "BEP20", amount: new Prisma.Decimal("20"), status: "sent", idempotencyKey: `forced-${RUN}` } });
-    const bal3 = (await (await app.request("/balance", { headers: hdr(A.plaintext) })).json()) as { balance: { allowance: string } };
-    check(bal3.balance.allowance === "-16.5", "8b. CONTROL — /balance never clamps: a forced over-send reads -16.5", bal3.balance.allowance);
+    const bal3 = await bep(A.plaintext);
+    check(bal3.available === "-16.5", "8b. CONTROL — /balance never clamps: a forced over-send reads BEP20 available -16.5", bal3.available);
   } catch (err) {
     // ⚠️ WITHOUT THIS, A CRASH REPORTS AS A CLEAN ZERO. `process.exit()` in
     // the `finally` below runs BEFORE the exception propagates and discards
