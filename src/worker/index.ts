@@ -27,6 +27,7 @@ import { getChainConfig } from "@/chain/impl/config.js";
 import { observeChain } from "@/observer/index.js";
 import type { Chain } from "@prisma/client";
 import { reconcileOnce } from "./reconciler.js";
+import { expireIntentsOnce } from "./intents-expire.js";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info", name: "samapay-worker" });
 export const GRACE_MS = 5_000;                 // a route's own submit gets this long first
@@ -122,6 +123,10 @@ async function loop(): Promise<never> {
       const b = await deliverDueOnce();
       const c = await confirmOutgoingOnce();
       const d = await reconcileOnce();
+      // Intents past expires_at with nothing at their address get no observer
+      // tick of their own; this asks the state machine about them (contract A9).
+      const x = await expireIntentsOnce({ confirmationsRequired: (chain) => getChainConfig(chain).confirmationsRequired });
+      if (x.expired) log.info({ actor: "expiry", action: "payment_intent.expire_sweep", result: "expired", ...x }, "intents expired");
       const o = await observeDueOnce(Date.now());
       if (o) log.info({ observe: o }, "observe tick");
       if (a.submitted || a.expired || b.attempted || c.confirmed || d.refunded || d.present_on_chain) log.info({ ...a, ...b, ...c, reconcile: d }, "tick");
@@ -132,6 +137,11 @@ async function loop(): Promise<never> {
 if (process.argv[1]?.endsWith("worker/index.ts") || process.argv[1]?.endsWith("worker/index.js")) {
   // Swap the four refusing stubs for the real adapters BEFORE the loop starts.
   installLiveChainAdapters();
+  // ⚠️ THE EVENT SINK MUST BE WIRED HERE ONCE src/events (G3) LANDS:
+  //   setEventSink(enqueueEvent)   // import { setEventSink } from "@/intents/index.js"
+  // Until then src/intents/events-port.ts REFUSES, so every deposit
+  // confirmation and intent transition rolls back and is retried next tick —
+  // nothing is confirmed without its event, nothing is lost.
   log.info({ chains: OBSERVED_CHAINS, everyMs: OBSERVE_EVERY_MS }, "observer armed");
   void loop();
 }
