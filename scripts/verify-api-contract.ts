@@ -332,10 +332,20 @@ async function main() {
     check(e2.status === 404 && e2.code === "not_found" && e3.status === 404, "§2 another client's event is 404, same as unknown", `${e2.status}/${e3.status}`);
 
     // ── §6 429 ──
-    const rl = [] as Array<{ status: number; retry: string | null; code?: string }>;
-    for (let i = 0; i < 4; i++) { const r = await call("GET", "/v1/payment-intents", SLOW.plaintext); rl.push({ status: r.status, retry: r.res.headers.get("retry-after"), ...(r.code ? { code: r.code } : {}) }); }
+    // Timing-honest: sequential calls each pay one argon2, and on a loaded box that alone can
+    // outlast the refill (2/s) so the bucket never empties. The calls go CONCURRENTLY and the
+    // bound is DERIVED: served ≤ RPS + floor(elapsed × RPS) + 1, and with N = 12 at least one
+    // must be 429 unless the whole burst took longer than (N − RPS − 1) / RPS seconds.
+    const RPS = 2, N = 12;
+    const tR = Date.now();
+    const rl = (await Promise.all(Array.from({ length: N }, () => call("GET", "/v1/payment-intents", SLOW.plaintext))))
+      .map((r) => ({ status: r.status, retry: r.res.headers.get("retry-after"), ...(r.code ? { code: r.code } : {}) }));
+    const rlElapsed = (Date.now() - tR) / 1000;
     const limited = rl.filter((r) => r.status === 429);
-    check(limited.length >= 1 && limited.every((r) => r.code === "rate_limited" && Number(r.retry) >= 1) && rl[0]?.status === 200, "§6 429 rate_limited with Retry-After (rps_limit=2, 4 quick calls)", JSON.stringify(rl));
+    const served = rl.filter((r) => r.status === 200).length;
+    const maxServed = RPS + Math.floor(rlElapsed * RPS) + 1;
+    check(limited.length >= 1 && served <= maxServed && served + limited.length === N && limited.every((r) => r.code === "rate_limited" && Number(r.retry) >= 1),
+      `§6 429 rate_limited with Retry-After (rps_limit=${RPS}, ${N} concurrent calls in ${rlElapsed.toFixed(2)} s: served ${served} ≤ ${maxServed})`, JSON.stringify(rl));
     await sleep(1100);
     const rl2 = await call("GET", "/v1/payment-intents", SLOW.plaintext);
     check(rl2.status === 200, "§2 the bucket refills: after 1 s the key is served again", `${rl2.status}`);
