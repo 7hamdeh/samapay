@@ -2,9 +2,19 @@
 // addresses.watch_disabled_at; the observer skips any address where it is set.
 //
 //   DRY RUN (default, writes nothing):
-//     pnpm exec tsx --env-file=.env scripts/ops/disable-address.ts --address=TNX7jtfaGHGjdSHzxHt9FhnFVmHvkQ2b9k
-//   APPLY (Ibrahim's keystroke, after a fresh SamaPay backup):
-//     … --address=<addr> --apply --backup=/absolute/path/to/samapay-dump [--by=ibrahim] [--reason="old seed 02e0fb61"]
+//     pnpm exec tsx --env-file=.env scripts/ops/disable-address.ts --address=<the written-off TRC20 address>
+//   APPLY (Ibrahim's keystroke, right after /root/backups/samapay-backup.sh):
+//     … --address=<addr> --apply --backup=/root/backups/samapay/samapay-<UTC>.dump.gpg [--by=ibrahim] [--reason=<text>]
+//   REHEARSAL (throwaway only): add --rehearsal; the backup comes from env
+//     SAMAPAY_OPS_REHEARSAL_BACKUP_DIR.
+//
+// ONE GATE FOR EVERY PHASE 0 OPS SCRIPT (review Q M3): src/chain/seed/ops-gate.ts
+//   - openOpsRun: where-am-I. Refuses anything but the production database
+//     (samapay on 5432), or with --rehearsal a *_sandbox DB away from 5432/5433.
+//   - requireFreshBackup (--apply only): samapay-backup.sh's encrypted dump,
+//     named samapay-<YYYY-MM-DDTHHMMSSZ>.dump.gpg in the backup dir, > 10 KiB,
+//     at most 120 min old, with a matching .sha256 sidecar.
+//   Exit codes (the gate's contract): 0 done / already done · 1 REFUSED · 3 FAILED.
 //
 // *** IT NEVER DELETES. *** The row stays: its derivation index stays taken
 // (UNIQUE(chain, derivation_index)), its deposits stay readable, its audit
@@ -15,54 +25,22 @@
 // (its original timestamp is kept). One address per run, matched EXACTLY
 // (case-sensitive: TRON base58 is case-significant; a BEP20 address must be
 // given as stored). A match on more than one chain is refused.
-//
-// BACKUP GATE (--apply only): --backup names an existing, non-empty,
-// absolute file whose mtime is within BACKUP_MAX_AGE_MS AND later than the
-// newest ops/CLI audit row (actor `ops:*` or `cli:*`) — a dump taken BEFORE
-// the previous hand-run write does not cover this one.
-import { statSync } from "node:fs";
-import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import type { PrismaClient } from "@prisma/client";
 
-export const BACKUP_MAX_AGE_MS = 6 * 60 * 60 * 1000;
-
-const Args = z.object({
+const Values = z.object({
   address: z.string().min(20).max(100).regex(/^[A-Za-z0-9]+$/, "an address is alphanumeric"),
-  apply: z.boolean(),
-  backup: z.string().optional(),
-  by: z.string().regex(/^[a-z][a-z0-9_-]{1,40}$/).optional(),
+  by: z.string().regex(/^[a-z][a-z0-9_-]{1,40}$/),
   reason: z.string().min(1).max(200).optional(),
-}).strict();
-export type DisableArgs = z.infer<typeof Args>;
+});
+export type DisableValues = z.infer<typeof Values>;
 
-export function parseArgs(argv: readonly string[]): DisableArgs {
-  const raw: Record<string, unknown> = { apply: false };
-  for (const a of argv) {
-    if (a === "--apply") { raw.apply = true; continue; }
-    const m = /^--(address|backup|by|reason)=(.*)$/.exec(a);
-    if (m) { raw[m[1] as string] = m[2]; continue; }
-    throw new Error(`unknown argument ${a} (use --address=… [--apply --backup=… --by=…] [--reason=…])`);
-  }
-  const parsed = Args.safeParse(raw);
+/** Validates the gate's parsed values (--address, --by, --reason). --by defaults to "ibrahim": this is a hand-run ops script. */
+export function disableValues(values: ReadonlyMap<string, string>): DisableValues {
+  const parsed = Values.safeParse({ address: values.get("--address"), by: values.get("--by") ?? "ibrahim", reason: values.get("--reason") });
   if (!parsed.success) throw new Error(parsed.error.issues.map((i) => `--${i.path.join(".")}: ${i.message}`).join("; "));
-  if (parsed.data.apply && !parsed.data.backup) throw new Error("--apply needs --backup=<absolute path of a fresh SamaPay dump>");
-  // Runbook §6 omits --by: this is a hand-run ops script, so the actor defaults to his name.
-  return { ...parsed.data, by: parsed.data.by ?? "ibrahim" };
-}
-
-/** Returns null when the backup gate passes, else the reason it does not. */
-export async function backupProblem(db: PrismaClient, path: string | undefined, now = Date.now()): Promise<string | null> {
-  if (!path) return "no --backup given";
-  if (!isAbsolute(path)) return `backup path ${path} is not absolute`;
-  let st;
-  try { st = statSync(path); } catch { return `backup ${path} does not exist`; }
-  if (!st.isFile() || st.size === 0) return `backup ${path} is not a non-empty file`;
-  if (now - st.mtimeMs > BACKUP_MAX_AGE_MS) return `backup ${path} is older than ${BACKUP_MAX_AGE_MS / 3_600_000} h`;
-  const last = await db.auditEvent.findFirst({ where: { OR: [{ actor: { startsWith: "ops:" } }, { actor: { startsWith: "cli:" } }] }, orderBy: { at: "desc" }, select: { at: true, action: true } });
-  if (last && st.mtimeMs <= last.at.getTime()) return `backup ${path} predates the last hand-run write (${last.action} at ${last.at.toISOString()})`;
-  return null;
+  return parsed.data;
 }
 
 export type DisableOutcome =
@@ -94,25 +72,29 @@ export async function disableAddress(db: PrismaClient, args: { address: string; 
   });
 }
 
-async function main() {
+async function main(): Promise<number> {
+  const { parseOpsArgs, openOpsRun, backupDirFor, requireFreshBackup, OpsRefused } = await import("@/chain/seed/ops-gate.js");
   const { logger } = await import("@/log.js");
-  let args: DisableArgs;
-  try { args = parseArgs(process.argv.slice(2)); }
-  catch (e) { console.error(`REFUSING: ${(e as Error).message}`); process.exit(2); }
   const { prisma } = await import("@/db/client.js");
-  const db = (await prisma.$queryRawUnsafe("select current_database() as db")) as Array<{ db: string }>;
-  console.log(`database: ${db[0]?.db}   mode: ${args.apply ? "APPLY" : "DRY RUN (nothing is written)"}`);
-  if (args.apply) {
-    const problem = await backupProblem(prisma, args.backup);
-    if (problem) { console.error(`REFUSING --apply: ${problem}`); await prisma.$disconnect(); process.exit(2); }
+  try {
+    const mode = parseOpsArgs(process.argv.slice(2), ["--address", "--by", "--reason"]);
+    let v: DisableValues;
+    try { v = disableValues(mode.values); } catch (e) { throw new OpsRefused((e as Error).message); }
+    await openOpsRun("disable-address", mode);
+    if (mode.apply) await requireFreshBackup(mode.values.get("--backup"), backupDirFor(mode));
+    const r = await disableAddress(prisma, { address: v.address, apply: mode.apply, by: v.by, reason: v.reason });
+    console.log(JSON.stringify(r, null, 2));
+    logger.info({ actor: `ops:${v.by}`, action: "address.watch_disable", address: v.address, apply: mode.apply, result: r.outcome }, "disable-address");
+    return r.outcome === "not_found" || r.outcome === "ambiguous" ? 1 : 0;
+  } catch (e) {
+    if (e instanceof OpsRefused) { console.error(`REFUSED: ${e.message}`); return 1; }
+    console.error(`FAILED: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`);
+    return 3;
+  } finally {
+    await prisma.$disconnect();
   }
-  const r = await disableAddress(prisma, args);
-  console.log(JSON.stringify(r, null, 2));
-  logger.info({ actor: `ops:${args.by ?? "dry-run"}`, action: "address.watch_disable", address: args.address, result: r.outcome }, "disable-address");
-  await prisma.$disconnect();
-  process.exit(r.outcome === "not_found" || r.outcome === "ambiguous" ? 1 : 0);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((e) => { console.error(e instanceof Error ? `${e.name}: ${e.message}` : e); process.exit(1); });
+  main().then((code) => process.exit(code), () => process.exit(3));
 }
