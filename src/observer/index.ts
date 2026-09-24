@@ -39,11 +39,13 @@ import { feeForConfirmation } from "@/allowance/fee.js";
 import { eventSink } from "@/intents/events-port.js";
 import { advanceIntentsForChain } from "@/intents/sweep.js";
 import type { ChainObserver, ObservedTransfer } from "@/chain/types.js";
+import { cursorLockKey } from "@/chain/cursor.js";
+import { getChainAdapter } from "@/chain/impl/index.js";
 
 export interface ObserveResult { seen: number; recorded: number; alreadyKnown: number; confirmed: number; unknownAddress: number; intentsAdvanced: number }
 
-/** The per-chain cursor lock. MUST equal the name src/chain/cursor.ts (G5) takes for rewind/enable. */
-export function cursorLockKey(chain: Chain): string { return `samapay_scan_cursor:${chain}`; }
+// The per-chain cursor lock is src/chain/cursor.ts's (G5): ONE definition for the tick and the handoff.
+export { cursorLockKey };
 /** A tick holds the lock across the scan (RPC); bounded so a hung RPC cannot hold it forever. */
 const TICK_TIMEOUT_MS = 10 * 60_000;
 const LOCK_WAIT_MS = 60_000;
@@ -66,7 +68,7 @@ export async function observeChain(chain: Chain, observer: ChainObserver, requir
     const cursor = await lockTx.scanCursor.findUnique({ where: { chain }, select: { legacyWatchEnabledAt: true } });
     const addresses = await lockTx.address.findMany({
       where: { chain, ...watchedAddressWhere(cursor?.legacyWatchEnabledAt != null) },
-      select: { id: true, address: true, keyId: true },
+      select: { id: true, address: true, keyId: true, key: { select: { clientId: true } } },
     });
     // ⚠️ CASE IS NOT A FREE NORMALISATION ACROSS CHAINS.
     // BEP20 addresses are hex and case-insensitive (the mixed case is only an
@@ -102,13 +104,13 @@ export function truncateAmount(amount: string): Prisma.Decimal {
   return d.toDecimalPlaces(6, Prisma.Decimal.ROUND_DOWN);
 }
 
-async function recordTransfer(chain: Chain, t: ObservedTransfer, target: { id: string; keyId: string } | undefined): Promise<"recorded" | "alreadyKnown" | "unknownAddress"> {
+async function recordTransfer(chain: Chain, t: ObservedTransfer, target: { id: string; keyId: string; key: { clientId: string } } | undefined): Promise<"recorded" | "alreadyKnown" | "unknownAddress"> {
   if (!target) return "unknownAddress";
   const amount = truncateAmount(t.amount);
   try {
     await prisma.$transaction(async (tx) => {
       const row = await tx.deposit.create({
-        data: { keyId: target.keyId, addressId: target.id, chain, txHash: t.txHash, amount, confirmations: t.confirmations, status: "detected", blockNumber: t.blockNumber },
+        data: { keyId: target.keyId, clientId: target.key.clientId, addressId: target.id, chain, txHash: t.txHash, amount, confirmations: t.confirmations, status: "detected", blockNumber: t.blockNumber },
         select: { id: true },
       });
       await appendAudit(tx, { keyId: target.keyId, actor: "observer", action: "deposit.detected", subjectId: row.id, params: { chain, txHash: t.txHash, amount: amount.toFixed(), observedAmount: t.amount, block: t.blockNumber.toString() } });
@@ -125,7 +127,11 @@ const DEPOSIT_SNAPSHOT_SELECT = {
   address: { select: { address: true, reference: true, intent: { select: { id: true, reference: true } } } },
 } as const satisfies Prisma.DepositSelect;
 
-/** The contract §4 Deposit as at event time. Public id `dep_<row id>` (the events objectId). */
+/**
+ * The contract §4 Deposit as at event time. Public id `dep_<row id>` (the events objectId).
+ * INTERIM: the lead ruled G1's src/render/deposit.ts renderDeposit the one renderer; when it
+ * lands, this function's body becomes that call — the only line to change.
+ */
 export function renderDepositSnapshot(d: Prisma.DepositGetPayload<{ select: typeof DEPOSIT_SNAPSHOT_SELECT }>): Record<string, unknown> {
   return {
     id: `dep_${d.id}`, object: "deposit", status: d.status, chain: d.chain, tx_hash: d.txHash, amount: d.amount.toFixed(),
@@ -162,15 +168,17 @@ async function promoteConfirmed(chain: Chain, observer: ChainObserver, requiredC
 const CHAINS: readonly Chain[] = ["TRC20", "BEP20"];
 
 /** legacy_watch: when SamaPay started watching each chain's legacy_import addresses, or null. */
-export async function legacyWatchStatus(): Promise<Record<Chain, string | null>> {
+export async function legacyWatchStatus(): Promise<Record<Chain, Date | null>> {
   const rows = await prisma.scanCursor.findMany({ select: { chain: true, legacyWatchEnabledAt: true } });
-  const out: Record<Chain, string | null> = { TRC20: null, BEP20: null };
-  for (const r of rows) out[r.chain] = r.legacyWatchEnabledAt?.toISOString() ?? null;
+  const out: Record<Chain, Date | null> = { TRC20: null, BEP20: null };
+  for (const r of rows) out[r.chain] = r.legacyWatchEnabledAt ?? null;
   return out;
 }
 
+const liveHead = (chain: Chain) => getChainAdapter(chain).getLatestBlock();
+
 /** observer_lag_blocks: chain head − last scanned block; null when there is no cursor yet or the head is unreadable. */
-export async function observerLagBlocks(head: (chain: Chain) => Promise<bigint>): Promise<Record<Chain, number | null>> {
+export async function observerLagBlocks(head: (chain: Chain) => Promise<bigint> = liveHead): Promise<Record<Chain, number | null>> {
   const rows = await prisma.scanCursor.findMany({ select: { chain: true, lastScannedBlock: true } });
   const out: Record<Chain, number | null> = { TRC20: null, BEP20: null };
   for (const chain of CHAINS) {

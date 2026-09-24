@@ -31,6 +31,11 @@ export class IntentInputInvalid extends Error {
   constructor(readonly fields: string[]) { super(`invalid payment intent input: ${fields.join(", ")}`); this.name = "IntentInputInvalid"; }
 }
 
+/** 409 reference_conflict — this client already has an intent with this reference (UNIQUE(client_id, reference), A7). The caller re-reads it. */
+export class ReferenceConflict extends Error {
+  constructor(readonly reference: string) { super(`an intent with reference ${reference} already exists for this client`); this.name = "ReferenceConflict"; }
+}
+
 /** The key is not an active key of the client. The HTTP layer never reaches this (auth resolved both); a caller bug otherwise. */
 export class IntentKeyMismatch extends Error {
   constructor() { super("key is not an active key of this client"); this.name = "IntentKeyMismatch"; }

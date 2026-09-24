@@ -33,6 +33,8 @@ import type { ObservedTransfer } from "@/chain/types.js";
 import { observeChain } from "@/observer/index.js";
 import { expireIntentsOnce } from "@/worker/intents-expire.js";
 import { advanceIntent, createIntent, setEventSink, type EnqueueEventInput, type IntentStatus } from "@/intents/index.js";
+import { enqueueEvent } from "@/events/index.js";
+import { legacyWatchStatus, observerLagBlocks } from "@/observer/index.js";
 import { check, checkOver, summary, thrown } from "./lib/check.js";
 
 const RUN = Date.now().toString(36);
@@ -71,18 +73,12 @@ function pay(to: string, amount: string, confirmations = 20): string {
   return txHash;
 }
 
-// Fake G3: idempotent on (object_id, type) by the events table's unique, and
-// every CALL recorded — so a second emission shows even when the row cannot.
+// G3's REAL enqueueEvent (merged from origin/p0/g3), wrapped so every CALL is
+// recorded — a second emission shows even when the unique index hides the row.
 const calls: EnqueueEventInput[] = [];
 async function fakeEnqueue(tx: Prisma.TransactionClient, e: EnqueueEventInput) {
   calls.push(e);
-  if (e.snapshot.id !== e.objectId || e.snapshot.object !== e.objectKind) throw new Error(`G3 contract: snapshot.id/object must equal objectId/objectKind (${String(e.snapshot.id)})`);
-  const owner = e.objectKind === "payment_intent"
-    ? await tx.paymentIntent.findUniqueOrThrow({ where: { id: e.objectId }, select: { clientId: true, keyId: true } })
-    : await tx.deposit.findUniqueOrThrow({ where: { id: e.objectId.replace(/^dep_/, "") }, select: { keyId: true, key: { select: { clientId: true } } } }).then((d) => ({ keyId: d.keyId, clientId: d.key.clientId }));
-  await tx.$executeRaw`INSERT INTO events (id, client_id, key_id, type, object_kind, object_id, snapshot)
-    VALUES (${`evt_${RUN}_${calls.length}`}, ${owner.clientId}, ${owner.keyId}, ${e.type}, ${e.objectKind}::"EventObjectKind", ${e.objectId}, ${JSON.stringify(e.snapshot)}::jsonb)
-    ON CONFLICT (object_id, type) DO NOTHING`;
+  return enqueueEvent(tx, e);
 }
 const callsFor = (id: string, type?: string) => calls.filter((c) => c.objectId === id && (!type || c.type === type));
 const rowsFor = (id: string) => prisma.event.findMany({ where: { objectId: id }, select: { type: true, snapshot: true } });
@@ -142,6 +138,9 @@ async function main() {
   const par = await Promise.all([mk("2"), mk("2"), mk("2")]);
   const parIdx = await prisma.address.findMany({ where: { address: { in: par.map((p) => p.address.address) } }, select: { derivationIndex: true } });
   check(new Set(parIdx.map((x) => x.derivationIndex)).size === 3 && parIdx.every((x) => x.derivationIndex > FLOOR), "A12. 3 concurrent createIntent → 3 distinct indices, all above the floor (a lost index race re-derives)", parIdx.map((x) => x.derivationIndex).join(","));
+  const dupRef = `dup_${RUN}`; await mk("2", { reference: dupRef });
+  before = await counts(); r = await thrown(() => mk("3", { reference: dupRef })); after = await counts();
+  check(r.name === "ReferenceConflict" && after.a === before.a && after.i === before.i, "A14. same (client, reference) again → ReferenceConflict, no index burned, nothing created (A7)", r.name);
   const other = await prisma.client.create({ data: { name: `verify-intents-other-${RUN}`, kind: "merchant" }, select: { id: true } });
   r = await thrown(() => createIntent(other.id, key.id, { amount: "5", chain: CHAIN, reference: `x_${RUN}` }));
   check(r.name === "IntentKeyMismatch", "A13. a key used with ANOTHER client's id → IntentKeyMismatch", r.name);
@@ -259,8 +258,9 @@ async function main() {
   const intentDeps = await prisma.deposit.findMany({ where: { address: { intent: { isNot: null } }, keyId: key.id, status: "confirmed" }, select: { id: true, address: { select: { intent: { select: { id: true } } } } } });
   const everyOne = intentDeps.every((d) => { const c = calls.filter((x) => x.objectId === `dep_${d.id}` && x.type === "deposit.confirmed"); return c.length === 1 && c[0]?.snapshot.payment_intent_id === d.address.intent?.id; });
   checkOver(intentDeps.length, everyOne, "D3. (A1) EVERY confirmed deposit at an intent address has exactly ONE deposit.confirmed carrying its payment_intent_id");
-  const oldPath = await prisma.webhookDelivery.count({ where: { eventType: "deposit.confirmed" } });
-  check(oldPath === 0, "D3b. nothing went through the legacy enqueue() path (global prisma, outside the confirm transaction)", `${oldPath} rows`);
+  const depHooks = await prisma.webhookDelivery.findMany({ where: { eventType: "deposit.confirmed" }, select: { eventId: true } });
+  const evIds = new Set((await prisma.event.findMany({ where: { type: "deposit.confirmed" }, select: { id: true } })).map((e) => e.id));
+  checkOver(depHooks.length, depHooks.every((h) => evIds.has(h.eventId)), "D3b. every deposit.confirmed delivery belongs to an events row (the enqueueEvent path; never the legacy enqueue())");
 
   // ── M. truncation and zero deposits ─────────────────────────────────────
   console.log("\nM. 6-dp truncation, zero deposits");
@@ -323,6 +323,16 @@ async function main() {
   await observeChain(LCH, cursorObserver, REQ);
   const legDep = await prisma.deposit.count({ where: { chain: LCH, txHash: `0xlegtx${RUN}` } });
   check(legDep === 1, "L2. the rewound range (120, 200] IS scanned for the now-enabled legacy address — its block-150 deposit is recorded, not skipped", `${legDep} row(s)`);
+
+  // ── client_id written by the new code (A12) and the /v1/health readers (A9) ──
+  const myDeps = await prisma.deposit.findMany({ where: { keyId: key.id }, select: { clientId: true } });
+  checkOver(myDeps.length, myDeps.every((d) => d.clientId === client.id), "M4. every deposit the observer wrote carries client_id (A12)");
+  const myAddrs = await prisma.address.findMany({ where: { keyId: key.id, intent: { isNot: null } }, select: { clientId: true } });
+  checkOver(myAddrs.length, myAddrs.every((a) => a.clientId === client.id), "M5. every intent address createIntent wrote carries client_id (A12)");
+  const lw = await legacyWatchStatus();
+  check(lw.TRC20 instanceof Date && lw.BEP20 instanceof Date, "H1. legacyWatchStatus() → a Date per chain once enabled", JSON.stringify(lw));
+  const lag = await observerLagBlocks(async (c) => (c === "BEP20" ? 250n : 0n));
+  check(lag.BEP20 === 40, "H2. observerLagBlocks(head) = head − cursor (BEP20 250 − 210 = 40)", JSON.stringify(lag));
 
   // ── the floor across everything this run created ───────────────────────
   const intentAddrs = await prisma.address.findMany({ where: { keyId: key.id, intent: { isNot: null } }, select: { derivationIndex: true } });

@@ -28,6 +28,8 @@ import { observeChain } from "@/observer/index.js";
 import type { Chain } from "@prisma/client";
 import { reconcileOnce } from "./reconciler.js";
 import { expireIntentsOnce } from "./intents-expire.js";
+import { setEventSink } from "@/intents/index.js";
+import { enqueueEvent } from "@/events/index.js";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info", name: "samapay-worker" });
 export const GRACE_MS = 5_000;                 // a route's own submit gets this long first
@@ -137,11 +139,9 @@ async function loop(): Promise<never> {
 if (process.argv[1]?.endsWith("worker/index.ts") || process.argv[1]?.endsWith("worker/index.js")) {
   // Swap the four refusing stubs for the real adapters BEFORE the loop starts.
   installLiveChainAdapters();
-  // ⚠️ THE EVENT SINK MUST BE WIRED HERE ONCE src/events (G3) LANDS:
-  //   setEventSink(enqueueEvent)   // import { setEventSink } from "@/intents/index.js"
-  // Until then src/intents/events-port.ts REFUSES, so every deposit
-  // confirmation and intent transition rolls back and is retried next tick —
-  // nothing is confirmed without its event, nothing is lost.
+  // The intents engine and the observer emit events ONLY through this sink;
+  // unwired, src/intents/events-port.ts REFUSES (every confirmation rolls back).
+  setEventSink(enqueueEvent);
   log.info({ chains: OBSERVED_CHAINS, everyMs: OBSERVE_EVERY_MS }, "observer armed");
   void loop();
 }
