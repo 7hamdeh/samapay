@@ -31,3 +31,5 @@ let sink: EnqueueEvent = refusing;
 
 export function setEventSink(fn: EnqueueEvent): void { sink = fn; }
 export function eventSink(): EnqueueEvent { return sink; }
+/** True once a real sink replaced the refusing default. The worker's boot assertion reads this. */
+export function isEventSinkWired(): boolean { return sink !== refusing; }

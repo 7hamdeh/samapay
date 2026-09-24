@@ -22,13 +22,13 @@ import { expire } from "@/allowance/index.js";
 import { submitForSending } from "@/sender/index.js";
 import { attemptDelivery, enqueue } from "@/webhooks/dispatch.js";
 import { chainAdapters } from "@/chain/registry.js";
-import { installLiveChainAdapters } from "@/chain/live.js";
+import { installLiveChainAdapters, liveObserver } from "@/chain/live.js";
 import { getChainConfig } from "@/chain/impl/config.js";
 import { observeChain } from "@/observer/index.js";
 import type { Chain } from "@prisma/client";
 import { reconcileOnce } from "./reconciler.js";
 import { expireIntentsOnce } from "./intents-expire.js";
-import { setEventSink } from "@/intents/index.js";
+import { isEventSinkWired, setEventSink } from "@/intents/index.js";
 import { enqueueEvent } from "@/events/index.js";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info", name: "samapay-worker" });
@@ -136,12 +136,34 @@ async function loop(): Promise<never> {
     await new Promise((r) => setTimeout(r, TICK_MS));
   }
 }
-if (process.argv[1]?.endsWith("worker/index.ts") || process.argv[1]?.endsWith("worker/index.js")) {
-  // Swap the four refusing stubs for the real adapters BEFORE the loop starts.
+export class WorkerNotComposed extends Error {
+  constructor(missing: string[]) { super(`worker refuses to start — unwired: ${missing.join(", ")}`); this.name = "WorkerNotComposed"; }
+}
+
+/**
+ * THE COMPOSITION ROOT. Installs every port and then ASSERTS it, so a worker
+ * with a refusing stub left in place stops at boot instead of running "online,
+ * 0 restarts" while confirming nothing (Q's review H2). Exported so a verify
+ * script can prove the assertion without starting the loop.
+ */
+export function composeWorker(): void {
+  // Swap the refusing stubs for the real adapters BEFORE the loop starts.
   installLiveChainAdapters();
   // The intents engine and the observer emit events ONLY through this sink;
   // unwired, src/intents/events-port.ts REFUSES (every confirmation rolls back).
   setEventSink(enqueueEvent);
+  assertWorkerComposed();
+}
+
+export function assertWorkerComposed(): void {
+  const missing: string[] = [];
+  if (!isEventSinkWired()) missing.push("event sink (setEventSink)");
+  if (chainAdapters().observer !== liveObserver) missing.push("chain observer (installLiveChainAdapters)");
+  if (missing.length) throw new WorkerNotComposed(missing);
+}
+
+if (process.argv[1]?.endsWith("worker/index.ts") || process.argv[1]?.endsWith("worker/index.js")) {
+  composeWorker();
   log.info({ chains: OBSERVED_CHAINS, everyMs: OBSERVE_EVERY_MS }, "observer armed");
   void loop();
 }

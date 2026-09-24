@@ -11,7 +11,7 @@
 import { Prisma, type Chain } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import logger from "@/log.js";
-import type { AddressDeriver, ChainObserver, DerivedAddress, ObservedTransfer, TxExistenceProver } from "@/chain/types.js";
+import type { AddressDeriver, ChainObserver, DerivedAddress, ScanBatch, TxExistenceProver } from "@/chain/types.js";
 import { getChainAdapter } from "@/chain/impl/index.js";
 import { getChainConfig } from "@/chain/impl/config.js";
 import { deriveAddress } from "@/chain/hd/derive.js";
@@ -72,16 +72,14 @@ async function readCursor(chain: Chain): Promise<bigint | null> {
   return row ? row.lastScannedBlock : null;
 }
 
-/** Monotonic: a late tick can never move the cursor backwards. */
-async function advanceCursor(chain: Chain, to: bigint): Promise<void> {
-  const updated = await prisma.scanCursor.updateMany({ where: { chain, lastScannedBlock: { lt: to } }, data: { lastScannedBlock: to } });
-  if (updated.count === 0) {
-    await prisma.scanCursor.upsert({ where: { chain }, create: { chain, lastScannedBlock: to }, update: {} });
-  }
-}
-
 export const liveObserver: ChainObserver = {
-  async scan(chain: Chain, addresses: ReadonlySet<string>): Promise<ObservedTransfer[]> {
+  // ⚠️ READS THE CURSOR, NEVER WRITES IT. This used to advance the cursor here,
+  // BEFORE the observer recorded the transfers it returned: one failed insert
+  // (a DB blip, a constraint, a bad amount) and that deposit — and the rest of
+  // the batch — was behind the cursor forever (Q's probe: 5 USDT at block 150,
+  // cursor already 982, nothing ever recorded). The observer now advances to
+  // `scannedThrough`, under the cursor lock, after every record succeeded.
+  async scan(chain: Chain, addresses: ReadonlySet<string>): Promise<ScanBatch> {
     const adapter = getChainAdapter(chain);
     const head = await adapter.getLatestBlock();
     const cursor = await readCursor(chain);
@@ -107,19 +105,18 @@ export const liveObserver: ChainObserver = {
     // docs/confirmation-depth-divergence-2026-09-07.md, closed by this change.
     const safeHead = head - BigInt(getChainConfig(chain).confirmationsRequired) + 1n;
     const from = cursor === null ? (head > FIRST_RUN_LOOKBACK ? head - FIRST_RUN_LOOKBACK : 0n) : cursor + 1n;
-    if (from > safeHead) return [];
+    if (from > safeHead) return { transfers: [], scannedThrough: null };
     const to = from + MAX_BLOCKS_PER_TICK - 1n > safeHead ? safeHead : from + MAX_BLOCKS_PER_TICK - 1n;
 
     const scan = await adapter.getIncomingTransfers(from, to, new Set(addresses));
-    // Advance to what was ACTUALLY scanned, never to `to` — the adapter may
+    // Report what was ACTUALLY scanned, never `to` — the adapter may
     // legitimately stop early, and reporting a block as scanned when it was not
     // is how a deposit is skipped forever.
-    if (scan.scannedThrough >= from) await advanceCursor(chain, scan.scannedThrough);
     if (scan.stoppedEarly) {
-      log.warn({ chain, ...scan.stoppedEarly }, "scan stopped early; cursor advanced only to scannedThrough");
+      log.warn({ chain, ...scan.stoppedEarly }, "scan stopped early; cursor will advance only to scannedThrough");
     }
 
-    return scan.transfers.map((t) => ({
+    const transfers = scan.transfers.map((t) => ({
       chain,
       txHash: t.txHash,
       toAddress: t.toAddress,
@@ -127,6 +124,7 @@ export const liveObserver: ChainObserver = {
       blockNumber: t.blockNumber,
       confirmations: Number(head - t.blockNumber + 1n),
     }));
+    return { transfers, scannedThrough: scan.scannedThrough >= from ? scan.scannedThrough : null };
   },
 
   async confirmationsFor(chain: Chain, txHash: string): Promise<number> {

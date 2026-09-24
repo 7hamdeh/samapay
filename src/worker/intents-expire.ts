@@ -16,13 +16,19 @@ import { advanceIntent } from "@/intents/advance.js";
 
 const log = logger.child({ mod: "worker/intents-expire" });
 const BATCH = 200;
+// ROUND-ROBIN by id, like src/intents/sweep.ts: a `processing` intent past
+// expiry whose in-time deposit never confirms stays due for ever, and "the
+// oldest 200" would let such intents starve every newer one (Q's review M1).
+let pageAfter: string | null = null;
 
 export async function expireIntentsOnce(opts: { now?: Date; confirmationsRequired: (chain: Chain) => number }): Promise<{ checked: number; expired: number }> {
   const now = opts.now ?? new Date();
   const due = await prisma.paymentIntent.findMany({
-    where: { status: { in: ["requires_payment", "processing"] }, expiresAt: { lt: now } },
-    orderBy: { expiresAt: "asc" }, take: BATCH, select: { id: true, chain: true },
+    where: { status: { in: ["requires_payment", "processing"] }, expiresAt: { lt: now }, ...(pageAfter ? { id: { gt: pageAfter } } : {}) },
+    orderBy: { id: "asc" }, take: BATCH, select: { id: true, chain: true },
   });
+  const last = due[due.length - 1];
+  pageAfter = due.length === BATCH && last ? last.id : null;
   let expired = 0;
   for (const d of due) {
     try {

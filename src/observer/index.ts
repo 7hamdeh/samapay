@@ -38,7 +38,8 @@ import { appendAudit } from "@/audit/append.js";
 import { feeForConfirmation } from "@/allowance/fee.js";
 import { eventSink } from "@/intents/events-port.js";
 import { advanceIntentsForChain } from "@/intents/sweep.js";
-import type { ChainObserver, ObservedTransfer } from "@/chain/types.js";
+import type { ChainObserver, ObservedTransfer, ScanBatch } from "@/chain/types.js";
+import { DEPOSIT_RENDER_SELECT, publicDepositId, renderDeposit } from "@/render/deposit.js";
 import { cursorLockKey } from "@/chain/cursor.js";
 import { getChainAdapter } from "@/chain/impl/index.js";
 
@@ -49,6 +50,12 @@ export { cursorLockKey };
 /** A tick holds the lock across the scan (RPC); bounded so a hung RPC cannot hold it forever. */
 const TICK_TIMEOUT_MS = 10 * 60_000;
 const LOCK_WAIT_MS = 60_000;
+/** The JS work stops this long before Prisma would time the lock transaction out. */
+const DEADLINE_MARGIN_MS = 60_000;
+
+export class TickDeadlineExceeded extends Error {
+  constructor(chain: Chain) { super(`observer tick for ${chain} ran past its deadline; stopped before the lock could lapse`); this.name = "TickDeadlineExceeded"; }
+}
 
 /**
  * One tick for one chain. Safe to call again with the same transfers:
@@ -64,6 +71,12 @@ const LOCK_WAIT_MS = 60_000;
 export async function observeChain(chain: Chain, observer: ChainObserver, requiredConfirmations: number): Promise<ObserveResult> {
   return prisma.$transaction(async (lockTx) => {
     await lockTx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${cursorLockKey(chain)}))`;
+    // The work and the lock END TOGETHER: every step checks the deadline, so the
+    // tick throws before Prisma times the transaction out and releases the lock
+    // under a still-running tick (Q M2). The cursor advance itself runs ON
+    // lockTx, so it cannot happen at all once that transaction is gone.
+    const deadline = Date.now() + TICK_TIMEOUT_MS - DEADLINE_MARGIN_MS;
+    const inTime = () => { if (Date.now() > deadline) throw new TickDeadlineExceeded(chain); };
     // Re-read INSIDE the lock: what a rewind/enable just committed is what this tick sees.
     const cursor = await lockTx.scanCursor.findUnique({ where: { chain }, select: { legacyWatchEnabledAt: true } });
     const addresses = await lockTx.address.findMany({
@@ -80,16 +93,31 @@ export async function observeChain(chain: Chain, observer: ChainObserver, requir
     const key = (a: string) => (chain === "BEP20" ? a.toLowerCase() : a);
     const byAddress = new Map(addresses.map((a) => [key(a.address), a]));
     // The adapter receives addresses EXACTLY as stored, never a normalised form.
-    const transfers = await observer.scan(chain, new Set(addresses.map((a) => a.address)));
-    const result: ObserveResult = { seen: transfers.length, recorded: 0, alreadyKnown: 0, confirmed: 0, unknownAddress: 0, intentsAdvanced: 0 };
-    for (const t of transfers) {
+    const scanned = await observer.scan(chain, new Set(addresses.map((a) => a.address)));
+    const batch: ScanBatch = Array.isArray(scanned) ? { transfers: scanned, scannedThrough: null } : scanned;
+    const result: ObserveResult = { seen: batch.transfers.length, recorded: 0, alreadyKnown: 0, confirmed: 0, unknownAddress: 0, intentsAdvanced: 0 };
+    // RECORD FIRST. Any failure throws out of the tick with the cursor where it
+    // was, and the next tick scans the same range again — UNIQUE(chain, tx_hash)
+    // makes the re-scan safe (Q's review B1).
+    for (const t of batch.transfers) {
+      inTime();
       const outcome = await recordTransfer(chain, t, byAddress.get(key(t.toAddress)));
       result[outcome]++;
     }
-    result.confirmed += await promoteConfirmed(chain, observer, requiredConfirmations);
+    // THEN the cursor — only now that every transfer in the range is recorded or already known.
+    inTime();
+    if (batch.scannedThrough !== null) await advanceCursor(lockTx, chain, batch.scannedThrough);
+    result.confirmed += await promoteConfirmed(chain, observer, requiredConfirmations, inTime);
+    inTime();
     result.intentsAdvanced = (await advanceIntentsForChain(chain, { now: new Date(), confirmationsRequired: requiredConfirmations })).advanced;
     return result;
   }, { timeout: TICK_TIMEOUT_MS, maxWait: LOCK_WAIT_MS });
+}
+
+/** Monotonic: a late tick can never move the cursor backwards. On the LOCK transaction. */
+async function advanceCursor(lockTx: Prisma.TransactionClient, chain: Chain, to: bigint): Promise<void> {
+  const updated = await lockTx.scanCursor.updateMany({ where: { chain, lastScannedBlock: { lt: to } }, data: { lastScannedBlock: to } });
+  if (updated.count === 0) await lockTx.scanCursor.upsert({ where: { chain }, create: { chain, lastScannedBlock: to }, update: {} });
 }
 
 /** The addresses this observer watches: never a disabled one; legacy imports only once their watch is enabled. */
@@ -122,32 +150,12 @@ async function recordTransfer(chain: Chain, t: ObservedTransfer, target: { id: s
   }
 }
 
-const DEPOSIT_SNAPSHOT_SELECT = {
-  id: true, chain: true, txHash: true, amount: true, confirmations: true, status: true, detectedAt: true, creditedAt: true,
-  address: { select: { address: true, reference: true, intent: { select: { id: true, reference: true } } } },
-} as const satisfies Prisma.DepositSelect;
-
-/**
- * The contract §4 Deposit as at event time. Public id `dep_<row id>` (the events objectId).
- * INTERIM: the lead ruled G1's src/render/deposit.ts renderDeposit the one renderer; when it
- * lands, this function's body becomes that call — the only line to change.
- */
-export function renderDepositSnapshot(d: Prisma.DepositGetPayload<{ select: typeof DEPOSIT_SNAPSHOT_SELECT }>): Record<string, unknown> {
-  return {
-    id: `dep_${d.id}`, object: "deposit", status: d.status, chain: d.chain, tx_hash: d.txHash, amount: d.amount.toFixed(),
-    confirmations: d.confirmations, address: d.address.address,
-    // An intent's address carries payment_intent:<id> internally; the store's reference is the intent's.
-    reference: d.address.intent?.reference ?? d.address.reference,
-    payment_intent_id: d.address.intent?.id ?? null,
-    detected_at: d.detectedAt.toISOString(), confirmed_at: d.creditedAt?.toISOString() ?? null,
-  };
-}
-
 /** detected → confirmed, once. The status guard in the WHERE is what makes "once" true under concurrency. */
-async function promoteConfirmed(chain: Chain, observer: ChainObserver, requiredConfirmations: number): Promise<number> {
+async function promoteConfirmed(chain: Chain, observer: ChainObserver, requiredConfirmations: number, inTime: () => void): Promise<number> {
   const pending = await prisma.deposit.findMany({ where: { chain, status: "detected", address: { watchDisabledAt: null } }, select: { id: true, keyId: true, txHash: true, amount: true } });
   let promoted = 0;
   for (const d of pending) {
+    inTime();
     const confirmations = await observer.confirmationsFor(chain, d.txHash);
     if (confirmations < requiredConfirmations) { await prisma.deposit.update({ where: { id: d.id }, data: { confirmations } }); continue; }
     await prisma.$transaction(async (tx) => {
@@ -156,9 +164,10 @@ async function promoteConfirmed(chain: Chain, observer: ChainObserver, requiredC
       if (flipped.count !== 1) return; // someone else confirmed it first; nothing to do, nothing to audit twice
       promoted++;
       await appendAudit(tx, { keyId: d.keyId, actor: "observer", action: "deposit.confirmed", subjectId: d.id, params: { chain, txHash: d.txHash, amount: d.amount.toString(), feeAmount: feeAmount.toFixed(), confirmations } });
-      const row = await tx.deposit.findUniqueOrThrow({ where: { id: d.id }, select: DEPOSIT_SNAPSHOT_SELECT });
+      const row = await tx.deposit.findUniqueOrThrow({ where: { id: d.id }, select: DEPOSIT_RENDER_SELECT });
       // A1: every confirmed deposit, intent addresses included — the store credits per deposit.
-      await eventSink()(tx, { type: "deposit.confirmed", objectKind: "deposit", objectId: `dep_${d.id}`, snapshot: renderDepositSnapshot(row) });
+      // The snapshot is G1's renderDeposit, the SAME function GET /v1/deposits/:id renders with (A13).
+      await eventSink()(tx, { type: "deposit.confirmed", objectKind: "deposit", objectId: publicDepositId(d.id), snapshot: { ...renderDeposit(row) } });
     });
   }
   return promoted;
@@ -168,10 +177,10 @@ async function promoteConfirmed(chain: Chain, observer: ChainObserver, requiredC
 const CHAINS: readonly Chain[] = ["TRC20", "BEP20"];
 
 /** legacy_watch: when SamaPay started watching each chain's legacy_import addresses, or null. */
-export async function legacyWatchStatus(): Promise<Record<Chain, Date | null>> {
+export async function legacyWatchStatus(): Promise<Record<Chain, string | null>> {
   const rows = await prisma.scanCursor.findMany({ select: { chain: true, legacyWatchEnabledAt: true } });
-  const out: Record<Chain, Date | null> = { TRC20: null, BEP20: null };
-  for (const r of rows) out[r.chain] = r.legacyWatchEnabledAt ?? null;
+  const out: Record<Chain, string | null> = { TRC20: null, BEP20: null };
+  for (const r of rows) out[r.chain] = r.legacyWatchEnabledAt?.toISOString() ?? null;
   return out;
 }
 
