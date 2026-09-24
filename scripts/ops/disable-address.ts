@@ -4,7 +4,7 @@
 //   DRY RUN (default, writes nothing):
 //     pnpm exec tsx --env-file=.env scripts/ops/disable-address.ts --address=TNX7jtfaGHGjdSHzxHt9FhnFVmHvkQ2b9k
 //   APPLY (Ibrahim's keystroke, after a fresh SamaPay backup):
-//     … --address=<addr> --apply --backup=/absolute/path/to/samapay-dump --by=ibrahim [--reason="old seed 02e0fb61"]
+//     … --address=<addr> --apply --backup=/absolute/path/to/samapay-dump [--by=ibrahim] [--reason="old seed 02e0fb61"]
 //
 // *** IT NEVER DELETES. *** The row stays: its derivation index stays taken
 // (UNIQUE(chain, derivation_index)), its deposits stay readable, its audit
@@ -47,8 +47,9 @@ export function parseArgs(argv: readonly string[]): DisableArgs {
   }
   const parsed = Args.safeParse(raw);
   if (!parsed.success) throw new Error(parsed.error.issues.map((i) => `--${i.path.join(".")}: ${i.message}`).join("; "));
-  if (parsed.data.apply && (!parsed.data.backup || !parsed.data.by)) throw new Error("--apply needs --backup=<absolute path> and --by=<who>");
-  return parsed.data;
+  if (parsed.data.apply && !parsed.data.backup) throw new Error("--apply needs --backup=<absolute path of a fresh SamaPay dump>");
+  // Runbook §6 omits --by: this is a hand-run ops script, so the actor defaults to his name.
+  return { ...parsed.data, by: parsed.data.by ?? "ibrahim" };
 }
 
 /** Returns null when the backup gate passes, else the reason it does not. */
