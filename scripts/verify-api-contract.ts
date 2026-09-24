@@ -415,15 +415,30 @@ async function main() {
     const BR = await iss(cA.id, "brake", ALL);
     await prisma.clientKey.update({ where: { id: BR.id }, data: { rpsLimit: 100_000 } });
     const brWrong = BR.plaintext.slice(0, 12) + "z".repeat(BR.plaintext.length - 12);
-    // Timing-honest: each failed verify costs one argon2 (~0.1 s) and the bucket refills 1/s, so
-    // the 11th or 12th wrong secret may still reach argon2. The claim is: at least the first 10
-    // are verified, the brake engages within a few more, and from then on it answers 429.
+    // The claim is "no argon2 once engaged" — proven by COUNTING verifies through
+    // auth.ts's read-only seam, not by the answer code (Q delta, 6ab225b: a brake
+    // moved after verifyKey still answered 429 and passed). The tolerance is
+    // DERIVED from the imported constants and the measured time, never copied:
+    // the bucket refills FAILED_VERIFY_PER_SEC while argon2 runs.
+    const auth = (await loadWiring("@/http/auth.js")) as { argon2VerifyCount?: () => number; FAILED_VERIFY_BURST?: number; FAILED_VERIFY_PER_SEC?: number };
+    const BURST = auth.FAILED_VERIFY_BURST ?? NaN, PER_SEC = auth.FAILED_VERIFY_PER_SEC ?? NaN;
+    const verifies = () => (auth.argon2VerifyCount ? auth.argon2VerifyCount() : NaN);
     const brakeCodes: string[] = [];
-    for (let i = 0; i < 20 && !brakeCodes.includes("rate_limited"); i++) brakeCodes.push(String((await call("GET", "/v1/payment-intents", brWrong)).code));
+    const t0 = Date.now();
+    for (let i = 0; i < 40 && !brakeCodes.includes("rate_limited"); i++) brakeCodes.push(String((await call("GET", "/v1/payment-intents", brWrong)).code));
+    const elapsedSec = (Date.now() - t0) / 1000;
     const firstLimited = brakeCodes.indexOf("rate_limited");
+    const maxBeforeBrake = BURST + Math.floor(elapsedSec * PER_SEC) + 1;
+    const K = 8;
+    const before = verifies();
+    const afterCodes: string[] = [];
+    for (let i = 0; i < K; i++) afterCodes.push(String((await call("GET", "/v1/payment-intents", brWrong)).code));
     const brRight = await call("GET", "/v1/payment-intents", BR.plaintext);
-    check(firstLimited >= 10 && firstLimited <= 13 && brakeCodes.slice(0, firstLimited).every((x) => x === "invalid_key") && brRight.status === 429 && Number(brRight.res.headers.get("retry-after")) >= 1,
-      "Q-M1 after 10 failed verifies on one prefix the prefix is 429 BEFORE argon2 (the real holder too, while it lasts — the stated trade-off)", brakeCodes.join(","));
+    const extraVerifies = verifies() - before;
+    check(firstLimited >= BURST && firstLimited <= maxBeforeBrake && brakeCodes.slice(0, firstLimited).every((x) => x === "invalid_key"),
+      `Q-M1 the brake engages after the burst: first 429 at attempt ${firstLimited + 1}, allowed ${BURST + 1}..${maxBeforeBrake + 1} (BURST ${BURST} + floor(${elapsedSec.toFixed(2)} s × ${PER_SEC}/s) + 1)`, brakeCodes.join(","));
+    check(extraVerifies === 0 && afterCodes.every((x) => x === "rate_limited") && brRight.status === 429 && Number(brRight.res.headers.get("retry-after")) >= 1,
+      `Q-M1 once engaged the brake is BEFORE argon2: ${K} more wrong secrets + the right key ran ${extraVerifies} argon2 verifies (must be 0), all 429 with Retry-After (the real holder too — the stated trade-off)`, `verifies +${extraVerifies} · ${afterCodes.join(",")} · right=${brRight.status}`);
     const brOther = await call("GET", "/v1/payment-intents", A.plaintext);
     check(brOther.status === 200, "Q-M1 the brake is per prefix: other keys are unaffected", `${brOther.status}`);
 

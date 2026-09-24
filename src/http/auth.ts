@@ -49,6 +49,7 @@ export async function authenticate(authorization: string | undefined): Promise<A
   });
   // Same error for unknown prefix and wrong secret: a caller must not learn which.
   if (!row) throw new ApiError("invalid_key", "Invalid API key.");
+  argon2Verifies++;
   if (!(await verifyKey(row.keyHash, plaintext))) { recordFailedVerify(prefix); throw new ApiError("invalid_key", "Invalid API key."); }
   if (row.environment === "test" && !testKeysAllowed()) throw new ApiError("invalid_key", "Test keys are not accepted in production.");
   if (!row.active || row.revokedAt) {
@@ -73,6 +74,12 @@ export async function authenticate(authorization: string | undefined): Promise<A
 // service, never access. In-process, like the per-key limiter below. A
 // per-IP brake needs a trusted client IP (nginx X-Real-IP), which Phase 0
 // (loopback only) does not have: that is a pre-public-exposure item.
+// TEST SEAM (read-only): how many argon2 verifies this process has run. The
+// brake's whole claim is "no argon2 once engaged", and a count is the only
+// thing that can tell a pre-argon2 brake from one placed after the verify.
+let argon2Verifies = 0;
+export function argon2VerifyCount(): number { return argon2Verifies; }
+
 export const FAILED_VERIFY_BURST = 10;
 export const FAILED_VERIFY_PER_SEC = 1;
 const failed = new Map<string, Bucket>();
