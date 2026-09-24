@@ -23,7 +23,7 @@ import logger from "@/log.js";
 import { chainAdapters, ChainUnavailable } from "@/chain/registry.js";
 import { CryptoError, ChainRpcError } from "@/chain/impl/errors.js";
 import { derivationFloor, DerivationFloorError } from "@/chain/derivation-floor.js";
-import { AmountOutOfRange, DerivationUnavailable, IntentInputInvalid, IntentKeyMismatch, ReferenceInvalid, UnsupportedChain } from "./errors.js";
+import { AmountOutOfRange, DerivationUnavailable, IntentInputInvalid, IntentKeyMismatch, ReferenceConflict, ReferenceInvalid, UnsupportedChain } from "./errors.js";
 import { INTENT_SELECT, type IntentRow } from "./render.js";
 
 const log = logger.child({ mod: "intents/create" });
@@ -48,6 +48,18 @@ export type CreateIntentInput = { amount: string; chain: Chain; reference: strin
 
 export function newIntentId(): string { return `pi_${randomBytes(12).toString("hex")}`; }
 
+/** Which unique a P2002 hit: the intent's (client, reference), or the address's index/address (a derivation race). */
+function uniqueHit(e: Prisma.PrismaClientKnownRequestError): "reference" | "derivation" | "other" {
+  const target = e.meta?.target;
+  const fields = Array.isArray(target) ? target.map(String) : [String(target ?? "")];
+  // target is field/column names or a constraint name, depending on the engine path — match both shapes.
+  const joined = fields.join(",");
+  const onAddress = e.meta?.modelName === "Address" || /^addresses_/.test(joined);
+  if (/reference/i.test(joined)) return onAddress ? "other" : "reference";
+  if (onAddress || /derivation_?index|derivationIndex|address/i.test(joined)) return "derivation";
+  return "other";
+}
+
 function isDerivationRefusal(e: unknown): boolean {
   return e instanceof DerivationFloorError || e instanceof ChainUnavailable || (e instanceof CryptoError && !(e instanceof ChainRpcError));
 }
@@ -71,6 +83,9 @@ export async function createIntent(clientId: string, keyId: string, input: Creat
     throw new AmountOutOfRange(parsed.data.amount, minIntent.toFixed(), maxIntent.toFixed());
   }
   if (!enabledChains.includes(chain)) throw new UnsupportedChain(chain);
+  // Checked BEFORE deriving so a replayed reference never burns an index. The
+  // unique index (client_id, reference) is what holds under a race (below).
+  if (await prisma.paymentIntent.findFirst({ where: { clientId, reference }, select: { id: true } })) throw new ReferenceConflict(reference);
 
   let floor: number;
   try { floor = derivationFloor(chain); }
@@ -91,7 +106,7 @@ export async function createIntent(clientId: string, keyId: string, input: Creat
     try {
       const row = await prisma.$transaction(async (tx) => {
         const address = await tx.address.create({
-          data: { keyId, chain, reference: `payment_intent:${id}`, address: derived.address, derivationIndex: derived.derivationIndex },
+          data: { keyId, clientId, chain, reference: `payment_intent:${id}`, address: derived.address, derivationIndex: derived.derivationIndex },
           select: { id: true },
         });
         const created = await tx.paymentIntent.create({
@@ -106,7 +121,11 @@ export async function createIntent(clientId: string, keyId: string, input: Creat
     } catch (e) {
       // Another derivation took this index/address between our read and our
       // insert. Nothing was committed; take the next one.
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002" && attempt < DERIVE_ATTEMPTS) continue;
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+        const hit = uniqueHit(e);
+        if (hit === "reference") throw new ReferenceConflict(reference);
+        if (hit === "derivation" && attempt < DERIVE_ATTEMPTS) continue;
+      }
       throw e;
     }
   }
