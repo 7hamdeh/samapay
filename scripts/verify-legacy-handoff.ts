@@ -21,7 +21,8 @@
 //          7 a cursor file missing a chain (or with an extra key) is refused
 //          8 a target below a legacy deposit SamaPay already recorded (rewinding
 //            past existing legacy history) is refused on BOTH chains
-//          9 dry run writes nothing
+//          8b not mainnet → refused unless --rehearsal
+//          9 dry run writes nothing; prints network + TRC20/BEP20 depth
 //         10 apply: a cursor AHEAD moves back to the MIN, one BEHIND stays;
 //            legacy_watch_enabled_at stamped on both, one transaction
 //         11 re-run from the saved file: no change (also after the observer moved)
@@ -55,8 +56,8 @@ const DIR = mkdtempSync(join(process.env.VERIFY_TMP ?? tmpdir(), "verify-legacy-
 const IMPORT = "scripts/import-legacy-addresses.ts";
 const WATCH = "scripts/ops/start-legacy-watch.ts";
 
-function run(script: string, args: string[]): { code: number | null; out: string } {
-  const r = spawnSync("./node_modules/.bin/tsx", [script, ...args], { env: { ...process.env, LOG_LEVEL: "silent" }, encoding: "utf8" });
+function run(script: string, args: string[], env: Record<string, string> = {}): { code: number | null; out: string } {
+  const r = spawnSync("./node_modules/.bin/tsx", [script, ...args], { env: { ...process.env, LOG_LEVEL: "silent", ...env }, encoding: "utf8" });
   const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
   console.log(out.split("\n").filter(Boolean).map((l) => `      | ${l}`).join("\n"));
   return { code: r.status, out };
@@ -161,6 +162,11 @@ async function main() {
 
   // 9. dry run
   const cFile = file("cursors.json", { TRC20: Number(650n + d.TRC20), BEP20: 800, stoppedAt });
+  // 8b. not mainnet → refused unless --rehearsal (the depth would be testnet's 3)
+  r = run(WATCH, [`--cursors=${cFile}`, "--apply"], { CRYPTO_MODE: "testnet" });
+  check(r.code === 3 && /not mainnet/.test(r.out) && r.out.includes("network: testnet") && (await snap()) === initial, "8b. CRYPTO_MODE=testnet without --rehearsal: REFUSED (exit 3) after printing the mode, nothing written", `exit ${r.code}`);
+  r = run(WATCH, [`--cursors=${cFile}`, "--rehearsal"], { CRYPTO_MODE: "testnet", CRYPTO_TRON_TESTNET_USDT_CONTRACT: "rehearsal-not-dialled", CRYPTO_BSC_TESTNET_USDT_CONTRACT: "rehearsal-not-dialled" });
+  check(r.code === 0 && r.out.includes("network: testnet") && (await snap()) === initial, "8c. ... with --rehearsal the testnet dry run proceeds (and still writes nothing)", `exit ${r.code}`);
   r = run(WATCH, [`--cursors=${cFile}`]);
   check(r.code === 0 && /TRC20: WOULD SET cursor 700 -> 650; re-scan 50/.test(r.out) && (await snap()) === initial, "9. dry run prints the rewind (TRC20 700 -> 650, 50 blocks) and writes nothing", `exit ${r.code}`);
   check(r.out.includes(`network: mainnet; confirmation depth TRC20 ${d.TRC20}, BEP20 ${d.BEP20}`), "9b. the dry run prints the network and the depth it subtracts, per chain");
@@ -170,6 +176,7 @@ async function main() {
   const after = await snap();
   check(r.code === 0 && after === JSON.stringify({ BEP20: { block: "500", stamped: true }, TRC20: { block: "650", stamped: true } }),
     `10. --apply: TRC20 (ahead, 700) moves BACK to MNTAD ${650n + d.TRC20} − depth ${d.TRC20} = 650; BEP20 (behind, 500 < 800 − ${d.BEP20}) STAYS at 500; legacy watch stamped on both`, after);
+  check(r.out.includes(`network: mainnet; confirmation depth TRC20 ${d.TRC20}, BEP20 ${d.BEP20}`), "10b. --apply prints the same network + per-chain depth line as the dry run");
 
   // 11. re-runnable from the saved file, no change — also after the observer moved on
   r = run(WATCH, [`--cursors=${cFile}`, "--apply"]);
