@@ -76,6 +76,7 @@ function mapCreateError(e: unknown): never {
   }
   if (name === "ReferenceInvalid") throw new ApiError("reference_invalid", "reference must be 1-200 characters of [A-Za-z0-9:_-].");
   if (name === "ReferenceConflict") throw new ApiError("reference_conflict", "A payment intent with this reference already exists with a different amount or chain.");
+  // IntentKeyMismatch is a caller bug (auth resolved key + client): falls through to 500 internal.
   if (name === "AmountOutOfRange") throw new ApiError("amount_out_of_range", "amount is outside this account's allowed range for a payment intent.");
   if (name === "UnsupportedChain") throw new ApiError("unsupported_chain", "This chain is not enabled for this account.");
   if (name === "DerivationUnavailable") throw new ApiError("derivation_unavailable", "Address derivation is unavailable; nothing was created. Retry later.");
@@ -119,8 +120,9 @@ paymentIntents.post("/", scope("payment_intents.write"), idempotent, async (c) =
   let created: { id: string };
   try { created = await createIntentImpl(key.clientId, key.id, { amount, chain: chain as Chain, reference, expiresInSec }); }
   catch (e) {
-    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-      // Lost the UNIQUE(client_id, reference) race: the winner's row decides.
+    if ((e instanceof Error && e.name === "ReferenceConflict") || (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002")) {
+      // Lost the UNIQUE(client_id, reference) race (G2 answers ReferenceConflict,
+      // or the raw P2002): the winner's row decides — 200 the same, 409 a different one.
       const winner = await existingForReference(key.clientId, reference, amount, chain as Chain);
       if (winner) return c.json(renderIntent(winner), 200);
     }

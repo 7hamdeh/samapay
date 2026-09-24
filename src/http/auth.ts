@@ -26,17 +26,31 @@ function clientIp(c: Context): string {
   return c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || c.req.header("x-real-ip") || "unknown";
 }
 
+// Contract §2: sk_test_ keys on NON-production only. Production is either
+// signal — NODE_ENV=production or CRYPTO_MODE=mainnet (real money) — so a
+// deployment that forgot one of them still refuses test keys (fail closed).
+export function testKeysAllowed(): boolean {
+  return process.env.NODE_ENV !== "production" && process.env.CRYPTO_MODE !== "mainnet";
+}
+
 export async function authenticate(authorization: string | undefined): Promise<AuthedKey> {
-  const m = /^Bearer\s+(sk_(?:live|test)_[a-z2-7]{40})$/.exec(authorization ?? "");
+  const m = /^Bearer\s+(sk_(live|test)_[a-z2-7]{40})$/.exec(authorization ?? "");
   if (!m) throw new ApiError("unauthenticated", 'Missing or malformed Authorization header — expected "Bearer sk_live_…".');
   const plaintext = m[1] as string;
+  // Decided from the key's own form, before any lookup or argon2 work.
+  if (m[2] === "test" && !testKeysAllowed()) throw new ApiError("invalid_key", "Test keys are not accepted in production.");
+  const prefix = keyPrefixOf(plaintext);
+  // Pre-argon2 brake: see FAILED_VERIFY_* below.
+  const wait = failedVerifyWait(prefix);
+  if (wait > 0) throw new ApiError("rate_limited", "Too many failed authentications for this key; retry later.", { retry_after_sec: wait });
   const row = await prisma.clientKey.findUnique({
-    where: { keyPrefix: keyPrefixOf(plaintext) },
+    where: { keyPrefix: prefix },
     select: { id: true, clientId: true, keyPrefix: true, keyHash: true, scopes: true, environment: true, active: true, rpsLimit: true, revokedAt: true, successorKeyId: true },
   });
   // Same error for unknown prefix and wrong secret: a caller must not learn which.
   if (!row) throw new ApiError("invalid_key", "Invalid API key.");
-  if (!(await verifyKey(row.keyHash, plaintext))) throw new ApiError("invalid_key", "Invalid API key.");
+  if (!(await verifyKey(row.keyHash, plaintext))) { recordFailedVerify(prefix); throw new ApiError("invalid_key", "Invalid API key."); }
+  if (row.environment === "test" && !testKeysAllowed()) throw new ApiError("invalid_key", "Test keys are not accepted in production.");
   if (!row.active || row.revokedAt) {
     const successor = row.successorKeyId
       ? await prisma.clientKey.findUnique({ where: { id: row.successorKeyId }, select: { keyLast4: true } })
@@ -46,6 +60,37 @@ export async function authenticate(authorization: string | undefined): Promise<A
   const { keyHash: _drop, revokedAt: _drop2, successorKeyId: _drop3, ...safe } = row;
   void _drop; void _drop2; void _drop3;
   return safe;
+}
+
+// ── PRE-ARGON2 BRAKE (Q M1) ─────────────────────────────────────────────────
+// An unknown prefix never reaches argon2, but a KNOWN prefix (12 chars, shown
+// in the CLI output and logs) with wrong secrets would make every request pay
+// a full argon2 verify. Failed verifies are counted per prefix; after a burst
+// of FAILED_VERIFY_BURST the prefix is answered 429 BEFORE any lookup or
+// argon2 until the bucket refills (FAILED_VERIFY_PER_SEC). Successful requests
+// never consume it. TRADE-OFF, stated: while someone floods a prefix with
+// wrong secrets, the real holder of that key is also answered 429 — degraded
+// service, never access. In-process, like the per-key limiter below. A
+// per-IP brake needs a trusted client IP (nginx X-Real-IP), which Phase 0
+// (loopback only) does not have: that is a pre-public-exposure item.
+export const FAILED_VERIFY_BURST = 10;
+export const FAILED_VERIFY_PER_SEC = 1;
+const failed = new Map<string, Bucket>();
+function refill(b: Bucket, rate: number, cap: number, now: number): void {
+  b.tokens = Math.min(cap, b.tokens + ((now - b.at) / 1000) * rate); b.at = now;
+}
+function failedVerifyWait(prefix: string, now = Date.now()): number {
+  const b = failed.get(prefix);
+  if (!b) return 0;
+  refill(b, FAILED_VERIFY_PER_SEC, FAILED_VERIFY_BURST, now);
+  if (b.tokens >= 1) return 0;
+  return Math.max(1, Math.ceil((1 - b.tokens) / FAILED_VERIFY_PER_SEC));
+}
+function recordFailedVerify(prefix: string, now = Date.now()): void {
+  const b = failed.get(prefix) ?? { tokens: FAILED_VERIFY_BURST, at: now };
+  refill(b, FAILED_VERIFY_PER_SEC, FAILED_VERIFY_BURST, now);
+  b.tokens = Math.max(0, b.tokens - 1);
+  failed.set(prefix, b);
 }
 
 // ── RATE LIMIT ─────────────────────────────────────────────────────────────

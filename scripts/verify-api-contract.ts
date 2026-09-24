@@ -9,7 +9,9 @@
 // Run on a disposable cluster only:
 //   bash /www/wwwroot/samaprime.com/scripts/throwaway-pg.sh \
 //     ./node_modules/.bin/tsx scripts/throwaway-sandbox.ts scripts/verify-api-contract.ts
+import { isDeepStrictEqual } from "node:util";
 import { Prisma } from "@prisma/client";
+import type { ObservedTransfer } from "@/chain/types.js";
 import { assertSandboxDatabase } from "@/db/guard.js";
 import { prisma } from "@/db/client.js";
 import { buildApp } from "@/http/app.js";
@@ -42,6 +44,9 @@ async function main() {
   // ── fakes for G2 / G3 ──
   let nextIndex = 5_000_000 + (RUN % 100_000) * 10;
   let createCalls = 0; let createDelayMs = 0; let createThrows: Error | null = null;
+  // Simulates losing G2's UNIQUE(client_id, reference) race: a concurrent winner's row is
+  // written (with `raceWinnerAmount`), then createIntent answers ReferenceConflict.
+  let raceWinnerAmount: string | null = null;
   const { setCreateIntent = () => undefined } = await loadWiring("@/http/routes/payment-intents.js");
   const { setGetEvent = () => undefined } = await loadWiring("@/http/routes/events.js");
   const { setHealthReaders = () => undefined } = (await loadWiring("@/http/routes/health.js")) as { setHealthReaders?: (r: Record<string, () => Promise<unknown>>) => void };
@@ -49,7 +54,7 @@ async function main() {
   // request, so this suite never reaches an RPC endpoint.
   setHealthReaders({ observerLagBlocks: async () => ({ TRC20: null, BEP20: null }) });
   // chain double for POST /addresses: deterministic, never a real derivation
-  let deriverDown = false; let deriveDelayMs = 0;
+  let deriverDown = false; let deriveDelayMs = 0; const gateTransfers: ObservedTransfer[] = [];
   setChainAdapters({ deriver: { async deriveNext(chain) { if (deriverDown) throw new ChainUnavailable("verify"); if (deriveDelayMs) await sleep(deriveDelayMs); const i = nextIndex++; return { chain, address: `AVERIFY${RUN}${i}`, derivationIndex: i }; } } });
   setCreateIntent(async (clientId: string, keyId: string, input: CreateIntentInput) => {
     createCalls++;
@@ -58,7 +63,8 @@ async function main() {
     const i = nextIndex++;
     // Mirrors G2: an intent's address carries reference "payment_intent:<pi>", not the store's.
     const address = await prisma.address.create({ data: { keyId, chain: input.chain, reference: `payment_intent:pi_verify${RUN}${i}`, address: `TVERIFY${RUN}${i}`, derivationIndex: i } });
-    const row = await prisma.paymentIntent.create({ data: { id: `pi_verify${RUN}${i}`, clientId, keyId, addressId: address.id, chain: input.chain, amount: new Prisma.Decimal(input.amount), reference: input.reference, expiresAt: new Date(Date.now() + input.expiresInSec * 1000) } });
+    const row = await prisma.paymentIntent.create({ data: { id: `pi_verify${RUN}${i}`, clientId, keyId, addressId: address.id, chain: input.chain, amount: new Prisma.Decimal(raceWinnerAmount ?? input.amount), reference: input.reference, expiresAt: new Date(Date.now() + input.expiresInSec * 1000) } });
+    if (raceWinnerAmount !== null) throw named("ReferenceConflict");
     return { id: row.id };
   });
   const named = (name: string, msg = name) => Object.assign(new Error(msg), { name });
@@ -84,8 +90,9 @@ async function main() {
     const hdr = (k: string | null, idem?: string) => ({ ...(k ? { authorization: `Bearer ${k}` } : {}), "content-type": "application/json", ...(idem !== undefined ? { "idempotency-key": idem } : {}) });
     const call = async (method: string, path: string, key: string | null, body?: unknown, idem?: string) => {
       const res = await app.request(path, { method, headers: hdr(key, idem), ...(body !== undefined ? { body: typeof body === "string" ? body : JSON.stringify(body) } : {}) });
-      const json = (await res.json().catch(() => ({}))) as Json;
-      return { res, status: res.status, json, code: json.error?.code };
+      const text = await res.text();
+      let json: Json = {}; try { json = JSON.parse(text) as Json; } catch { /* not JSON */ }
+      return { res, status: res.status, json, text, code: json.error?.code };
     };
     const good = { amount: "12.5", chain: "TRC20", reference: `store-${RUN}-1` };
     let seq = 0; const idem = () => `verify-${RUN}-${++seq}`;
@@ -185,7 +192,7 @@ async function main() {
     // canonical body: same fields, different key order and whitespace
     const reordered = `{ "reference": "store-${RUN}-2",  "chain":"TRC20", "amount": "12.5" }`;
     const p1r = await call("POST", "/v1/payment-intents", A.plaintext, reordered, k1);
-    check(p1r.status === 201 && p1r.res.headers.get("idempotent-replayed") === "true" && JSON.stringify(p1r.json) === JSON.stringify(p1.json) && createCalls === callsBefore + 1,
+    check(p1r.status === 201 && p1r.res.headers.get("idempotent-replayed") === "true" && p1r.text === p1.text && createCalls === callsBefore + 1,
       "§3 replay (same key, same CANONICAL body, reordered) → original status+body, Idempotent-Replayed: true, createIntent ran once", `status=${p1r.status} replayed=${p1r.res.headers.get("idempotent-replayed")} calls=${createCalls - callsBefore}`);
     const p1m = await call("POST", "/v1/payment-intents", A.plaintext, { ...good, reference: `store-${RUN}-2`, amount: "13" }, k1);
     check(p1m.status === 409 && p1m.code === "idempotency_payload_mismatch" && createCalls === callsBefore + 1, "§6 409 idempotency_payload_mismatch — same key, different body; nothing created", `${p1m.status} ${p1m.code}`);
@@ -224,6 +231,16 @@ async function main() {
     // B created its own store-2 above (p1other) while A held store-2: the uniqueness is per client.
     const otherClientSameRef = await call("POST", "/v1/payment-intents", B.plaintext, { ...good, reference: `store-${RUN}-2` }, idem());
     check(otherClientSameRef.status === 200 && otherClientSameRef.json.id === p1other.json.id && p1other.json.id !== pi.id, "A7 the uniqueness is per CLIENT: B's store-2 is B's own intent, not A's", `${otherClientSameRef.status}`);
+
+    // A7 under a race: createIntent answers ReferenceConflict after another request won.
+    raceWinnerAmount = "12.5";
+    const race1 = await call("POST", "/v1/payment-intents", A.plaintext, { ...good, reference: `store-${RUN}-race1` }, idem());
+    raceWinnerAmount = "99";
+    const race2 = await call("POST", "/v1/payment-intents", A.plaintext, { ...good, reference: `store-${RUN}-race2` }, idem());
+    raceWinnerAmount = null;
+    const winner1 = await prisma.paymentIntent.findFirst({ where: { clientId: cA.id, reference: `store-${RUN}-race1` }, select: { id: true } });
+    check(race1.status === 200 && race1.json.id === winner1?.id && race2.status === 409 && race2.code === "reference_conflict",
+      "A7 race: createIntent's ReferenceConflict is re-read — the winner with the same amount → 200 it; a different amount → 409 reference_conflict", `${race1.status}/${race2.status} ${race2.code}`);
 
     // ── list (a dedicated client, so the count is exact) ──
     const cL = await prisma.client.create({ data: { name: `verify-api-L-${RUN}`, kind: "merchant" } }); made.clients.push(cL.id);
@@ -352,9 +369,10 @@ async function main() {
       call("POST", "/v1/addresses", A2.plaintext, { chain: "BEP20", reference: `samaprime:m${RUN}:user:race` }, idem()),
     ]);
     deriveDelayMs = 0;
-    const raceRows = await prisma.address.count({ where: { reference: `samaprime:m${RUN}:user:race` } });
-    check(ra.json.address === rb.json.address && raceRows === 1 && [ra.status, rb.status].sort().join() === "200,201",
-      "A7 two concurrent POST /addresses for one (client, chain, reference) → ONE address, one 201 + one 200 (per-reference advisory lock; G6 UNIQUE is the backstop)", `${ra.status}/${rb.status} rows=${raceRows}`);
+    const raceRowsList = await prisma.address.findMany({ where: { reference: `samaprime:m${RUN}:user:race` }, select: { clientId: true } });
+    const raceRows = raceRowsList.length;
+    check(ra.json.address === rb.json.address && raceRows === 1 && raceRowsList[0]?.clientId === cA.id && [ra.status, rb.status].sort().join() === "200,201",
+      "A7 two concurrent POST /addresses for one (client, chain, reference) → ONE address with client_id set, one 201 + one 200 (per-reference advisory lock; G6 UNIQUE is the backstop)", `${ra.status}/${rb.status} rows=${raceRows} client_id=${raceRowsList[0]?.clientId === cA.id ? "caller's" : String(raceRowsList[0]?.clientId)}`);
 
     // ── Phase 0: withdrawals refuse (A9 gate) ──
     const wBefore = await prisma.withdrawal.count();
@@ -363,11 +381,59 @@ async function main() {
     const w3 = await call("GET", "/v1/withdrawals/x", A.plaintext);
     const wAfter = await prisma.withdrawal.count();
     check(w1.status === 404 && w2.status === 404 && w3.status === 404 && wAfter === wBefore, "A9 GATE — Phase 0 has no withdrawal route: POST /v1/withdrawals and /withdrawals are 404 and no withdrawal row is written", `${w1.status}/${w2.status}/${w3.status} rows ${wBefore}→${wAfter}`);
+
+    // ── §2 test keys refused in production (Q M2). This suite runs with CRYPTO_MODE=mainnet. ──
+    const TK = await issueKey({ clientId: cA.id, name: "test-env", scopes: ["payment_intents.read"], environment: "test", issuedBy: "verify", issuedVia: "cli" }); made.keys.push(TK.id);
+    const tk = await call("GET", "/v1/payment-intents", TK.plaintext);
+    check(tk.status === 401 && tk.code === "invalid_key", "§2 an sk_test_ key is refused (401 invalid_key) when running in production mode", `${tk.status} ${tk.code}`);
+
+    // ── pre-argon2 brake (Q M1): a flood of wrong secrets on one known prefix ──
+    const BR = await iss(cA.id, "brake", ALL);
+    await prisma.clientKey.update({ where: { id: BR.id }, data: { rpsLimit: 100_000 } });
+    const brWrong = BR.plaintext.slice(0, 12) + "z".repeat(BR.plaintext.length - 12);
+    const brakeCodes: string[] = [];
+    for (let i = 0; i < 12; i++) brakeCodes.push(String((await call("GET", "/v1/payment-intents", brWrong)).code));
+    const brRight = await call("GET", "/v1/payment-intents", BR.plaintext);
+    check(brakeCodes.slice(0, 10).every((x) => x === "invalid_key") && brakeCodes.slice(10).every((x) => x === "rate_limited") && brRight.status === 429 && Number(brRight.res.headers.get("retry-after")) >= 1,
+      "Q-M1 after 10 failed verifies on one prefix the prefix is 429 BEFORE argon2 (the real holder too, while it lasts — the stated trade-off)", brakeCodes.join(","));
+    const brOther = await call("GET", "/v1/payment-intents", A.plaintext);
+    check(brOther.status === 200, "Q-M1 the brake is per prefix: other keys are unaffected", `${brOther.status}`);
+
+    // ── ONE RENDERER GATE (lead ruling): the event snapshot IS the REST body ──
+    // Real observer (G2) + real enqueueEvent/getEvent (G3) + the fake chain.
+    const { observeChain } = await import("@/observer/index.js");
+    const { setEventSink } = await import("@/intents/index.js");
+    const { enqueueEvent, getEvent } = await import("@/events/index.js");
+    setEventSink(enqueueEvent);
+    setGetEvent(getEvent as (c: string, id: string) => Promise<Record<string, unknown> | null>);
+    const gatePi = await call("POST", "/v1/payment-intents", A.plaintext, { ...good, reference: `store-${RUN}-gate` }, idem());
+    gateTransfers.push({ chain: "TRC20", txHash: `gatetx${RUN}a`, toAddress: String(gatePi.json.address), amount: "12.5", blockNumber: 10n, confirmations: 19 });
+    gateTransfers.push({ chain: "TRC20", txHash: `gatetx${RUN}b`, toAddress: String(ad1.json.address), amount: "3.25", blockNumber: 10n, confirmations: 19 });
+    const gateObserver = { async scan() { return gateTransfers; }, async confirmationsFor() { return 19; } };
+    await observeChain("TRC20", gateObserver, 19);
+    await observeChain("TRC20", gateObserver, 19);
+    for (const [tx, label] of [[`gatetx${RUN}a`, "an intent deposit"], [`gatetx${RUN}b`, "a top-up deposit"]] as const) {
+      const row = await prisma.deposit.findFirst({ where: { txHash: tx }, select: { id: true } });
+      const rest = await call("GET", `/v1/deposits/dep_${row?.id}`, A.plaintext);
+      const ev = await prisma.event.findFirst({ where: { objectId: `dep_${row?.id}`, type: "deposit.confirmed" }, select: { id: true } });
+      const got = ev ? await call("GET", `/v1/events/${ev.id}`, A.plaintext) : null;
+      const snap = (got?.json.data as { object?: unknown } | undefined)?.object;
+      check(rest.status === 200 && got?.status === 200 && isDeepStrictEqual(snap, rest.json), `GATE — ${label}: deposit.confirmed data.object DEEP-EQUALS GET /v1/deposits/:id`, `event=${JSON.stringify(snap)} rest=${rest.text}`);
+    }
+    const piRest = await call("GET", `/v1/payment-intents/${gatePi.json.id}`, A.plaintext);
+    const piEv = await prisma.event.findFirst({ where: { objectId: String(gatePi.json.id), type: "payment_intent.succeeded" }, select: { id: true } });
+    const piGot = piEv ? await call("GET", `/v1/events/${piEv.id}`, A.plaintext) : null;
+    const piSnap = (piGot?.json.data as { object?: unknown } | undefined)?.object;
+    check(piRest.json.status === "succeeded" && piGot?.status === 200 && isDeepStrictEqual(piSnap, piRest.json), "GATE — payment_intent.succeeded data.object DEEP-EQUALS GET /v1/payment-intents/:id", `event=${JSON.stringify(piSnap)} rest=${piRest.text}`);
+    const piEvB = piEv ? await call("GET", `/v1/events/${piEv.id}`, B.plaintext) : { status: 0 };
+    check(piEvB.status === 404, "§2 the real getEvent: another client's event is 404", `${piEvB.status}`);
   } catch (err) {
     fail++;
     console.error(`\n*** THE SUITE THREW — nothing below this point ran ***\n`, err);
   } finally {
     const keys = { in: made.keys };
+    await prisma.webhookDelivery.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
+    await prisma.event.deleteMany({ where: { clientId: { in: made.clients } } }).catch(() => undefined);
     await prisma.deposit.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
     await prisma.paymentIntent.deleteMany({ where: { clientId: { in: made.clients } } }).catch(() => undefined);
     await prisma.idempotencyKey.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
