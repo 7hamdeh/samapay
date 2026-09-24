@@ -17,6 +17,10 @@
 // number). The cursor only moves BACK or stays; re-scanned blocks are absorbed
 // by UNIQUE(chain, tx_hash). Rules and refusals: src/chain/cursor.ts header.
 //
+// MAINNET ONLY: refuses (exit 3) unless CRYPTO_MODE=mainnet; --rehearsal lifts
+// that for a throwaway database. The network and the depth per chain are
+// printed first, in dry run and apply alike.
+//
 // DRY RUN BY DEFAULT: prints, per chain, MNTAD's block, SamaPay's cursor, the
 // target, how many blocks will be re-scanned and how many legacy addresses
 // become watched. Writes nothing without --apply.
@@ -44,15 +48,24 @@ async function main(): Promise<number> {
   const file = flag("cursors");
   const apply = process.argv.includes("--apply");
   const by = flag("by") ?? "ibrahim";
-  if (!file) { console.error("usage: tsx scripts/ops/start-legacy-watch.ts --cursors=<file> [--apply] [--by=<who>]"); return 2; }
+  if (!file) { console.error("usage: tsx scripts/ops/start-legacy-watch.ts --cursors=<file> [--apply] [--by=<who>] [--rehearsal]"); return 2; }
 
   const cursors = parseCursorFile(readFileSync(file, "utf8"));
   console.log(`cursor file: TRC20 ${cursors.TRC20}, BEP20 ${cursors.BEP20}, MNTAD stopped at ${cursors.stoppedAt}`);
   console.log(apply ? "MODE: APPLY" : "MODE: DRY RUN (nothing is written; pass --apply)");
 
-  // The observer's own depth per chain; printed so the operator reads it before --apply.
+  // MAINNET OR NOTHING. On testnet config the depth is 3, not 19 / 15, and a
+  // cursor rewound by 3 is a handoff the operator never read. --rehearsal is
+  // for throwaway databases only.
+  const network = getCryptoNetworkMode();
+  const rehearsal = process.argv.includes("--rehearsal");
+  if (network !== "mainnet" && !rehearsal) {
+    console.log(`network: ${network}`);
+    throw new LegacyWatchRefused(null, `CRYPTO_MODE is ${network}, not mainnet — the handoff runs only with the production chain config (pass --rehearsal only on a throwaway database)`);
+  }
+  // The observer's own depth per chain; printed in dry run AND apply so the operator reads it.
   const depth = Object.fromEntries(CHAINS.map((c) => [c, BigInt(getChainConfig(c).confirmationsRequired)])) as Record<(typeof CHAINS)[number], bigint>;
-  console.log(`network: ${getCryptoNetworkMode()}; confirmation depth TRC20 ${depth.TRC20}, BEP20 ${depth.BEP20}`);
+  console.log(`network: ${network}${rehearsal ? " (REHEARSAL)" : ""}; confirmation depth TRC20 ${depth.TRC20}, BEP20 ${depth.BEP20}`);
 
   const at = new Date();
   let plans: ChainPlan[] = [];
