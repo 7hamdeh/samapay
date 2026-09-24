@@ -32,7 +32,7 @@ export class VaultNotConfiguredError extends VaultError {
   constructor() {
     super(
       "vault_not_configured",
-      "No vault verifier is configured. Run `pnpm exec tsx scripts/migrate-seed-to-vault.ts` once to set an admin passphrase.",
+      "No vault verifier is configured. Run `pnpm exec tsx --env-file=.env scripts/prove-vault.ts` once to set an admin passphrase.",
     );
   }
 }
@@ -65,7 +65,7 @@ function getUnlockTtlMs(): number {
   return (Number.isFinite(minutes) && minutes > 0 ? minutes : 240) * 60 * 1000;
 }
 
-/** Encrypts `plaintext` with a vault key. Exported for scripts/migrate-seed-to-vault.ts. */
+/** Encrypts `plaintext` with a vault key. Exported for scripts/prove-vault.ts (via vault-proof.ts). */
 export function encryptWithVaultKey(plaintext: string, vaultKey: Buffer): string {
   const iv = crypto.randomBytes(IV_LENGTH);
   const cipher = crypto.createCipheriv(ALGORITHM, vaultKey, iv);
@@ -84,6 +84,21 @@ function decryptWithVaultKey(blob: string, vaultKey: Buffer): string {
   decipher.setAAD(AAD);
   decipher.setAuthTag(authTag);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
+}
+
+/**
+ * The passphrase check itself, shared by unlockVault and scripts/prove-vault.ts
+ * (whose round trip is therefore the same code an unlock runs): derive the vault
+ * key from SEED_ENCRYPTION_KEY + Argon2id(passphrase), open the verifier, and
+ * require it to hold exactly the seed's fingerprint. Wrong passphrase → false.
+ */
+export async function verifyVaultPassphrase(passphrase: string, vaultVerifier: string, seedFingerprint: string): Promise<boolean> {
+  const vaultKey = combineAndStretchKey(getSeedEncryptionKey(), await deriveArgon2Key(passphrase));
+  try {
+    return decryptWithVaultKey(vaultVerifier, vaultKey) === seedFingerprint;
+  } catch {
+    return false;
+  }
 }
 
 // --- In-memory vault state. Locked on every process start, by design. ---
@@ -219,19 +234,7 @@ export async function unlockVault(passphrase: string, ip: string): Promise<Vault
     throw new VaultNotConfiguredError();
   }
 
-  const seedEncryptionKey = getSeedEncryptionKey();
-  const argon2Key = await deriveArgon2Key(passphrase);
-  const vaultKey = combineAndStretchKey(seedEncryptionKey, argon2Key);
-
-  let decrypted: string;
-  try {
-    decrypted = decryptWithVaultKey(config.vaultVerifier, vaultKey);
-  } catch {
-    recordAttempt(ip);
-    throw new VaultInvalidPassphraseError();
-  }
-
-  if (decrypted !== config.seedFingerprint) {
+  if (!(await verifyVaultPassphrase(passphrase, config.vaultVerifier, config.seedFingerprint))) {
     recordAttempt(ip);
     throw new VaultInvalidPassphraseError();
   }
