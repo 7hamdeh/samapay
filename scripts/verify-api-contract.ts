@@ -15,6 +15,12 @@ import { prisma } from "@/db/client.js";
 import { buildApp } from "@/http/app.js";
 import { issueKey } from "@/keys/issue.js";
 import { setChainAdapters, ChainUnavailable } from "@/chain/registry.js";
+import { isScope } from "@/http/scopes.js";
+
+// Chain CONFIG only (confirmation depth for confirmations_required): mainnet
+// resolves from built-in defaults with no env and no network call. No RPC is
+// ever contacted by this suite.
+process.env.CRYPTO_MODE = "mainnet";
 // Loaded DYNAMICALLY so the suite still RUNS (and fails check by check) on
 // code where these wiring points do not exist yet — the red-first run.
 type CreateIntentInput = { amount: string; chain: "TRC20" | "BEP20"; reference: string; expiresInSec: number };
@@ -58,7 +64,7 @@ async function main() {
     const cA = await prisma.client.create({ data: { name: `verify-api-A-${RUN}`, kind: "merchant", minIntent: new Prisma.Decimal(1), maxIntent: new Prisma.Decimal(10000), enabledChains: ["TRC20", "BEP20"] } }); made.clients.push(cA.id);
     const cB = await prisma.client.create({ data: { name: `verify-api-B-${RUN}`, kind: "merchant" } }); made.clients.push(cB.id);
     const cT = await prisma.client.create({ data: { name: `verify-api-TRC-${RUN}`, kind: "merchant", enabledChains: ["TRC20"] } }); made.clients.push(cT.id);
-    const iss = async (clientId: string, name: string, scopes: string[]) => { const k = await issueKey({ clientId, name, scopes, issuedBy: "verify", issuedVia: "cli" }); made.keys.push(k.id); return k; };
+    const iss = async (clientId: string, name: string, scopes: string[]) => { const k = await issueKey({ clientId, name, scopes: scopes.filter(isScope), issuedBy: "verify", issuedVia: "cli" }); made.keys.push(k.id); return k; };
     const A = await iss(cA.id, "A", ALL);
     const A2 = await iss(cA.id, "A2", ALL); // a second key of the SAME client
     const B = await iss(cB.id, "B", ALL);
@@ -168,7 +174,7 @@ async function main() {
     const pi = p1.json as Record<string, unknown>;
     const shapeOk = p1.status === 201 && typeof pi.id === "string" && pi.object === "payment_intent" && pi.status === "requires_payment"
       && pi.amount === "12.5" && pi.amount_received === "0" && pi.fee_amount === "0" && pi.currency === "USDT" && pi.chain === "TRC20"
-      && typeof pi.address === "string" && Array.isArray(pi.tx_hashes) && typeof pi.confirmations_required === "number"
+      && typeof pi.address === "string" && Array.isArray(pi.tx_hashes) && pi.confirmations_required === 19
       && typeof pi.expires_at === "string" && typeof pi.created_at === "string" && pi.succeeded_at === null && pi.expired_at === null;
     check(shapeOk, "§4 201 PaymentIntent — every field, snake_case, money as strings", JSON.stringify(pi));
     const exp = Date.parse(String(pi.expires_at)) - Date.parse(String(pi.created_at));
@@ -358,10 +364,13 @@ async function main() {
     await prisma.paymentIntent.deleteMany({ where: { clientId: { in: made.clients } } }).catch(() => undefined);
     await prisma.idempotencyKey.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
     await prisma.address.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
+    // Keys and clients are PINNED by their audit rows (append-only, FK
+    // Restrict) and stay; they are counted and printed, not treated as leaks.
     await prisma.clientKey.deleteMany({ where: { id: keys } }).catch(() => undefined);
     await prisma.client.deleteMany({ where: { id: { in: made.clients } } }).catch(() => undefined);
-    const left = (await prisma.paymentIntent.count({ where: { clientId: { in: made.clients } } })) + (await prisma.address.count({ where: { keyId: keys } })) + (await prisma.clientKey.count({ where: { id: keys } })) + (await prisma.client.count({ where: { id: { in: made.clients } } }));
-    console.log(`\n${pass} passed, ${fail} failed · ${left} left behind (counted; audit rows permanent by design)`);
+    const pinned = (await prisma.clientKey.count({ where: { id: keys } })) + (await prisma.client.count({ where: { id: { in: made.clients } } }));
+    const left = (await prisma.paymentIntent.count({ where: { clientId: { in: made.clients } } })) + (await prisma.address.count({ where: { keyId: keys } })) + (await prisma.deposit.count({ where: { keyId: keys } })) + (await prisma.idempotencyKey.count({ where: { keyId: keys } }));
+    console.log(`\n${pass} passed, ${fail} failed · ${left} left behind (counted) · ${pinned} key/client rows pinned by audit rows (permanent by design)`);
     if (left !== 0) fail++;
     await prisma.$disconnect();
     if (pass + fail === 0) { console.log("*** VOID — no check executed. This is NOT a pass. ***"); process.exit(1); }
