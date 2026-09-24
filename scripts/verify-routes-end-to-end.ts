@@ -1,172 +1,173 @@
-// STEP 4, RED-FIRST — the whole rule through the real app, in-process, with
-// injected chain doubles (no chain, no port): issue an address → the observer
-// records a transfer → it confirms → /balance shows it → /withdrawals is bounded
-// by it → replay is one row → an over-allowance is refused with the three
-// unclamped numbers → a second key sees NONE of it (isolation).
-import { Prisma } from "@prisma/client";
+// COVERS: src/http/app.ts src/http/routes/payment-intents.ts src/http/routes/deposits.ts src/http/routes/events.ts src/http/routes/addresses.ts src/http/routes/balance.ts src/render/deposit.ts src/intents/create.ts src/intents/render.ts src/observer/index.ts src/events/index.ts
+//
+// THE WHOLE PHASE 0 RAIL THROUGH THE REAL APP AND THE REAL MODULES, in-process
+// (no port, no chain): the ONLY double is the chain adapter (deterministic
+// derivations above the floor, a transfer list and a confirmation count we
+// control). createIntent (G2), the observer (G2), enqueueEvent/getEvent (G3),
+// balance (G6) and every route (G1) are the production code.
+//
+//   top-up address → intent (real createIntent) → transfer seen → processing →
+//   confirmed → succeeded → deposit.confirmed + payment_intent.succeeded events
+//   → GET /v1/events/:id data.object DEEP-EQUALS GET /v1/deposits/:id and
+//   GET /v1/payment-intents/:id (the one-renderer gate) → balance → another
+//   client sees none of it → withdrawals refuse in Phase 0.
+//
+// verify-api-contract.ts proves the error table and idempotency with fakes;
+// this suite proves the pieces compose.
+//
+// Run on a disposable cluster only:
+//   bash /www/wwwroot/samaprime.com/scripts/throwaway-pg.sh \
+//     ./node_modules/.bin/tsx scripts/throwaway-sandbox.ts scripts/verify-routes-end-to-end.ts
+import { isDeepStrictEqual } from "node:util";
 import { assertSandboxDatabase } from "@/db/guard.js";
 import { prisma } from "@/db/client.js";
 import { buildApp } from "@/http/app.js";
 import { issueKey } from "@/keys/issue.js";
 import { setChainAdapters } from "@/chain/registry.js";
 import { observeChain } from "@/observer/index.js";
+import { setEventSink } from "@/intents/index.js";
+import { enqueueEvent } from "@/events/index.js";
 import type { ObservedTransfer } from "@/chain/types.js";
+
+// Configuration the API process has in production, set for THIS process only:
+// the index floor (approved value) and mainnet chain config (built-in defaults;
+// read for confirmations_required only — no RPC is ever contacted here).
+process.env.SAMAPAY_DERIVATION_FLOOR_TRC20 = "1000";
+process.env.SAMAPAY_DERIVATION_FLOOR_BEP20 = "1000";
+process.env.CRYPTO_MODE = "mainnet";
+const TRC20_DEPTH = 19; // getChainConfig("TRC20").confirmationsRequired on mainnet defaults
 
 let pass = 0, fail = 0;
 function check(ok: boolean, label: string, detail = "") { if (ok) pass++; else fail++; console.log(`  ${ok ? "PASS" : "FAIL"}  ${label}${detail ? ` — ${detail}` : ""}`); }
 const RUN = Date.now();
-// Deliberately a literal, not getChainConfig("BEP20").confirmationsRequired:
-// this suite tests observeChain()'s PROMOTION LOGIC against a threshold it is
-// TOLD, not whether config resolution is correct (that's
-// scripts/verify-confirmation-depth-single-source.ts). Any value works; the
-// test asserts fewer confirmations than this doesn't promote and this-or-more
-// does.
-const REQUIRED_CONFIRMATIONS_UNDER_TEST = 15;
+const ALL = ["payment_intents.write", "payment_intents.read", "deposits.read", "addresses.write", "balance.read", "events.read"];
+type Json = Record<string, unknown> & { error?: { code: string } };
 
 async function main() {
   console.log(`database: ${await assertSandboxDatabase()}`);
   const app = buildApp();
+  setEventSink(enqueueEvent); // the composition the worker does
   const made = { clients: [] as string[], keys: [] as string[] };
-  // chain doubles: deterministic addresses, a transfer list we control, confirmations we control
-  let nextIndex = 1000 + (RUN % 1000) * 10; const transfers: ObservedTransfer[] = []; let confirmations = 0;
+
+  let nextIndex = 2_000_000 + (RUN % 100_000) * 10;
+  const transfers: ObservedTransfer[] = []; let confirmations = 0;
+  const fakeObserver = { async scan() { return transfers; }, async confirmationsFor() { return confirmations; } };
   setChainAdapters({
-    deriver: { async deriveNext(chain) { const i = nextIndex++; return { chain, address: `0xVERIFY${RUN}${i}`, derivationIndex: i }; } },
-    observer: { async scan() { return transfers; }, async confirmationsFor() { return confirmations; } },
-    sender: { async send() { return { ok: false, reason: "rejected_pre_broadcast", detail: "verify: no real chain" }; } },
+    deriver: { async deriveNext(chain) { const i = nextIndex++; return { chain, address: `TE2E${RUN}${i}`, derivationIndex: i }; } },
+    observer: fakeObserver,
   });
+  const tick = () => observeChain("TRC20", fakeObserver, TRC20_DEPTH);
+
   try {
-    const client = await prisma.client.create({ data: { name: `verify-e2e-${RUN}`, kind: "platform" } }); made.clients.push(client.id);
-    const scopes = ["addresses.write", "deposits.read", "withdrawals.write", "withdrawals.read", "balance.read"];
-    const A = await issueKey({ clientId: client.id, name: "A", scopes, issuedBy: "verify", issuedVia: "cli" });
-    // B is ANOTHER CLIENT's key: since contract v1.1 A6 the balance (and every
-    // read) is per CLIENT, so a second key of the SAME client would see A's money
-    // by design — isolation is between clients.
-    const client2 = await prisma.client.create({ data: { name: `verify-e2e-b-${RUN}`, kind: "platform" } }); made.clients.push(client2.id);
-    const B = await issueKey({ clientId: client2.id, name: "B", scopes, issuedBy: "verify", issuedVia: "cli" });
-    made.keys.push(A.id, B.id);
-    const hdr = (k: string, idem?: string) => ({ authorization: `Bearer ${k}`, "content-type": "application/json", ...(idem ? { "idempotency-key": idem } : {}) });
-    // GET /balance is the contract §4 object; this suite moves BEP20 only.
-    type Bal = { object: string; chains: { BEP20: { available: string; pending: string }; TRC20: { available: string; pending: string } } };
-    const bep = async (k: string) => { const b = (await (await app.request("/balance", { headers: hdr(k) })).json()) as Bal; return b.chains.BEP20; };
+    const cA = await prisma.client.create({ data: { name: `verify-e2e-A-${RUN}`, kind: "merchant" } }); made.clients.push(cA.id);
+    const cB = await prisma.client.create({ data: { name: `verify-e2e-B-${RUN}`, kind: "merchant" } }); made.clients.push(cB.id);
+    const A = await issueKey({ clientId: cA.id, name: "A", scopes: ALL, issuedBy: "verify", issuedVia: "cli" }); made.keys.push(A.id);
+    const B = await issueKey({ clientId: cB.id, name: "B", scopes: ALL, issuedBy: "verify", issuedVia: "cli" }); made.keys.push(B.id);
+    await prisma.clientKey.updateMany({ where: { id: { in: made.keys } }, data: { rpsLimit: 100_000 } });
+    let seq = 0;
+    const req = async (method: string, path: string, key: string, body?: unknown, idem?: string) => {
+      const headers: Record<string, string> = { authorization: `Bearer ${key}`, "content-type": "application/json" };
+      if (method === "POST") headers["idempotency-key"] = idem ?? `e2e-${RUN}-${++seq}`;
+      const res = await app.request(path, { method, headers, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
+      return { res, status: res.status, json: (await res.json().catch(() => ({}))) as Json };
+    };
 
-    // 1. address issued to A, bound to a reference; same (reference, chain) reuses
-    const a1 = await app.request("/addresses", { method: "POST", headers: hdr(A.plaintext, `addr-${RUN}`), body: JSON.stringify({ chain: "BEP20", reference: "samaprime:verify:user:cust1" }) });
-    const a1b = (await a1.json()) as { address: { address: string; reused: boolean } };
-    const a2 = await app.request("/addresses", { method: "POST", headers: hdr(A.plaintext, `addr2-${RUN}`), body: JSON.stringify({ chain: "BEP20", reference: "samaprime:verify:user:cust1" }) });
-    const a2b = (await a2.json()) as { address: { address: string; reused: boolean } };
-    check(a1.status === 201 && a2.status === 200 && a2b.address.reused && a2b.address.address === a1b.address.address, "1. POST /addresses issues once per (key, reference, chain); the second call reuses", `${a1.status}/${a2.status}`);
-    const noIdem = await app.request("/addresses", { method: "POST", headers: hdr(A.plaintext), body: "{}" });
-    check(noIdem.status === 400, "1b. a write without Idempotency-Key is refused 400", `status=${noIdem.status}`);
+    // 1. a per-customer top-up address; the same (chain, reference) is the same address
+    const ref = `samaprime:m${RUN}:user:u1`;
+    const t1 = await req("POST", "/v1/addresses", A.plaintext, { chain: "TRC20", reference: ref });
+    const t2 = await req("POST", "/v1/addresses", A.plaintext, { chain: "TRC20", reference: ref });
+    check(t1.status === 201 && t2.status === 200 && t1.json.address === t2.json.address && t1.json.object === "address", "1. POST /v1/addresses issues once; the same (chain, reference) returns the same address", `${t1.status}/${t2.status}`);
 
-    // 2. observer records a 10 USDT transfer ONCE even when scanned twice
-    transfers.push({ chain: "BEP20", txHash: `0xtx${RUN}`, toAddress: a1b.address.address, amount: "10.000000", blockNumber: 1n, confirmations: 0 });
-    const o1 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
-    const o2 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
-    check(o1.recorded === 1 && o2.recorded === 0 && o2.alreadyKnown === 1, "2. the observer records a transfer once; a second scan sees it as alreadyKnown (UNIQUE chain+tx_hash)", `${JSON.stringify(o1)} then ${JSON.stringify(o2)}`);
-    const bal0 = await bep(A.plaintext);
-    check(bal0.available === "0" && bal0.pending === "10", "3. a DETECTED deposit is not available: /balance BEP20 available 0, pending 10", JSON.stringify(bal0));
+    // 2. an intent through the REAL createIntent: fresh address above the floor
+    const idem = `e2e-intent-${RUN}`;
+    const p1 = await req("POST", "/v1/payment-intents", A.plaintext, { amount: "12.5", chain: "TRC20", reference: `order-${RUN}` }, idem);
+    const pi = p1.json;
+    const piAddr = await prisma.address.findFirst({ where: { address: String(pi.address) }, select: { derivationIndex: true, reference: true } });
+    check(p1.status === 201 && String(pi.id).startsWith("pi_") && pi.status === "requires_payment" && pi.confirmations_required === TRC20_DEPTH && (piAddr?.derivationIndex ?? 0) > 1000 && piAddr?.reference === `payment_intent:${pi.id}` && pi.address !== t1.json.address,
+      "2. POST /v1/payment-intents (real createIntent) → 201 requires_payment on a FRESH address above the floor", `${p1.status} ${JSON.stringify(pi).slice(0, 160)} index=${piAddr?.derivationIndex}`);
+    const p1r = await req("POST", "/v1/payment-intents", A.plaintext, { amount: "12.5", chain: "TRC20", reference: `order-${RUN}` }, idem);
+    check(p1r.status === 201 && p1r.res.headers.get("idempotent-replayed") === "true" && p1r.json.id === pi.id && (await prisma.paymentIntent.count({ where: { clientId: cA.id } })) === 1, "2b. replay → same intent, Idempotent-Replayed, ONE row", `${p1r.status}`);
 
-    // 4. confirm once; balance moves exactly once
-    confirmations = REQUIRED_CONFIRMATIONS_UNDER_TEST;
-    const o3 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
-    const o4 = await observeChain("BEP20", (await import("@/chain/registry.js")).chainAdapters().observer, REQUIRED_CONFIRMATIONS_UNDER_TEST);
-    const bal1 = await bep(A.plaintext);
-    check(o3.confirmed === 1 && o4.confirmed === 0 && bal1.available === "10" && bal1.pending === "0", "4. confirmed exactly once; /balance BEP20 available=10 pending=0", `confirmed ${o3.confirmed}/${o4.confirmed} balance=${JSON.stringify(bal1)}`);
-    const dep = (await (await app.request("/deposits", { headers: hdr(A.plaintext) })).json()) as { deposits: Array<{ status: string; counts_toward_allowance: boolean }> };
-    check(dep.deposits.length === 1 && dep.deposits[0]?.status === "confirmed" && dep.deposits[0]?.counts_toward_allowance === true, "4b. GET /deposits shows it confirmed and counting");
-    const webhook = await prisma.webhookDelivery.count({ where: { keyId: A.id, eventType: "deposit.confirmed" } });
-    check(webhook === 1, "4c. exactly one deposit.confirmed webhook enqueued", `${webhook}`);
+    // 3. the transfer is seen, unconfirmed → processing
+    transfers.push({ chain: "TRC20", txHash: `e2etx${RUN}a`, toAddress: String(pi.address), amount: "12.5", blockNumber: 10n, confirmations: 0 });
+    transfers.push({ chain: "TRC20", txHash: `e2etx${RUN}b`, toAddress: String(t1.json.address), amount: "3.25", blockNumber: 10n, confirmations: 0 });
+    await tick();
+    const g3 = await req("GET", `/v1/payment-intents/${pi.id}`, A.plaintext);
+    check(g3.json.status === "processing" && g3.json.amount_received === "0", "3. a detected, unconfirmed transfer → processing, amount_received still 0", `${g3.json.status} ${g3.json.amount_received}`);
 
-    // 5. withdrawal within allowance: 202, balance in body shows the reservation counted
-    const w1 = await app.request("/withdrawals", { method: "POST", headers: hdr(A.plaintext, `wd-${RUN}`), body: JSON.stringify({ to: "0x" + "d".repeat(40), amount: "6.5", chain: "BEP20" }) });
-    const w1b = (await w1.json()) as { withdrawal: { id: string; status: string; replayed: boolean }; balance: { withdrawn: string; allowance: string } };
-    check(w1.status === 202 && w1b.withdrawal.status === "pending" && w1b.balance.withdrawn === "6.5" && w1b.balance.allowance === "3.5", "5. POST /withdrawals 202 pending; body.balance shows withdrawn=6.5 allowance=3.5", `status=${w1.status} ${JSON.stringify(w1b.balance)}`);
-    // 5b. replay with the same key = same row, no second reservation
-    const w1r = await app.request("/withdrawals", { method: "POST", headers: hdr(A.plaintext, `wd-${RUN}`), body: JSON.stringify({ to: "0x" + "d".repeat(40), amount: "6.5", chain: "BEP20" }) });
-    const w1rb = (await w1r.json()) as { withdrawal: { id: string } };
-    const rows = await prisma.withdrawal.count({ where: { keyId: A.id } });
-    check(w1r.status === 202 && w1rb.withdrawal.id === w1b.withdrawal.id && w1r.headers.get("idempotent-replayed") === "true" && rows === 1, "5b. replay returns the same withdrawal, Idempotent-Replayed, still ONE row", `rows=${rows}`);
-    // 5c. same key, different body → 409 mismatch
-    const w1m = await app.request("/withdrawals", { method: "POST", headers: hdr(A.plaintext, `wd-${RUN}`), body: JSON.stringify({ to: "0x" + "d".repeat(40), amount: "1", chain: "BEP20" }) });
-    check(w1m.status === 409, "5c. same Idempotency-Key with a different body → 409", `status=${w1m.status}`);
+    // 4. confirmed → succeeded, exactly once
+    confirmations = TRC20_DEPTH;
+    await tick(); await tick();
+    const g4 = await req("GET", `/v1/payment-intents/${pi.id}`, A.plaintext);
+    check(g4.json.status === "succeeded" && g4.json.amount_received === "12.5" && JSON.stringify(g4.json.tx_hashes) === JSON.stringify([`e2etx${RUN}a`]), "4. confirmed → succeeded; amount_received 12.5; tx_hashes", `${g4.json.status} ${g4.json.amount_received}`);
 
-    // 6. over the remaining allowance → 409 with the three numbers, unclamped, no row
-    const w2 = await app.request("/withdrawals", { method: "POST", headers: hdr(A.plaintext, `wd2-${RUN}`), body: JSON.stringify({ to: "0x" + "e".repeat(40), amount: "3.500001", chain: "BEP20" }) });
-    const w2b = (await w2.json()) as { error: { code: string; details: { received: string; withdrawn: string; requested: string } } };
-    const rows2 = await prisma.withdrawal.count({ where: { keyId: A.id } });
-    check(w2.status === 409 && w2b.error.code === "allowance_exceeded" && w2b.error.details.received === "10" && w2b.error.details.withdrawn === "6.5" && w2b.error.details.requested === "3.500001" && rows2 === 1, "6. over-allowance refused 409 allowance_exceeded with received/withdrawn/requested; no row written", JSON.stringify(w2b.error?.details));
+    // 5. deposits over REST
+    const dl = await req("GET", `/v1/deposits?payment_intent_id=${pi.id}`, A.plaintext);
+    const dep = ((dl.json.data ?? []) as Json[])[0] ?? {};
+    const d1 = await req("GET", `/v1/deposits/${dep.id}`, A.plaintext);
+    check(dl.status === 200 && String(dep.id).startsWith("dep_") && d1.status === 200 && d1.json.reference === `order-${RUN}` && d1.json.payment_intent_id === pi.id && d1.json.status === "confirmed",
+      "5. GET /v1/deposits/:id — public id dep_…, reference = the intent's, confirmed", JSON.stringify(d1.json).slice(0, 200));
+    const raw = String(dep.id).slice(4);
+    const dRaw = await req("GET", `/v1/deposits/${raw}`, A.plaintext);
+    check(dRaw.status === 404 && dRaw.json.error?.code === "not_found", "5b. the UNPREFIXED row id is not an id: 404 not_found", `${dRaw.status}`);
 
-    // 7. isolation: key B sees none of it
-    const balB = await bep(B.plaintext);
-    const depB = (await (await app.request("/deposits", { headers: hdr(B.plaintext) })).json()) as { deposits: unknown[] };
-    const wdB = await app.request(`/withdrawals/${w1b.withdrawal.id}`, { headers: hdr(B.plaintext) });
-    check(balB.available === "0" && balB.pending === "0" && depB.deposits.length === 0 && wdB.status === 404, "7. ISOLATION — another client's key B: balance 0, no deposits, A's withdrawal is 404", `${JSON.stringify(balB)} ${wdB.status}`);
+    // 6. THE ONE-RENDERER GATE: the event snapshot and the REST body are the same object
+    const evDep = await prisma.event.findFirst({ where: { objectId: String(dep.id), type: "deposit.confirmed" }, select: { id: true } });
+    const evPi = await prisma.event.findFirst({ where: { objectId: String(pi.id), type: "payment_intent.succeeded" }, select: { id: true } });
+    const e1 = evDep ? await req("GET", `/v1/events/${evDep.id}`, A.plaintext) : null;
+    const e2 = evPi ? await req("GET", `/v1/events/${evPi.id}`, A.plaintext) : null;
+    const snapDep = (e1?.json.data as { object?: unknown } | undefined)?.object;
+    const snapPi = (e2?.json.data as { object?: unknown } | undefined)?.object;
+    check(e1?.status === 200 && isDeepStrictEqual(snapDep, d1.json), "6. GATE — deposit.confirmed data.object DEEP-EQUALS GET /v1/deposits/:id", `event=${JSON.stringify(snapDep)} rest=${JSON.stringify(d1.json)}`);
+    check(e2?.status === 200 && isDeepStrictEqual(snapPi, g4.json), "6b. GATE — payment_intent.succeeded data.object DEEP-EQUALS GET /v1/payment-intents/:id", `event=${JSON.stringify(snapPi)} rest=${JSON.stringify(g4.json)}`);
+    const events = await prisma.event.count({ where: { clientId: cA.id } });
+    check(events === 3, "6c. exactly three events: deposit.confirmed ×2 (intent + top-up, A1) and payment_intent.succeeded ×1, after three ticks", `${events}`);
+    const topDep = await prisma.deposit.findFirst({ where: { txHash: `e2etx${RUN}b` }, select: { id: true } });
+    const td = await req("GET", `/v1/deposits/dep_${topDep?.id}`, A.plaintext);
+    const evTop = await prisma.event.findFirst({ where: { objectId: `dep_${topDep?.id}`, type: "deposit.confirmed" }, select: { id: true } });
+    const e3 = evTop ? await req("GET", `/v1/events/${evTop.id}`, A.plaintext) : null;
+    check(td.json.reference === ref && td.json.payment_intent_id === null && isDeepStrictEqual((e3?.json.data as { object?: unknown } | undefined)?.object, td.json),
+      "6d. GATE — a top-up deposit: REST body deep-equals its deposit.confirmed snapshot; reference = the address's", JSON.stringify(td.json).slice(0, 160));
 
-    // 8. the sender stub is refused (rejected) and the row is `failed` — still CONSUMING (allowance unchanged)
-    await new Promise((r) => setTimeout(r, 300));
-    const w1s = await prisma.withdrawal.findUniqueOrThrow({ where: { id: w1b.withdrawal.id }, select: { status: true } });
-    const bal2 = await bep(A.plaintext);
-    check(w1s.status === "failed" && bal2.available === "3.5", "8. a failed (pre-broadcast) send keeps CONSUMING: status=failed, available still 3.5 (restore needs evidence)", `status=${w1s.status} available=${bal2.available}`);
-    // 8c. finding 1: with NO chain (ChainUnavailable) a request is RELEASED with a reason, not left pending
-    setChainAdapters({ sender: { async send() { throw new (await import("@/chain/registry.js")).ChainUnavailable("send"); } } });
-    const w3 = await app.request("/withdrawals", { method: "POST", headers: hdr(A.plaintext, `wd3-${RUN}`), body: JSON.stringify({ to: "0x" + "a".repeat(40), amount: "1", chain: "BEP20" }) });
-    const w3b = (await w3.json()) as { withdrawal: { id: string } };
-    await new Promise((r) => setTimeout(r, 300));
-    const w3s = await prisma.withdrawal.findUniqueOrThrow({ where: { id: w3b.withdrawal.id }, select: { status: true, reservation: { select: { status: true, reason: true } } } });
-    const cancelledHook = await prisma.webhookDelivery.count({ where: { keyId: A.id, eventType: "withdrawal.cancelled" } });
-    const bal4 = await bep(A.plaintext);
-    check(w3.status === 202 && w3s.status === "cancelled" && w3s.reservation?.reason === "chain_unavailable" && cancelledHook === 1 && bal4.available === "3.5", "8c. ChainUnavailable → cancelled with reason chain_unavailable + webhook; available restored to 3.5, nothing left pending", `status=${w3s.status} reason=${w3s.reservation?.reason} hooks=${cancelledHook} available=${bal4.available}`);
-    // ⚠️ 8d WAS ASSERTING A BEHAVIOUR THAT CONTRADICTS IDEMPOTENCY.
-    // There are TWO replay layers: the middleware (keyed on the
-    // Idempotency-Key) and allowance.reserve (keyed on the same string in
-    // the withdrawals unique). The MIDDLEWARE WINS — it returns the STORED
-    // RESPONSE VERBATIM and the route never runs. That is what an
-    // idempotency key means, and it is what Stripe's own contract does.
-    // So a replay CANNOT report a fresher status: it reports the answer the
-    // first call got. The route's own status re-read (added for
-    // value-model's finding 3) is therefore only reachable when the
-    // idempotency row has expired while the withdrawal row survives.
-    // ⇒ THE CONTRACT, now asserted rather than wished for: a replay is
-    // byte-identical to the original, carries Idempotent-Replayed, and
-    // creates no second row; CURRENT status comes from GET /withdrawals/:id.
-    const replayRes = await app.request("/withdrawals", { method: "POST", headers: hdr(A.plaintext, `wd3-${RUN}`), body: JSON.stringify({ to: "0x" + "a".repeat(40), amount: "1", chain: "BEP20" }) });
-    const replayBody = (await replayRes.json()) as { withdrawal: { id: string; status: string } };
-    const rowCount3 = await prisma.withdrawal.count({ where: { keyId: A.id, idempotencyKey: `wd3-${RUN}` } });
-    check(replayRes.headers.get("idempotent-replayed") === "true" && replayBody.withdrawal.id === w3b.withdrawal.id && rowCount3 === 1,
-      "8d. a replay returns the STORED response verbatim (same id, Idempotent-Replayed) and creates no second row",
-      `id ${replayBody.withdrawal.id === w3b.withdrawal.id ? "same" : "DIFFERENT"} · replayed=${replayRes.headers.get("idempotent-replayed")} · rows=${rowCount3}`);
-    const liveStatus = (await (await app.request(`/withdrawals/${w3b.withdrawal.id}`, { headers: hdr(A.plaintext) })).json()) as { withdrawal: { status: string } };
-    check(liveStatus.withdrawal.status === "cancelled" && replayBody.withdrawal.status === "pending",
-      "8e. and the CURRENT status comes from GET /withdrawals/:id (cancelled) while the replayed body keeps the original (pending) — the client must not read a replay as live state",
-      `GET=${liveStatus.withdrawal.status} replayBody=${replayBody.withdrawal.status}`);
-    // 8b. CONTROL: the balance number is not clamped — force withdrawn > received in the DB and read
-    await prisma.withdrawal.create({ data: { keyId: A.id, toAddress: "0x" + "f".repeat(40), chain: "BEP20", amount: new Prisma.Decimal("20"), status: "sent", idempotencyKey: `forced-${RUN}` } });
-    const bal3 = await bep(A.plaintext);
-    check(bal3.available === "-16.5", "8b. CONTROL — /balance never clamps: a forced over-send reads BEP20 available -16.5", bal3.available);
+    // 7. balance (G6) sees both confirmed deposits
+    const bal = await req("GET", "/v1/balance", A.plaintext);
+    const trc = (bal.json.chains as Record<string, { available: string }> | undefined)?.TRC20;
+    check(bal.status === 200 && bal.json.object === "balance" && trc?.available === "15.75", "7. GET /v1/balance: TRC20 available = 12.5 + 3.25", JSON.stringify(bal.json));
+
+    // 8. ISOLATION — client B sees none of it
+    const iB = await req("GET", `/v1/payment-intents/${pi.id}`, B.plaintext);
+    const dB = await req("GET", `/v1/deposits/${dep.id}`, B.plaintext);
+    const eB = evDep ? await req("GET", `/v1/events/${evDep.id}`, B.plaintext) : { status: 0 };
+    const lB = await req("GET", "/v1/deposits", B.plaintext);
+    const bB = await req("GET", "/v1/balance", B.plaintext);
+    check(iB.status === 404 && dB.status === 404 && eB.status === 404 && (lB.json.data as unknown[]).length === 0 && (bB.json.chains as Record<string, { available: string }>)?.TRC20?.available === "0",
+      "8. ISOLATION — client B: intent, deposit and event are 404; no deposits; balance 0", `${iB.status}/${dB.status}/${eB.status}`);
+
+    // 9. Phase 0: no withdrawal route
+    const w = await req("POST", "/v1/withdrawals", A.plaintext, { to: "T" + "x".repeat(33), amount: "1", chain: "TRC20" });
+    check(w.status === 404 && (await prisma.withdrawal.count({ where: { keyId: A.id } })) === 0, "9. Phase 0 refuses withdrawals: POST /v1/withdrawals is 404, no row", `${w.status}`);
   } catch (err) {
-    // ⚠️ WITHOUT THIS, A CRASH REPORTS AS A CLEAN ZERO. `process.exit()` in
-    // the `finally` below runs BEFORE the exception propagates and discards
-    // it — the first run of this suite against a real sandbox printed
-    // "0 passed, 0 failed" and exited 0 while main() was throwing on its
-    // second statement. A suite that cannot fail loudly is the defect this
-    // whole repository is about, and it was in the harness rather than the
-    // assertions.
+    // ⚠️ WITHOUT THIS, A CRASH REPORTS AS A CLEAN ZERO (the finally's exit discards it).
     fail++;
     console.error(`\n*** THE SUITE THREW — nothing below this point ran ***\n`, err);
   } finally {
-    await prisma.webhookDelivery.deleteMany({ where: { keyId: { in: made.keys } } }).catch(() => undefined);
-    await prisma.reservation.deleteMany({ where: { keyId: { in: made.keys } } }).catch(() => undefined);
-    await prisma.withdrawal.deleteMany({ where: { keyId: { in: made.keys } } }).catch(() => undefined);
-    await prisma.idempotencyKey.deleteMany({ where: { keyId: { in: made.keys } } }).catch(() => undefined);
-    await prisma.deposit.deleteMany({ where: { keyId: { in: made.keys } } }).catch(() => undefined);
-    await prisma.address.deleteMany({ where: { keyId: { in: made.keys } } }).catch(() => undefined);
-    await prisma.clientKey.deleteMany({ where: { id: { in: made.keys } } }).catch(() => undefined);
+    const keys = { in: made.keys };
+    const eventIds = (await prisma.event.findMany({ where: { clientId: { in: made.clients } }, select: { id: true } })).map((e) => e.id);
+    await prisma.webhookDelivery.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
+    await prisma.event.deleteMany({ where: { id: { in: eventIds } } }).catch(() => undefined);
+    await prisma.deposit.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
+    await prisma.paymentIntent.deleteMany({ where: { clientId: { in: made.clients } } }).catch(() => undefined);
+    await prisma.idempotencyKey.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
+    await prisma.address.deleteMany({ where: { keyId: keys } }).catch(() => undefined);
+    await prisma.clientKey.deleteMany({ where: { id: keys } }).catch(() => undefined);
     await prisma.client.deleteMany({ where: { id: { in: made.clients } } }).catch(() => undefined);
-    const left = (await prisma.deposit.count({ where: { keyId: { in: made.keys } } })) + (await prisma.withdrawal.count({ where: { keyId: { in: made.keys } } })) + (await prisma.address.count({ where: { keyId: { in: made.keys } } })) + (await prisma.clientKey.count({ where: { id: { in: made.keys } } })) + (await prisma.client.count({ where: { id: { in: made.clients } } }));
-    console.log(`\n${pass} passed, ${fail} failed · ${left} left behind (counted; audit rows permanent by design)`);
+    // Keys/clients are pinned by their append-only audit rows (FK Restrict) — counted apart, by design.
+    const left = (await prisma.deposit.count({ where: { keyId: keys } })) + (await prisma.paymentIntent.count({ where: { clientId: { in: made.clients } } })) + (await prisma.address.count({ where: { keyId: keys } })) + (await prisma.event.count({ where: { clientId: { in: made.clients } } })) + (await prisma.webhookDelivery.count({ where: { keyId: keys } }));
+    const pinned = (await prisma.clientKey.count({ where: { id: keys } })) + (await prisma.client.count({ where: { id: { in: made.clients } } }));
+    console.log(`\n${pass} passed, ${fail} failed · ${left} left behind (counted) · ${pinned} key/client rows pinned by audit rows (permanent by design)`);
     if (left !== 0) fail++;
-    await prisma.$disconnect(); // ⚠️ ZERO CHECKS IS **VOID**, NEVER A PASS. "0 passed, 0 failed" is the
-    // reassuring shape of a suite that never reached its assertions.
+    await prisma.$disconnect();
+    // ⚠️ ZERO CHECKS IS **VOID**, NEVER A PASS.
     if (pass + fail === 0) { console.log("*** VOID — no check executed. This is NOT a pass. ***"); process.exit(1); }
     process.exit(fail === 0 ? 0 : 1);
   }

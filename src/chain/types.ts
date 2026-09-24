@@ -39,9 +39,22 @@ export interface ObservedTransfer {
   confirmations: number;
 }
 
+/**
+ * One scan's result, NOTHING PERSISTED. `scannedThrough` is the highest block
+ * actually scanned (null = none). The OBSERVER advances the cursor to it, under
+ * the chain's cursor lock, ONLY after every transfer is recorded — a cursor
+ * written before the records is a deposit lost on the first failed insert
+ * (Q's review B1, 2026-09-24).
+ */
+export interface ScanBatch { transfers: ObservedTransfer[]; scannedThrough: bigint | null }
+
 export interface ChainObserver {
-  /** Transfers to any of `addresses` between the cursor and head; the observer persists its own cursor. */
-  scan(chain: Chain, addresses: ReadonlySet<string>): Promise<ObservedTransfer[]>;
+  /**
+   * Transfers to any of `addresses` from the cursor on. A ScanBatch (the live
+   * scanner) hands the cursor to the observer; a bare array (test doubles with
+   * no cursor) moves none.
+   */
+  scan(chain: Chain, addresses: ReadonlySet<string>): Promise<ObservedTransfer[] | ScanBatch>;
   confirmationsFor(chain: Chain, txHash: string): Promise<number>;
 }
 
