@@ -37,7 +37,8 @@ export const ALLOWANCE_LOCK_NAMESPACE = 4712;
  *   2. the replay check — same key + idempotency key returns the existing
  *      row; a retried request must never consume twice.
  *   3. the aggregate — now serialised behind the lock.
- *   4. refuse iff withdrawn + amount > received. Exactly, not at-most.
+ *   4. refuse iff withdrawn + fees + amount > received. Exactly, not at-most.
+ *      (`fees` = the merchant fees stamped on the confirmed deposits.)
  *   5. insert the withdrawal (pending) and the reservation (held, NO
  *      amount of its own — the withdrawal row is the single figure that
  *      enters any sum; a second amount column would be two calculators).
@@ -64,8 +65,8 @@ export async function reserve(tx: Tx, input: ReserveInput): Promise<ReserveResul
 
   // 3–4. The rule.
   const before = await read(input.keyId, tx);
-  if (before.withdrawn.plus(amount).greaterThan(before.received)) {
-    throw new AllowanceExceeded(input.keyId, before.received.toString(), before.withdrawn.toString(), amount.toString());
+  if (before.withdrawn.plus(before.fees).plus(amount).greaterThan(before.received)) {
+    throw new AllowanceExceeded(input.keyId, before.received.toString(), before.withdrawn.toString(), amount.toString(), before.fees.toString());
   }
 
   // 5. The pending row IS the reservation's amount; the reservation row carries none.
