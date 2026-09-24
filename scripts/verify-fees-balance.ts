@@ -24,7 +24,7 @@ import { balance } from "@/http/routes/balance.js";
 import { issueKey } from "@/keys/issue.js";
 import { provisionClientKey } from "@/keys/provision.js";
 import { MERCHANT_DEFAULT_SCOPES, termsFromArgv, TermsError } from "@/keys/terms.js";
-import { computeFee, feeForConfirmation, read, readByChain, reserve, AllowanceExceeded, InvalidFeeBps } from "@/allowance/index.js";
+import { computeFee, feeForConfirmation, read, readClientByChain, reserve, AllowanceExceeded, InvalidFeeBps } from "@/allowance/index.js";
 import { backupProblem, disableAddress, parseArgs } from "./ops/disable-address.js";
 import { check, summary, thrown, voidCheck } from "./lib/check.js";
 
@@ -80,10 +80,10 @@ async function main() {
 
     // ── C. balance: per chain, fees stamped, pending gross ──────────────
     const keyId = p.key.id;
-    const addr = async (chain: "TRC20" | "BEP20") => (await prisma.address.create({ data: { keyId, chain, reference: `verify:g6:user:${RUN}`, address: `G6${chain}${RUN}${nextIndex()}`, derivationIndex: nextIndex() }, select: { id: true } })).id;
+    const addr = async (chain: "TRC20" | "BEP20") => (await prisma.address.create({ data: { keyId, clientId: p.client.id, chain, reference: `verify:g6:user:${RUN}`, address: `G6${chain}${RUN}${nextIndex()}`, derivationIndex: nextIndex() }, select: { id: true } })).id;
     const tA = await addr("TRC20"); const bA = await addr("BEP20");
     const dep = (chain: "TRC20" | "BEP20", addressId: string, amount: string, status: "confirmed" | "detected", fee: Prisma.Decimal | string = "0") =>
-      prisma.deposit.create({ data: { keyId, addressId, chain, txHash: `g6-${RUN}-${nextIndex()}`, amount: new Prisma.Decimal(amount), status, feeAmount: new Prisma.Decimal(fee), ...(status === "confirmed" ? { creditedAt: new Date() } : {}) } });
+      prisma.deposit.create({ data: { keyId, clientId: p.client.id, addressId, chain, txHash: `g6-${RUN}-${nextIndex()}`, amount: new Prisma.Decimal(amount), status, feeAmount: new Prisma.Decimal(fee), ...(status === "confirmed" ? { creditedAt: new Date() } : {}) } });
     // the fee is what feeForConfirmation says for THIS key — the observer's call
     const fee100 = await prisma.$transaction((tx) => feeForConfirmation(tx, keyId, "100"));
     check(fee100.toString() === "2.5", "C1. feeForConfirmation reads the key's client fee_bps (250) → 2.5 on 100", fee100.toString());
@@ -96,23 +96,23 @@ async function main() {
     const app = new Hono();
     app.route("/balance", balance);
     app.onError((err, c) => (err instanceof ApiError ? c.json(err.toBody(), err.status as 400) : c.json({ error: String(err) }, 500)));
-    // the key needs a plaintext: issue one on the same client for the HTTP read
-    const reader = await issueKey({ clientId: p.client.id, name: "reader", scopes: ["balance.read"], environment: "test", issuedBy: "verify", issuedVia: "cli" });
-    // same client, different key: its OWN position is zero (per key)
-    const res = await app.request("/balance", { headers: { authorization: `Bearer ${reader.plaintext}` } });
-    const rb = (await res.json()) as Record<string, unknown>;
-    const want0 = { object: "balance", currency: "USDT", chains: { TRC20: { available: "0", pending: "0" }, BEP20: { available: "0", pending: "0" } }, fee_bps: 250 };
-    check(res.status === 200 && JSON.stringify(rb) === JSON.stringify(want0), "C2. GET /balance renders the contract object; per KEY (a sibling key sees 0)", JSON.stringify(rb));
-
     // the funded key, read over HTTP (its plaintext came back once from provisioning)
-    const getBalance = async () => (await (await app.request("/balance", { headers: { authorization: `Bearer ${p.key.plaintext}` } })).json()) as { chains?: Record<string, { available: string }>; fee_bps?: number };
+    const getBalance = async (plaintext = p.key.plaintext) => (await (await app.request("/balance", { headers: { authorization: `Bearer ${plaintext}` } })).json()) as { chains?: Record<string, { available: string }>; fee_bps?: number };
     const body = await getBalance();
     const want = { object: "balance", currency: "USDT", chains: { TRC20: { available: "97.5", pending: "7" }, BEP20: { available: "7", pending: "0" } }, fee_bps: 250 };
-    check(JSON.stringify(body) === JSON.stringify(want), "C3. available = confirmed − stamped fee − consuming withdrawals; pending = detected, gross; cancelled not counted", JSON.stringify(body));
+    check(JSON.stringify(body) === JSON.stringify(want), "C3. GET /balance is the contract object: available = confirmed − stamped fee − consuming withdrawals; pending = detected, gross; cancelled not counted", JSON.stringify(body));
+    // C2. per CLIENT (A6): a rotated-in key of the SAME client sees the same balance; another client sees 0
+    const sibling = await issueKey({ clientId: p.client.id, name: "rotated-in", scopes: ["balance.read"], environment: "test", issuedBy: "verify", issuedVia: "cli" });
+    const other = await provisionClientKey({ clientName: `${name}-other`, kind: "merchant", keyName: "gw", scopes: ["balance.read"], issuedBy: "verify", environment: "test" });
+    made.push(other.client.id);
+    const sib = await getBalance(sibling.plaintext);
+    const oth = await getBalance(other.key.plaintext);
+    const want0 = { object: "balance", currency: "USDT", chains: { TRC20: { available: "0", pending: "0" }, BEP20: { available: "0", pending: "0" } }, fee_bps: 0 };
+    check(JSON.stringify(sib) === JSON.stringify(want) && JSON.stringify(oth) === JSON.stringify(want0), "C2. balance is per CLIENT: a second key of the same client sees the same numbers; another client sees 0", `sibling=${JSON.stringify(sib.chains)} other=${JSON.stringify(oth.chains)}`);
     const pos = await read(keyId);
-    const byChain = await readByChain(keyId);
+    const byChain = await readClientByChain(p.client.id);
     const sum = byChain.TRC20.available.plus(byChain.BEP20.available);
-    check(pos.fees?.toString() === "2.5" && pos.allowance.toString() === "104.5" && sum.equals(pos.allowance), "C4. the withdrawal bound read() = Σ per-chain available (104.5): display and charge are one number", `fees=${pos.fees} allowance=${pos.allowance} Σavailable=${sum}`);
+    check(pos.fees?.toString() === "2.5" && pos.allowance.toString() === "104.5" && sum.equals(pos.allowance), "C4. the per-key withdrawal bound read() = Σ per-chain client available (104.5; the only funded key): same rows, one number", `fees=${pos.fees} allowance=${pos.allowance} Σavailable=${sum}`);
 
     // C5. changing fee_bps later never rewrites a stamped fee
     await applyTerms(p.client.id, { feeBps: 5000 }, "verify");
@@ -126,7 +126,7 @@ async function main() {
     check(exact.name === "NO THROW", "C7. exactly received − fees − withdrawn (104.5) is allowed", exact.name);
 
     // ── D. disable-address (§9 step 0) ──────────────────────────────────
-    const target = await prisma.address.create({ data: { keyId, chain: "TRC20", reference: `verify:g6:legacy:${RUN}`, address: `TG6disable${RUN}${"x".repeat(20)}`, derivationIndex: nextIndex(), legacyImport: true }, select: { id: true, address: true } });
+    const target = await prisma.address.create({ data: { keyId, clientId: p.client.id, chain: "TRC20", reference: `verify:g6:legacy:${RUN}`, address: `TG6disable${RUN}${"x".repeat(20)}`, derivationIndex: nextIndex(), legacyImport: true }, select: { id: true, address: true } });
     const addrCount0 = await prisma.address.count();
     const dry = await disableAddress(prisma, { address: target.address, apply: false });
     const afterDry = await prisma.address.findUniqueOrThrow({ where: { id: target.id }, select: { watchDisabledAt: true } });
@@ -162,6 +162,42 @@ async function main() {
       const relative = await backupProblem(prisma, "backup.dump");
       check(fresh === null && /predates the last hand-run write/.test(stale ?? "") && /does not exist/.test(missing ?? "") && /not absolute/.test(relative ?? ""), "D8. backup gate: fresh passes; older than the last ops/cli write, missing, or relative is refused", JSON.stringify({ fresh, stale, missing, relative }));
     }
+
+    // ── E. schema: A7 / G3 uniqueness + the migration's backfill SQL ─────
+    const p2002 = (r: { err?: unknown }) => r.err instanceof Prisma.PrismaClientKnownRequestError && r.err.code === "P2002";
+    const ref = `verify:g6:dup:${RUN}`;
+    await prisma.address.create({ data: { keyId, clientId: p.client.id, chain: "BEP20", reference: ref, address: `0xG6dupA${RUN}`, derivationIndex: nextIndex() } });
+    const dupAddr = await thrown(() => prisma.address.create({ data: { keyId: sibling.id, clientId: p.client.id, chain: "BEP20", reference: ref, address: `0xG6dupB${RUN}`, derivationIndex: nextIndex() } }));
+    const otherChain = await thrown(() => prisma.address.create({ data: { keyId, clientId: p.client.id, chain: "TRC20", reference: ref, address: `TG6dupC${RUN}`, derivationIndex: nextIndex() } }));
+    check(p2002(dupAddr) && otherChain.name === "NO THROW", "E1. UNIQUE(client_id, chain, reference) on addresses: same client+chain+reference refused (even from another key); other chain allowed", `${dupAddr.name}/${otherChain.name}`);
+    const piAddr = async () => (await prisma.address.create({ data: { keyId, clientId: p.client.id, chain: "TRC20", reference: `verify:g6:pi:${RUN}:${nextIndex()}`, address: `TG6pi${RUN}${nextIndex()}`, derivationIndex: nextIndex() }, select: { id: true } })).id;
+    const pi = (id: string, addressId: string) => prisma.paymentIntent.create({ data: { id, clientId: p.client.id, keyId, addressId, chain: "TRC20", amount: new Prisma.Decimal("5"), reference: `store:${RUN}`, expiresAt: new Date(Date.now() + 3_600_000) } });
+    await pi(`pi_g6a${RUN}`, await piAddr());
+    const dupPi = await thrown(async () => pi(`pi_g6b${RUN}`, await piAddr()));
+    check(p2002(dupPi), "E2. UNIQUE(client_id, reference) on payment_intents: a second intent with the same reference is refused", dupPi.name);
+    const dl = () => prisma.webhookDelivery.create({ data: { keyId, clientId: p.client.id, eventType: "deposit.confirmed", eventId: `evt_g6${RUN}`, payload: {} } });
+    await dl();
+    const dupDl = await thrown(dl);
+    check(p2002(dupDl), "E3. UNIQUE(key_id, event_id) on webhook_deliveries: a second delivery series for one event+key is refused", dupDl.name);
+    const ev = (id: string) => prisma.event.create({ data: { id, clientId: p.client.id, keyId, type: "payment_intent.succeeded", objectKind: "payment_intent", objectId: `pi_g6a${RUN}`, snapshot: { id: `pi_g6a${RUN}` } } });
+    await ev(`evt_g6a${RUN}`);
+    const dupEv = await thrown(() => ev(`evt_g6b${RUN}`));
+    check(p2002(dupEv), "E4. UNIQUE(object_id, type) on events: a second payment_intent.succeeded for one intent is refused", dupEv.name);
+
+    // E5. the migration's OWN backfill statements (read from the file, not retyped) fill client_id from the key
+    const { readFileSync } = await import("node:fs");
+    const sql = readFileSync(new URL("../prisma/migrations/20260925000000_phase0/migration.sql", import.meta.url), "utf8");
+    const updates = sql.split("\n").filter((l) => l.startsWith("UPDATE \""));
+    const nullAddr = await prisma.address.create({ data: { keyId, chain: "BEP20", reference: `verify:g6:null:${RUN}`, address: `0xG6null${RUN}`, derivationIndex: nextIndex() }, select: { id: true } });
+    const nullDep = await prisma.deposit.create({ data: { keyId, addressId: nullAddr.id, chain: "BEP20", txHash: `g6-null-${RUN}`, amount: new Prisma.Decimal("1") }, select: { id: true } });
+    const nullDl = await prisma.webhookDelivery.create({ data: { keyId, eventType: "deposit.confirmed", eventId: `evt_g6null${RUN}`, payload: {} }, select: { id: true } });
+    for (const u of updates) await prisma.$executeRawUnsafe(u);
+    const [fa, fd, fw] = await Promise.all([
+      prisma.address.findUniqueOrThrow({ where: { id: nullAddr.id }, select: { clientId: true } }),
+      prisma.deposit.findUniqueOrThrow({ where: { id: nullDep.id }, select: { clientId: true } }),
+      prisma.webhookDelivery.findUniqueOrThrow({ where: { id: nullDl.id }, select: { clientId: true } }),
+    ]);
+    check(updates.length === 3 && fa.clientId === p.client.id && fd.clientId === p.client.id && fw.clientId === p.client.id, "E5. the migration file's 3 backfill UPDATEs set client_id from client_keys on addresses, deposits, webhook_deliveries", `updates=${updates.length} ${fa.clientId}/${fd.clientId}/${fw.clientId}`);
   } finally {
     // Fixtures stay on the disposable cluster; it is discarded with the run.
     console.log(`fixture clients: ${made.join(",")}`);
