@@ -104,20 +104,20 @@ async function main() {
     const want0 = { object: "balance", currency: "USDT", chains: { TRC20: { available: "0", pending: "0" }, BEP20: { available: "0", pending: "0" } }, fee_bps: 250 };
     check(res.status === 200 && JSON.stringify(rb) === JSON.stringify(want0), "C2. GET /balance renders the contract object; per KEY (a sibling key sees 0)", JSON.stringify(rb));
 
-    // the funded key, read through the same function the route renders
-    const { balanceBody } = await import("@/http/routes/balance.js");
-    const body = await balanceBody(keyId, p.client.id);
+    // the funded key, read over HTTP (its plaintext came back once from provisioning)
+    const getBalance = async () => (await (await app.request("/balance", { headers: { authorization: `Bearer ${p.key.plaintext}` } })).json()) as { chains?: Record<string, { available: string }>; fee_bps?: number };
+    const body = await getBalance();
     const want = { object: "balance", currency: "USDT", chains: { TRC20: { available: "97.5", pending: "7" }, BEP20: { available: "7", pending: "0" } }, fee_bps: 250 };
     check(JSON.stringify(body) === JSON.stringify(want), "C3. available = confirmed − stamped fee − consuming withdrawals; pending = detected, gross; cancelled not counted", JSON.stringify(body));
     const pos = await read(keyId);
     const byChain = await readByChain(keyId);
     const sum = byChain.TRC20.available.plus(byChain.BEP20.available);
-    check(pos.fees.toString() === "2.5" && pos.allowance.toString() === "104.5" && sum.equals(pos.allowance), "C4. the withdrawal bound read() = Σ per-chain available (104.5): display and charge are one number", `fees=${pos.fees} allowance=${pos.allowance} Σavailable=${sum}`);
+    check(pos.fees?.toString() === "2.5" && pos.allowance.toString() === "104.5" && sum.equals(pos.allowance), "C4. the withdrawal bound read() = Σ per-chain available (104.5): display and charge are one number", `fees=${pos.fees} allowance=${pos.allowance} Σavailable=${sum}`);
 
     // C5. changing fee_bps later never rewrites a stamped fee
     await applyTerms(p.client.id, { feeBps: 5000 }, "verify");
-    const body5 = await balanceBody(keyId, p.client.id);
-    check(body5.chains.TRC20?.available === "97.5" && body5.fee_bps === 5000, "C5. fee_bps 250 → 5000 afterwards: the TRC20 available stays 97.5; fee_bps shows the new rate", JSON.stringify(body5));
+    const body5 = await getBalance();
+    check(body5.chains?.TRC20?.available === "97.5" && body5.fee_bps === 5000, "C5. fee_bps 250 → 5000 afterwards: the TRC20 available stays 97.5; fee_bps shows the new rate", JSON.stringify(body5));
 
     // C6. reserve honours the fee: 104.500001 refused, 104.5 accepted
     const over = await thrown(() => prisma.$transaction((tx) => reserve(tx, { keyId, amount: "104.500001", idempotencyKey: `g6-r1-${RUN}`, toAddress: "0xdest", chain: "BEP20" })));
@@ -126,7 +126,7 @@ async function main() {
     check(exact.name === "NO THROW", "C7. exactly received − fees − withdrawn (104.5) is allowed", exact.name);
 
     // ── D. disable-address (§9 step 0) ──────────────────────────────────
-    const target = await prisma.address.create({ data: { keyId, chain: "TRC20", reference: `verify:g6:legacy:${RUN}`, address: `TG6disable${RUN}`, derivationIndex: nextIndex(), legacyImport: true }, select: { id: true, address: true } });
+    const target = await prisma.address.create({ data: { keyId, chain: "TRC20", reference: `verify:g6:legacy:${RUN}`, address: `TG6disable${RUN}${"x".repeat(20)}`, derivationIndex: nextIndex(), legacyImport: true }, select: { id: true, address: true } });
     const addrCount0 = await prisma.address.count();
     const dry = await disableAddress(prisma, { address: target.address, apply: false });
     const afterDry = await prisma.address.findUniqueOrThrow({ where: { id: target.id }, select: { watchDisabledAt: true } });

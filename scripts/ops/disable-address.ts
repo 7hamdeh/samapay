@@ -71,7 +71,7 @@ export type DisableOutcome =
   | { outcome: "would_disable" | "disabled"; id: string; chain: string; derivationIndex: number; legacyImport: boolean; deposits: number; watchDisabledAt: Date | null };
 
 /** The whole operation. `apply=false` reads only. With apply, one transaction: a guarded UPDATE (watch_disabled_at IS NULL) + one audit row. */
-export async function disableAddress(db: PrismaClient, args: { address: string; apply: boolean; by?: string; reason?: string }): Promise<DisableOutcome> {
+export async function disableAddress(db: PrismaClient, args: { address: string; apply: boolean; by?: string | undefined; reason?: string | undefined }): Promise<DisableOutcome> {
   const { appendAudit } = await import("@/audit/append.js");
   const rows = await db.address.findMany({ where: { address: args.address }, select: { id: true, chain: true, keyId: true, derivationIndex: true, legacyImport: true, watchDisabledAt: true, _count: { select: { deposits: true } } } });
   if (rows.length === 0) return { outcome: "not_found" };
