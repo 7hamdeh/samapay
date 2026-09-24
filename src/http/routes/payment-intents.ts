@@ -13,18 +13,15 @@ import { Prisma, type Chain, type PaymentIntentStatus } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import { logger } from "@/log.js";
 import { getChainConfig } from "@/chain/impl/config.js";
-import { computeIntentState } from "@/intents/state.js";
+import { createIntent, INTENT_SELECT, renderPaymentIntent, type IntentRow } from "@/intents/index.js";
 import { bearerAuth, scope } from "../auth.js";
 import { ApiError, fieldsOf } from "../errors.js";
 import { idempotent } from "../idempotency.js";
 
-// ── G2's interface (plan §Interfaces), injected so this file never waits on it ──
+// ── G2's createIntent (src/intents); replaceable only so the verify script can inject a fake ──
 export interface CreateIntentInput { amount: string; chain: Chain; reference: string; expiresInSec: number }
 export type CreateIntentFn = (clientId: string, keyId: string, input: CreateIntentInput) => Promise<{ id: string }>;
-let createIntentImpl: CreateIntentFn = async () => {
-  // Wired at integration to `createIntent` from @/intents. Until then nothing can be created.
-  throw Object.assign(new Error("createIntent is not wired"), { name: "DerivationUnavailable" });
-};
+let createIntentImpl: CreateIntentFn = createIntent;
 /** Wiring point for G2's createIntent (and for the verify script's fake). */
 export function setCreateIntent(fn: CreateIntentFn): void { createIntentImpl = fn; }
 
@@ -49,14 +46,7 @@ const ListQuery = z.object({
   starting_after: z.string().min(1).max(64).optional(),
 });
 
-// ── Rendering ──
-const INTENT_SELECT = {
-  id: true, clientId: true, status: true, amount: true, chain: true, reference: true,
-  expiresAt: true, createdAt: true, succeededAt: true, expiredAt: true,
-  address: { select: { address: true, deposits: { select: { txHash: true, amount: true, status: true, detectedAt: true, confirmations: true, feeAmount: true } } } },
-} as const;
-
-type IntentRow = NonNullable<Awaited<ReturnType<typeof readIntent>>>;
+// ── Rendering: G2's renderPaymentIntent — the SAME function the event snapshots use ──
 function readIntent(clientId: string, id: string) {
   return prisma.paymentIntent.findFirst({ where: { id, clientId }, select: INTENT_SELECT });
 }
@@ -66,20 +56,7 @@ function confirmationsRequired(chain: Chain): number {
   catch { throw new ApiError("chain_unavailable", `The ${chain} chain configuration is unavailable.`); }
 }
 
-export function renderIntent(row: IntentRow): Record<string, unknown> {
-  // amount_received and tx_hashes come from THE one calculator (state.ts);
-  // nothing here sums deposits a second way.
-  const state = computeIntentState({ amount: row.amount, expiresAt: row.expiresAt, current: row.status, deposits: row.address.deposits, now: new Date() });
-  const fee = row.address.deposits.filter((d) => d.status === "confirmed").reduce((s, d) => s.plus(d.feeAmount), new Prisma.Decimal(0));
-  return {
-    id: row.id, object: "payment_intent", status: row.status,
-    amount: row.amount.toFixed(), amount_received: state.amountReceived.toFixed(), fee_amount: fee.toFixed(), currency: "USDT",
-    chain: row.chain, address: row.address.address, reference: row.reference,
-    tx_hashes: state.txHashes, confirmations_required: confirmationsRequired(row.chain),
-    expires_at: row.expiresAt.toISOString(), created_at: row.createdAt.toISOString(),
-    succeeded_at: row.succeededAt?.toISOString() ?? null, expired_at: row.expiredAt?.toISOString() ?? null,
-  };
-}
+function renderIntent(row: IntentRow) { return renderPaymentIntent(row, confirmationsRequired(row.chain)); }
 
 async function existingForReference(clientId: string, reference: string, amount: string, chain: Chain): Promise<IntentRow | null> {
   const row = await prisma.paymentIntent.findFirst({ where: { clientId, reference }, select: INTENT_SELECT });

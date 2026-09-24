@@ -1,8 +1,6 @@
 // GET /v1/deposits (+ /:id) — the "+" side, read-only. Contract §4/§5: Deposit
 // objects in a {object:"list"} envelope, owned by the CLIENT (any of its keys,
 // v1.1 A6 — reachable after a rotation), 404 for unknown and foreign ids alike.
-// An intent's address carries reference "payment_intent:<pi>" (G2), so a
-// deposit to it reports the INTENT's reference, the store's own id.
 // Only `confirmed` rows count toward an allowance; `detected` is shown so a
 // client can see money on its way, labelled as such.
 import { Hono } from "hono";
@@ -10,24 +8,14 @@ import { z } from "zod";
 import { prisma } from "@/db/client.js";
 import { bearerAuth, scope } from "../auth.js";
 import { ApiError, fieldsOf } from "../errors.js";
+import { DEPOSIT_RENDER_SELECT, parseDepositId, renderDeposit } from "@/render/deposit.js";
 
-// ── /v1 ──
-const DEPOSIT_SELECT = {
-  id: true, chain: true, txHash: true, amount: true, confirmations: true, status: true, detectedAt: true, creditedAt: true,
-  address: { select: { reference: true, address: true, intent: { select: { id: true, reference: true } } } },
-} as const;
-type DepositRow = NonNullable<Awaited<ReturnType<typeof readDeposit>>>;
-function readDeposit(clientId: string, id: string) {
-  return prisma.deposit.findFirst({ where: { id, key: { clientId } }, select: DEPOSIT_SELECT });
-}
-
-export function renderDeposit(d: DepositRow): Record<string, unknown> {
-  return {
-    id: d.id, object: "deposit", status: d.status, chain: d.chain, tx_hash: d.txHash, amount: d.amount.toFixed(),
-    confirmations: d.confirmations, address: d.address.address, reference: d.address.intent?.reference ?? d.address.reference,
-    payment_intent_id: d.address.intent?.id ?? null,
-    detected_at: d.detectedAt.toISOString(), confirmed_at: d.creditedAt?.toISOString() ?? null,
-  };
+// Rendering is src/render/deposit.ts — the SAME function the deposit.confirmed
+// snapshot uses. Ids on the wire are "dep_<row id>"; only that form is accepted.
+function readDeposit(clientId: string, publicId: string) {
+  const id = parseDepositId(publicId);
+  if (!id) return Promise.resolve(null);
+  return prisma.deposit.findFirst({ where: { id, key: { clientId } }, select: DEPOSIT_RENDER_SELECT });
 }
 
 const ListQuery = z.object({
@@ -53,7 +41,7 @@ deposits.get("/", scope("deposits.read"), async (c) => {
       // reference, or — for an intent address — the intent's.
       ...(reference || payment_intent_id ? { address: { ...(reference ? { OR: [{ reference }, { intent: { reference } }] } : {}), ...(payment_intent_id ? { intent: { id: payment_intent_id } } : {}) } } : {}),
     },
-    orderBy: [{ detectedAt: "asc" }, { id: "asc" }], take: limit + 1, select: DEPOSIT_SELECT,
+    orderBy: [{ detectedAt: "asc" }, { id: "asc" }], take: limit + 1, select: DEPOSIT_RENDER_SELECT,
   });
   return c.json({ object: "list", data: rows.slice(0, limit).map(renderDeposit), has_more: rows.length > limit }, 200);
 });

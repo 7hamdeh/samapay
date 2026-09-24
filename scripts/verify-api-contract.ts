@@ -45,6 +45,9 @@ async function main() {
   const { setCreateIntent = () => undefined } = await loadWiring("@/http/routes/payment-intents.js");
   const { setGetEvent = () => undefined } = await loadWiring("@/http/routes/events.js");
   const { setHealthReaders = () => undefined } = (await loadWiring("@/http/routes/health.js")) as { setHealthReaders?: (r: Record<string, () => Promise<unknown>>) => void };
+  // /health's observer-lag reader reads a live chain head: replaced BEFORE any
+  // request, so this suite never reaches an RPC endpoint.
+  setHealthReaders({ observerLagBlocks: async () => ({ TRC20: null, BEP20: null }) });
   // chain double for POST /addresses: deterministic, never a real derivation
   let deriverDown = false; let deriveDelayMs = 0;
   setChainAdapters({ deriver: { async deriveNext(chain) { if (deriverDown) throw new ChainUnavailable("verify"); if (deriveDelayMs) await sleep(deriveDelayMs); const i = nextIndex++; return { chain, address: `AVERIFY${RUN}${i}`, derivationIndex: i }; } } });
@@ -248,14 +251,16 @@ async function main() {
     const piRow = await prisma.paymentIntent.findUniqueOrThrow({ where: { id: String(pi.id) }, select: { addressId: true, keyId: true } });
     const dep1 = await prisma.deposit.create({ data: { keyId: piRow.keyId, addressId: piRow.addressId, chain: "TRC20", txHash: `tx${RUN}a`, amount: new Prisma.Decimal("5"), confirmations: 20, status: "confirmed", creditedAt: new Date(), feeAmount: new Prisma.Decimal("0.05") } });
     const dep2 = await prisma.deposit.create({ data: { keyId: piRow.keyId, addressId: piRow.addressId, chain: "TRC20", txHash: `tx${RUN}b`, amount: new Prisma.Decimal("1.25"), confirmations: 2, status: "detected" } });
-    const d1 = await call("GET", `/v1/deposits/${dep1.id}`, A.plaintext);
+    const d1 = await call("GET", `/v1/deposits/dep_${dep1.id}`, A.plaintext);
     const d = d1.json;
-    check(d1.status === 200 && d.object === "deposit" && d.status === "confirmed" && d.amount === "5" && d.tx_hash === `tx${RUN}a` && d.payment_intent_id === pi.id && d.reference === `store-${RUN}-2` && typeof d.confirmed_at === "string" && typeof d.detected_at === "string",
+    check(d1.status === 200 && d.id === `dep_${dep1.id}` && d.object === "deposit" && d.status === "confirmed" && d.amount === "5" && d.tx_hash === `tx${RUN}a` && d.payment_intent_id === pi.id && d.reference === `store-${RUN}-2` && typeof d.confirmed_at === "string" && typeof d.detected_at === "string",
       "§4 GET /deposits/:id renders a Deposit with payment_intent_id", JSON.stringify(d));
-    const dA2 = await call("GET", `/v1/deposits/${dep1.id}`, A2.plaintext);
-    check(dA2.status === 200 && dA2.json.id === dep1.id, "A6 another key of the SAME client reads the deposit (reachable after rotation)", `${dA2.status}`);
-    const d2 = await call("GET", `/v1/deposits/${dep1.id}`, B.plaintext);
+    const dA2 = await call("GET", `/v1/deposits/dep_${dep1.id}`, A2.plaintext);
+    check(dA2.status === 200 && dA2.json.id === `dep_${dep1.id}`, "A6 another key of the SAME client reads the deposit (reachable after rotation)", `${dA2.status}`);
+    const d2 = await call("GET", `/v1/deposits/dep_${dep1.id}`, B.plaintext);
     const d3 = await call("GET", `/v1/deposits/nope_${RUN}`, B.plaintext);
+    const dUnprefixed = await call("GET", `/v1/deposits/${dep1.id}`, A.plaintext);
+    check(dUnprefixed.status === 404 && dUnprefixed.code === "not_found", "§4 a deposit id is only ever dep_<row id>: the bare row id is 404 not_found", `${dUnprefixed.status}`);
     check(d2.status === 404 && d2.code === "not_found" && d3.status === 404, "§2 another client's deposit is 404, same as unknown", `${d2.status}/${d3.status}`);
     const dl = await call("GET", `/v1/deposits?payment_intent_id=${pi.id}`, A.plaintext);
     const dlB = await call("GET", `/v1/deposits?payment_intent_id=${pi.id}`, B.plaintext);
@@ -266,7 +271,7 @@ async function main() {
     const dls = await call("GET", `/v1/deposits?since=not-a-date`, A.plaintext);
     check(dls.status === 400 && dls.code === "validation_failed", "§5 GET /deposits?since=garbage is validation_failed", `${dls.status} ${dls.code}`);
     const NODEP = await iss(cA.id, "no-deposits", ["payment_intents.read"]);
-    const dro = await call("GET", `/v1/deposits/${dep1.id}`, NODEP.plaintext);
+    const dro = await call("GET", `/v1/deposits/dep_${dep1.id}`, NODEP.plaintext);
     check(dro.status === 403 && dro.json.error?.details?.required === "deposits.read", "§6 403 insufficient_scope — GET deposit without deposits.read", `${dro.status}`);
     const g4 = await call("GET", `/v1/payment-intents/${pi.id}`, A.plaintext);
     check(g4.json.amount_received === "5" && g4.json.fee_amount === "0.05" && JSON.stringify(g4.json.tx_hashes) === JSON.stringify([`tx${RUN}a`]),

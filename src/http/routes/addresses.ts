@@ -71,7 +71,7 @@ addresses.post("/", scope("addresses.write"), idempotent, async (c) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`address:${key.clientId}:${chain}:${reference}`}))`;
       const winner = await findExisting(key.clientId, chain as Chain, reference, tx);
       if (winner) return { ...winner, id: null };
-      const created = await tx.address.create({ data: { keyId: key.id, chain: chain as Chain, reference, address: derived.address, derivationIndex: derived.derivationIndex }, select: { id: true, chain: true, address: true, reference: true } });
+      const created = await tx.address.create({ data: { keyId: key.id, clientId: key.clientId, chain: chain as Chain, reference, address: derived.address, derivationIndex: derived.derivationIndex }, select: { id: true, chain: true, address: true, reference: true } });
       await appendAudit(tx, { keyId: key.id, actor: "client", action: "address.issued", subjectId: created.id, idempotencyKey: c.req.header("idempotency-key") ?? null, params: { chain, reference, derivationIndex: derived.derivationIndex } });
       return created;
     });
