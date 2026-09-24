@@ -46,8 +46,8 @@ async function main() {
   const { setGetEvent = () => undefined } = await loadWiring("@/http/routes/events.js");
   const { setHealthReaders = () => undefined } = (await loadWiring("@/http/routes/health.js")) as { setHealthReaders?: (r: Record<string, () => Promise<unknown>>) => void };
   // chain double for POST /addresses: deterministic, never a real derivation
-  let deriverDown = false;
-  setChainAdapters({ deriver: { async deriveNext(chain) { if (deriverDown) throw new ChainUnavailable("verify"); const i = nextIndex++; return { chain, address: `AVERIFY${RUN}${i}`, derivationIndex: i }; } } });
+  let deriverDown = false; let deriveDelayMs = 0;
+  setChainAdapters({ deriver: { async deriveNext(chain) { if (deriverDown) throw new ChainUnavailable("verify"); if (deriveDelayMs) await sleep(deriveDelayMs); const i = nextIndex++; return { chain, address: `AVERIFY${RUN}${i}`, derivationIndex: i }; } } });
   setCreateIntent(async (clientId: string, keyId: string, input: CreateIntentInput) => {
     createCalls++;
     if (createDelayMs) await sleep(createDelayMs);
@@ -218,8 +218,9 @@ async function main() {
     const conflictChain = await call("POST", "/v1/payment-intents", A.plaintext, { ...good, reference: `store-${RUN}-2`, chain: "BEP20" }, idem());
     check(conflict.status === 409 && conflict.code === "reference_conflict" && conflictChain.status === 409 && conflictChain.code === "reference_conflict" && createCalls === callsA7,
       "A7 same reference, different amount / chain → 409 reference_conflict, nothing created", `${conflict.status} ${conflict.code} / ${conflictChain.status} ${conflictChain.code}`);
-    const otherClientSameRef = await call("POST", "/v1/payment-intents", B.plaintext, { ...good, reference: `store-${RUN}-2`, amount: "13" }, idem());
-    check(otherClientSameRef.status === 201, "A7 the uniqueness is per CLIENT: another client may use the same reference", `${otherClientSameRef.status}`);
+    // B created its own store-2 above (p1other) while A held store-2: the uniqueness is per client.
+    const otherClientSameRef = await call("POST", "/v1/payment-intents", B.plaintext, { ...good, reference: `store-${RUN}-2` }, idem());
+    check(otherClientSameRef.status === 200 && otherClientSameRef.json.id === p1other.json.id && p1other.json.id !== pi.id, "A7 the uniqueness is per CLIENT: B's store-2 is B's own intent, not A's", `${otherClientSameRef.status}`);
 
     // ── list (a dedicated client, so the count is exact) ──
     const cL = await prisma.client.create({ data: { name: `verify-api-L-${RUN}`, kind: "merchant" } }); made.clients.push(cL.id);
@@ -340,10 +341,12 @@ async function main() {
     deriverDown = false;
     check(ad9.status === 503 && ad9.code === "derivation_unavailable", "§6 503 derivation_unavailable — POST /addresses with no deriver; nothing created", `${ad9.status} ${ad9.code}`);
     const kAd = idem();
+    deriveDelayMs = 500; // both requests pass the pre-check before either writes
     const [ra, rb] = await Promise.all([
       call("POST", "/v1/addresses", A.plaintext, { chain: "BEP20", reference: `samaprime:m${RUN}:user:race` }, kAd),
       call("POST", "/v1/addresses", A2.plaintext, { chain: "BEP20", reference: `samaprime:m${RUN}:user:race` }, idem()),
     ]);
+    deriveDelayMs = 0;
     const raceRows = await prisma.address.count({ where: { reference: `samaprime:m${RUN}:user:race` } });
     check(ra.json.address === rb.json.address && raceRows === 1 && [ra.status, rb.status].sort().join() === "200,201",
       "A7 two concurrent POST /addresses for one (client, chain, reference) → ONE address, one 201 + one 200 (per-reference advisory lock; G6 UNIQUE is the backstop)", `${ra.status}/${rb.status} rows=${raceRows}`);

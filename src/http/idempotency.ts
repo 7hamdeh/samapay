@@ -6,7 +6,7 @@
 //   claim            fast INSERT of a `processing` row; work happens OUTSIDE any
 //                    long transaction (Stripe's shape; Prisma's 5 s interactive
 //                    transaction timeout is why)
-//   replay same hash -> the stored status + body, header Idempotent-Replayed: true
+//   replay same hash -> the stored status + body (byte-identical), header Idempotent-Replayed: true
 //   replay diff hash -> 409 idempotency_payload_mismatch
 //   in progress      -> 409 idempotency_in_progress (stale locks reclaimed after 90 s)
 //   5xx              -> row `failed`: the same key may retry (nothing was created)
@@ -73,6 +73,12 @@ export const idempotent: MiddlewareHandler = async (c, next) => {
       throw new ApiError("idempotency_payload_mismatch", "This Idempotency-Key was already used with a different request body.");
     } else if (existing.status === "completed" && existing.statusCode !== null) {
       c.header("Idempotent-Replayed", "true");
+      // Stored as the RAW response text (a JSON string value), so the replay
+      // is byte-identical — jsonb would re-order the keys of an object.
+      // Rows written before that change hold the parsed object.
+      if (typeof existing.responseBody === "string") {
+        return c.body(existing.responseBody, existing.statusCode as 200, { "Content-Type": "application/json; charset=UTF-8" });
+      }
       return c.json(existing.responseBody as Record<string, unknown>, existing.statusCode as 200);
     } else if (existing.status === "processing" && now.getTime() - existing.lockedAt.getTime() < STALE_LOCK_MS) {
       throw inProgress();
@@ -99,11 +105,9 @@ export const idempotent: MiddlewareHandler = async (c, next) => {
   // RECORD the final state; a 5xx is `failed` (retryable), everything else `completed`.
   const status = response.status;
   const text = await response.clone().text();
-  let json: Prisma.InputJsonValue = {};
-  try { json = JSON.parse(text) as Prisma.InputJsonValue; } catch { json = { raw: text }; }
   await prisma.idempotencyKey.update({
     where,
-    data: status >= 500 ? { status: "failed" } : { status: "completed", statusCode: status, responseBody: json },
+    data: status >= 500 ? { status: "failed" } : { status: "completed", statusCode: status, responseBody: text },
   });
 };
 
