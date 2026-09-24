@@ -16,13 +16,17 @@
 //          4 apply writes every row exactly (key, reference, legacy_import)
 //          5 a second run writes 0 (idempotent)
 //          6 an existing row that differs is refused, never overwritten
-// Handoff: 7 a cursor file missing a chain is refused, nothing written
-//          8 a target below a legacy deposit SamaPay already recorded (backwards
-//            past existing data) is refused on BOTH chains
+// Handoff (contract v1.1 A2: cursor = MIN(SamaPay cursor, MNTAD final − depth)):
+//          H0 the MIN rule as a pure function
+//          7 a cursor file missing a chain (or with an extra key) is refused
+//          8 a target below a legacy deposit SamaPay already recorded (rewinding
+//            past existing legacy history) is refused on BOTH chains
 //          9 dry run writes nothing
-//         10 apply sets scan_cursors EXACTLY to the file's blocks (+ stamp)
-//         11 re-run with the same file is a no-op; a different block refused
+//         10 apply: a cursor AHEAD moves back to the MIN, one BEHIND stays;
+//            legacy_watch_enabled_at stamped on both, one transaction
+//         11 re-run from the saved file: no change (also after the observer moved)
 //         12 importing NEW legacy rows after the handoff is refused
+//         13 the import leaves watch_disabled_at NULL
 import crypto from "node:crypto";
 process.env.SEED_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
 process.env.SAMAPAY_DERIVATION_FLOOR_TRC20 = "1000";
@@ -38,6 +42,7 @@ import { assertSandboxDatabase } from "@/db/guard.js";
 import { prisma } from "@/db/client.js";
 import { saveMasterSeedConfig } from "@/chain/seed/master-seed.js";
 import { deriveAddress } from "@/chain/hd/derive.js";
+import { getChainConfig } from "@/chain/impl/config.js";
 import { check, summary } from "./lib/check.js";
 
 const RUN = Date.now().toString(36);
@@ -123,43 +128,59 @@ async function main() {
   r = run(IMPORT, [`--in=${goodFile}`, `--key=${mA}:${keyB.id}`, `--key=${mB}:${keyB.id}`, "--apply"]);
   check(r.code === 3 && /differs/.test(r.out) && JSON.stringify(await legacyRows()) === JSON.stringify(want), "6. re-import under a DIFFERENT key is REFUSED and no row changed", `exit ${r.code}`);
 
-  // ── handoff ──────────────────────────────────────────────────────────────
-  // SamaPay's own observer has been running: TRC20 cursor ahead of MNTAD's stop.
+  // ── handoff (contract v1.1 A2) ───────────────────────────────────────────
+  // target(chain) = MIN(SamaPay cursor, MNTAD final − SamaPay confirmation depth):
+  // only BACK or stay. Depth read from getChainConfig, the observer's own source.
+  const d = { TRC20: BigInt(getChainConfig("TRC20").confirmationsRequired), BEP20: BigInt(getChainConfig("BEP20").confirmationsRequired) };
+  // Imported dynamically so the import half still runs (and reports) when the module is absent.
+  const handoffTarget = await import("@/chain/cursor.js").then((m) => m.handoffTarget).catch(() => null);
+  check(handoffTarget !== null && handoffTarget(700n, 653n, 3n) === 650n && handoffTarget(500n, 800n, 3n) === 500n && handoffTarget(null, 800n, 3n) === 797n && handoffTarget(null, 2n, 3n) === 0n,
+    "H0. handoffTarget = MIN(current, mntad − depth); no SamaPay cursor → mntad − depth; never below 0");
+  // SamaPay's observer has been running: TRC20 AHEAD of MNTAD's stop, BEP20 BEHIND it.
   await prisma.scanCursor.create({ data: { chain: "TRC20", lastScannedBlock: 700n } });
+  await prisma.scanCursor.create({ data: { chain: "BEP20", lastScannedBlock: 500n } });
   const legacyTrc = await prisma.address.findFirstOrThrow({ where: { chain: "TRC20", legacyImport: true }, select: { id: true, keyId: true } });
   await prisma.deposit.create({ data: { keyId: legacyTrc.keyId, addressId: legacyTrc.id, chain: "TRC20", txHash: `vlh-${RUN}`, amount: "1", blockNumber: 600n } });
+  const stoppedAt = "2026-09-24T12:00:00.000Z";
+  const initial = JSON.stringify({ BEP20: { block: "500", stamped: false }, TRC20: { block: "700", stamped: false } });
+  const snap = async () => { const c = await cursors(); return JSON.stringify({ BEP20: c.BEP20, TRC20: c.TRC20 }); };
 
-  // 7. missing chain
-  const before7 = JSON.stringify(await cursors());
-  r = run(WATCH, [`--cursors=${file("c-missing.json", { TRC20: 650, stoppedAt: "2026-09-24T12:00:00.000Z" })}`, "--apply"]);
-  check(r.code === 3 && /no BEP20/.test(r.out) && JSON.stringify(await cursors()) === before7, "7. a cursor file without BEP20 is REFUSED, cursors unchanged", `exit ${r.code}`);
-  r = run(WATCH, [`--cursors=${file("c-extra.json", { TRC20: 650, BEP20: 800, stoppedAt: "2026-09-24T12:00:00.000Z", ETH: 1 })}`, "--apply"]);
-  check(r.code === 3 && JSON.stringify(await cursors()) === before7, "7b. a cursor file with an extra key is REFUSED (shape is exact)", `exit ${r.code}`);
+  // 7. file shape
+  r = run(WATCH, [`--cursors=${file("c-missing.json", { TRC20: 653, stoppedAt })}`, "--apply"]);
+  check(r.code === 3 && /no BEP20/.test(r.out) && (await snap()) === initial, "7. a cursor file without BEP20 is REFUSED, cursors unchanged", `exit ${r.code}`);
+  r = run(WATCH, [`--cursors=${file("c-extra.json", { TRC20: 653, BEP20: 800, stoppedAt, ETH: 1 })}`, "--apply"]);
+  check(r.code === 3 && (await snap()) === initial, "7b. a cursor file with an extra key is REFUSED (shape is exact)", `exit ${r.code}`);
 
-  // 8. backwards past existing SamaPay data
-  r = run(WATCH, [`--cursors=${file("c-back.json", { TRC20: 599, BEP20: 800, stoppedAt: "2026-09-24T12:00:00.000Z" })}`, "--apply"]);
-  check(r.code === 3 && /backwards/.test(r.out) && JSON.stringify(await cursors()) === before7, "8. TRC20 599 < a legacy deposit SamaPay recorded at 600: REFUSED, and BEP20 NOT set either (one transaction)", `exit ${r.code}`);
+  // 8. rewinding below recorded legacy history
+  r = run(WATCH, [`--cursors=${file("c-back.json", { TRC20: Number(599n + d.TRC20), BEP20: 800, stoppedAt })}`, "--apply"]);
+  check(r.code === 3 && /backwards/.test(r.out) && (await snap()) === initial, "8. TRC20 target 599 < a legacy deposit SamaPay recorded at 600: REFUSED, and BEP20 NOT touched either (one transaction)", `exit ${r.code}`);
 
   // 9. dry run
-  const cFile = file("cursors.json", { TRC20: 650, BEP20: 800, stoppedAt: "2026-09-24T12:00:00.000Z" });
+  const cFile = file("cursors.json", { TRC20: Number(650n + d.TRC20), BEP20: 800, stoppedAt });
   r = run(WATCH, [`--cursors=${cFile}`]);
-  check(r.code === 0 && /WOULD SET cursor 700 -> 650; re-scan 50/.test(r.out) && JSON.stringify(await cursors()) === before7, "9. dry run prints the rewind (700 -> 650, 50 blocks) and writes nothing", `exit ${r.code}`);
+  check(r.code === 0 && /TRC20: WOULD SET cursor 700 -> 650; re-scan 50/.test(r.out) && (await snap()) === initial, "9. dry run prints the rewind (TRC20 700 -> 650, 50 blocks) and writes nothing", `exit ${r.code}`);
 
-  // 10. apply: exactly
+  // 10. apply: ahead moves back to the MIN, behind stays, both stamped
   r = run(WATCH, [`--cursors=${cFile}`, "--apply"]);
-  const after = await cursors();
-  check(r.code === 0 && JSON.stringify(after) === JSON.stringify({ TRC20: { block: "650", stamped: true }, BEP20: { block: "800", stamped: true } }), "10. --apply sets scan_cursors EXACTLY to TRC20 650 / BEP20 800 and stamps legacy watch on both", JSON.stringify(after));
+  const after = await snap();
+  check(r.code === 0 && after === JSON.stringify({ BEP20: { block: "500", stamped: true }, TRC20: { block: "650", stamped: true } }),
+    "10. --apply: TRC20 (ahead) moves BACK to MNTAD 653 − depth = 650; BEP20 (behind, 500 < 797) STAYS at 500; legacy watch stamped on both", after);
 
-  // 11. once
+  // 11. re-runnable from the saved file, no change — also after the observer moved on
   r = run(WATCH, [`--cursors=${cFile}`, "--apply"]);
-  check(r.code === 0 && /ALREADY DONE/.test(r.out) && JSON.stringify(await cursors()) === JSON.stringify(after), "11. the same file again is a no-op", `exit ${r.code}`);
-  r = run(WATCH, [`--cursors=${file("c-other.json", { TRC20: 660, BEP20: 800, stoppedAt: "2026-09-24T12:00:00.000Z" })}`, "--apply"]);
-  check(r.code === 3 && /already enabled/.test(r.out) && JSON.stringify(await cursors()) === JSON.stringify(after), "11b. a different block after the handoff is REFUSED", `exit ${r.code}`);
+  check(r.code === 0 && /ALREADY ENABLED/.test(r.out) && (await snap()) === after, "11. the same file again: no change", `exit ${r.code}`);
+  await prisma.scanCursor.update({ where: { chain: "TRC20" }, data: { lastScannedBlock: 900n } });
+  const moved = await snap();
+  r = run(WATCH, [`--cursors=${cFile}`, "--apply"]);
+  check(r.code === 0 && (await snap()) === moved, "11b. re-run after the observer advanced to 900: no rewind, no change", `exit ${r.code}`);
 
   // 12. import after the handoff
   const extra = [...good, { chain: "TRC20" as Chain, address: deriveAddress(seed, "TRC20", 50), derivationIndex: 50, userId: "u9", merchantId: mA }];
   r = run(IMPORT, [`--in=${file("late.json", extra)}`, ...keys, "--apply"]);
   check(r.code === 3 && /already started/.test(r.out) && (await legacyRows()).length === 6, "12. a NEW legacy row after the handoff is REFUSED", `exit ${r.code}`);
+
+  // 13. the import never sets watch_disabled_at (reserved for explicit disables)
+  check((await prisma.address.count({ where: { legacyImport: true, watchDisabledAt: { not: null } } })) === 0, "13. imported legacy rows carry watch_disabled_at NULL");
 }
 
 main()
