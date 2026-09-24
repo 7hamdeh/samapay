@@ -231,9 +231,12 @@ async function main() {
     ]);
     createDelayMs = 0;
     const createdForKc = await prisma.paymentIntent.count({ where: { clientId: cA.id, reference: `store-${RUN}-3` } });
-    check(c1.status === 201 && c2.status === 409 && c2.code === "idempotency_in_progress" && createdForKc === 1, "§6 409 idempotency_in_progress — 2 concurrent same-key POSTs: one 201, one 409, ONE intent", `${c1.status}/${c2.status} ${c2.code} rows=${createdForKc}`);
+    // ORDER-FREE: which of the two claims the key first is argon2 timing, not the
+    // contract. The contract is exactly one 201 and one 409 in_progress, ONE intent.
+    const won = c1.status === 201 ? c1 : c2; const lost = won === c1 ? c2 : c1;
+    check(won.status === 201 && lost.status === 409 && lost.code === "idempotency_in_progress" && createdForKc === 1, "§6 409 idempotency_in_progress — 2 concurrent same-key POSTs: one 201, one 409, ONE intent", `${c1.status}/${c2.status} ${lost.code} rows=${createdForKc}`);
     const c3 = await call("POST", "/v1/payment-intents", A.plaintext, { ...good, reference: `store-${RUN}-3` }, kc);
-    check(c3.status === 201 && c3.res.headers.get("idempotent-replayed") === "true" && c3.json.id === c1.json.id, "§3 after the first finishes, the same key replays it", `${c3.status}`);
+    check(c3.status === 201 && c3.res.headers.get("idempotent-replayed") === "true" && c3.json.id === won.json.id, "§3 after the first finishes, the same key replays it", `${c3.status}`);
 
     // ── GET / 404 cross-client ──
     const g1 = await call("GET", `/v1/payment-intents/${pi.id}`, A.plaintext);
