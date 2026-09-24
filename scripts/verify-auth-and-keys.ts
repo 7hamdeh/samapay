@@ -1,10 +1,15 @@
+// COVERS: src/http/auth.ts src/http/scopes.ts src/http/errors.ts src/keys/issue.ts src/keys/generate.ts src/audit/append.ts
+//
 // STEP 2, RED-FIRST. Drives the REAL Hono app in-process (app.request — no
-// port, no PM2) against the sandbox database.
+// port, no PM2) against the sandbox database. Contract v1 (Phase 0): every
+// route is under /v1 and the 401s are the §6 codes — unauthenticated /
+// invalid_key / key_revoked (revoked is told only to a caller holding the
+// full key; details.successor = the successor's last 4).
 //
 // ⚠️ THE ADMIN KEYS ROUTE IS NOT MOUNTED IN v1 (model correction, 2026-09-04:
 // SamaPrime is ONE client with ONE key, minted from the CLI). So the issuing
 // checks below exercise the CLI path — issueKey()/revokeKey() — and the AUTH
-// checks drive a mounted route (/balance). Nothing here tests handlers that
+// checks drive a mounted route (/v1/balance). Nothing here tests handlers that
 // no longer have a caller; when SamaPay's own registration site mounts
 // admin-keys, it brings its own suite. Refuses any other database.
 //
@@ -57,17 +62,22 @@ async function main() {
     // wrong-LENGTH key, which the format regex rejected before the lookup —
     // the probe was failing upstream of the thing it tests.
     const wrong = client.plaintext.slice(0, 12) + "z".repeat(client.plaintext.length - 12);
-    const r4 = await app.request("/balance", { headers: { authorization: `Bearer ${wrong}` } });
-    const r4b = await app.request("/balance", { headers: { authorization: "Bearer sk_live_" + "b".repeat(40) } });
-    const t4 = await r4.text(); const t4b = await r4b.text();
-    check(r4.status === 401 && r4b.status === 401 && t4 === t4b, "4. wrong secret and unknown prefix both 401 with the SAME body (no oracle)", `${r4.status}/${r4b.status} · wrongSecret=${t4} · unknownPrefix=${t4b}`);
+    const r4 = await app.request("/v1/balance", { headers: { authorization: `Bearer ${wrong}` } });
+    const r4b = await app.request("/v1/balance", { headers: { authorization: "Bearer sk_live_" + "b".repeat(40) } });
+    // The bodies differ ONLY by request_id (every error echoes its own); strip it and compare the rest.
+    const strip = async (r: Response) => { const j = (await res5json(r)) as { error?: Record<string, unknown> }; if (j.error) delete j.error.request_id; return JSON.stringify(j); };
+    const t4 = await strip(r4); const t4b = await strip(r4b);
+    check(r4.status === 401 && r4b.status === 401 && t4 === t4b && t4.includes('"invalid_key"'), "4. wrong secret and unknown prefix both 401 invalid_key with the SAME body apart from request_id (no oracle)", `${r4.status}/${r4b.status} · wrongSecret=${t4} · unknownPrefix=${t4b}`);
+    const r4c = await app.request("/v1/balance");
+    const b4c = (await res5json(r4c)) as { error?: { code: string } };
+    check(r4c.status === 401 && b4c.error?.code === "unauthenticated", "4b. no Authorization header → 401 unauthenticated", `${r4c.status} ${b4c.error?.code}`);
 
     // 5. a key without the scope is refused 403, with the scope named
     const noScope = await issueKey({ clientId: partner.id, name: "no scope", scopes: ["deposits.read"], issuedBy: "verify", issuedVia: "cli" });
     made.keys.push(noScope.id);
-    const r5 = await app.request("/balance", { headers: { authorization: `Bearer ${noScope.plaintext}` } });
-    const b5 = (await res5json(r5)) as { error?: { code: string; details?: { scope?: string } } };
-    check(r5.status === 403 && b5.error?.code === "insufficient_scope" && b5.error.details?.scope === "balance.read", "5. a key missing the scope is refused 403, scope named", `status=${r5.status} code=${b5.error?.code}`);
+    const r5 = await app.request("/v1/balance", { headers: { authorization: `Bearer ${noScope.plaintext}` } });
+    const b5 = (await res5json(r5)) as { error?: { code: string; details?: { required?: string } } };
+    check(r5.status === 403 && b5.error?.code === "insufficient_scope" && b5.error.details?.required === "balance.read", "5. a key missing the scope is refused 403, details.required names it", `status=${r5.status} code=${b5.error?.code}`);
 
     // 6. CONTROL — keys.issue can be minted by the CLI ONLY: the admin path refuses
     let refusedEscalation = false;
@@ -75,10 +85,21 @@ async function main() {
     catch (e) { refusedEscalation = e instanceof IssueKeyError && e.code === "keys_issue_not_via_admin"; }
     check(refusedEscalation, "6. CONTROL — keys.issue is refused unless it comes from the CLI (his hand), so no admin path can mint an admin key");
 
-    // 7. revoke, then the revoked key is 401 on its next request
+    // 7. ROTATION: a successor is issued, the old key revoked with successor_key_id set.
+    const successor = await issueKey({ clientId: partner.id, name: "store key v2", scopes: ["balance.read"], environment: "test", issuedBy: "verify", issuedVia: "cli" });
+    made.keys.push(successor.id);
     const revoked = await revokeKey(client.id, "verify", "revoked by the suite");
-    const r7b = await app.request("/balance", { headers: { authorization: `Bearer ${client.plaintext}` } });
-    check(revoked === 1 && r7b.status === 401, "7. a revoked key is 401 on its next request", `revoked=${revoked} status=${r7b.status}`);
+    await prisma.clientKey.update({ where: { id: client.id }, data: { successorKeyId: successor.id } });
+    const r7b = await app.request("/v1/balance", { headers: { authorization: `Bearer ${client.plaintext}` } });
+    const b7b = (await res5json(r7b)) as { error?: { code: string; details?: { successor?: string } } };
+    check(revoked === 1 && r7b.status === 401 && b7b.error?.code === "key_revoked" && b7b.error.details?.successor === successor.plaintext.slice(-4),
+      "7. a revoked key is 401 key_revoked on its next request, details.successor = the successor's last 4", `revoked=${revoked} status=${r7b.status} ${JSON.stringify(b7b.error)}`);
+    const wrongRevoked = client.plaintext.slice(0, 12) + "z".repeat(client.plaintext.length - 12);
+    const r7c = await app.request("/v1/balance", { headers: { authorization: `Bearer ${wrongRevoked}` } });
+    const b7c = (await res5json(r7c)) as { error?: { code: string } };
+    check(r7c.status === 401 && b7c.error?.code === "invalid_key", "7b. a WRONG secret on the revoked key's prefix is invalid_key — revocation is never told to a stranger", `${r7c.status} ${b7c.error?.code}`);
+    const r7d = await app.request("/v1/balance", { headers: { authorization: `Bearer ${successor.plaintext}` } });
+    check(r7d.status === 200, "7c. the successor key is served", `${r7d.status}`);
 
     const rows = await prisma.auditEvent.findMany({ orderBy: { at: "asc" }, select: { at: true, keyId: true, actor: true, action: true, subjectId: true, idempotencyKey: true, params: true, prevHash: true, hash: true } });
     let prev = GENESIS_HASH, broken = 0;
@@ -92,10 +113,17 @@ async function main() {
     // 8b. NEGATIVE CONTROL — the chain check can fail: tamper one field in memory
     const tampered = rows.length ? computeAuditHash(GENESIS_HASH, { ...rows[0]!, at: rows[0]!.at.toISOString(), params: { x: RUN } }) : "";
     check(rows.length > 0 && tampered !== rows[0]!.hash, "8b. CONTROL — a tampered field changes the hash (the check can go red)");
-    // 9. the append-only trigger refuses a delete
-    let refused = false;
-    try { await prisma.auditEvent.deleteMany({ where: { keyId: { in: made.keys } } }); } catch (e) { refused = /append-only|restrict_violation/i.test(String((e as Error).message)); }
-    check(refused, "9. audit_events refuses DELETE (append-only trigger from the first migration)");
+    // 9. the append-only trigger refuses a delete. The trigger lives only in
+    // the migration SQL; a `db push` cluster (scripts/throwaway-sandbox.ts)
+    // does not have it, so there the check is NOT RUN and says so — never a pass.
+    const trig = (await prisma.$queryRawUnsafe("select count(*)::int as n from information_schema.triggers where event_object_table = 'audit_events'")) as Array<{ n: number }>;
+    if ((trig[0]?.n ?? 0) === 0) {
+      console.log("  NOT RUN  9. audit_events append-only trigger — absent on this cluster (schema from db push, not migrations); proven only on a migrated database");
+    } else {
+      let refused = false;
+      try { await prisma.auditEvent.deleteMany({ where: { keyId: { in: made.keys } } }); } catch (e) { refused = /append-only|restrict_violation/i.test(String((e as Error).message)); }
+      check(refused, "9. audit_events refuses DELETE (append-only trigger from the first migration)");
+    }
   } catch (err) {
     // ⚠️ WITHOUT THIS, A CRASH REPORTS AS A CLEAN ZERO. `process.exit()` in
     // the `finally` below runs BEFORE the exception propagates and discards

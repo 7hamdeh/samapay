@@ -8,6 +8,8 @@ export const SCOPES = [
   "addresses.write", "deposits.read", "withdrawals.write", "withdrawals.read", "balance.read",
   // S2 slice 1: a merchant's gateway key creates and reads its own payment intents.
   "payment_intents.write", "payment_intents.read",
+  // Phase 0 contract §2: GET /v1/events/:id, so a webhook receiver can re-fetch.
+  "events.read",
   // held only by the SamaPrime server's admin key: it can issue and revoke
   // keys and can NEVER move money — that is what keeps "no privileged path" true.
   "keys.issue",
