@@ -55,14 +55,18 @@ let cachedSeed: Buffer | null = null;
 /** seedFingerprint(cachedSeed), computed once when it was loaded and verified. */
 let cachedFingerprint: string | null = null;
 let wipeTimer: ReturnType<typeof setTimeout> | null = null;
+/** When the current wipe timer was (re)armed — observable so a test can prove a reader never re-arms it. */
+let wipeArmedAt: number | null = null;
 
 function scheduleWipe(): void {
   if (wipeTimer) clearTimeout(wipeTimer);
+  wipeArmedAt = Date.now();
   wipeTimer = setTimeout(() => {
     cachedSeed?.fill(0);
     cachedSeed = null;
     cachedFingerprint = null;
     wipeTimer = null;
+    wipeArmedAt = null;
   }, SEED_MEMORY_TTL_MS);
   wipeTimer.unref();
 }
@@ -120,6 +124,11 @@ export function loadedSeedFingerprint(): string | null {
   return cachedSeed ? cachedFingerprint : null;
 }
 
+/** Test/diagnostic view of the cache: never the seed, only whether one is held and when its wipe was armed. */
+export function seedCacheState(): { loaded: boolean; wipeArmedAt: number | null } {
+  return { loaded: cachedSeed !== null, wipeArmedAt };
+}
+
 export interface CryptoConfigStatus {
   configured: boolean;
   fingerprint: string | null;
@@ -139,6 +148,7 @@ export async function getCryptoConfigStatus(): Promise<CryptoConfigStatus> {
 export function wipeMasterSeedCache(): void {
   if (wipeTimer) clearTimeout(wipeTimer);
   wipeTimer = null;
+  wipeArmedAt = null;
   cachedSeed?.fill(0);
   cachedSeed = null;
   cachedFingerprint = null;
