@@ -131,6 +131,7 @@ async function main() {
     if (events) enq = await prisma.$transaction((tx) => events.enqueueEvent(tx, { type: "deposit.confirmed", objectKind: "deposit", objectId: snap.id, snapshot: snap }));
     check(!!enq && enq.status === "created" && /^evt_[A-Za-z0-9]{24,}$/.test(enq.eventId), "B1. enqueueEvent on a plain top-up address creates an evt_ event", JSON.stringify(enq));
     const deliveryId = enq && enq.status !== "suppressed" ? enq.deliveryId : null;
+    const enqEventId = enq && enq.status !== "suppressed" ? enq.eventId : null;
     mode = "ok"; received.length = 0;
     const out = deliveryId ? await dispatch.attemptDelivery(deliveryId) : { outcome: "none" };
     const got = received[0];
@@ -141,7 +142,7 @@ async function main() {
     check(!!deliveryId && h["x-samapay-delivery"] === deliveryId, "B5. X-SamaPay-Delivery carries the delivery id", String(h["x-samapay-delivery"]));
     check(!!got && sign.verifySignature(plainSecret, got.body, String(h["x-samapay-signature"])), "B6. X-SamaPay-Signature verifies with the PLAINTEXT secret over the RAW body (11437a3 kept)");
     const env = JSON.parse(got?.body ?? "{}") as Record<string, unknown> & { data?: { object?: Record<string, unknown> } };
-    check(env.id === enq?.eventId && env.object === "event" && env.api_version === "2026-09-24" && env.type === "deposit.confirmed" && typeof env.created_at === "string" && /Z$/.test(String(env.created_at)), "B7. body is the §4 envelope: id, object, api_version 2026-09-24, type, ISO created_at", JSON.stringify(env).slice(0, 140));
+    check(env.id === enqEventId && env.object === "event" && env.api_version === "2026-09-24" && env.type === "deposit.confirmed" && typeof env.created_at === "string" && /Z$/.test(String(env.created_at)), "B7. body is the §4 envelope: id, object, api_version 2026-09-24, type, ISO created_at", JSON.stringify(env).slice(0, 140));
     check(canon(env.data?.object) === canon(snap), "B8. data.object is the snapshot exactly as enqueued");
 
     // ── C. retry schedule ───────────────────────────────────────────────────
@@ -246,7 +247,7 @@ async function main() {
     const own = events && enq && enq.status !== "suppressed" ? await events.getEvent(clientA.id, enq.eventId) : null;
     const foreign = events && enq && enq.status !== "suppressed" ? await events.getEvent(clientB.id, enq.eventId) : "no-module";
     const unknown = events ? await events.getEvent(clientA.id, "evt_doesnotexist000000000000") : "no-module";
-    check(!!own && own.id === enq?.eventId && own.object === "event" && canon(own) === (got?.body ? canon(JSON.parse(got.body)) : ""), "G1. the owner's getEvent returns the same envelope the webhook carried", JSON.stringify(own).slice(0, 80));
+    check(!!own && own.id === enqEventId && own.object === "event" && canon(own) === (got?.body ? canon(JSON.parse(got.body)) : ""), "G1. the owner's getEvent returns the same envelope the webhook carried", JSON.stringify(own).slice(0, 80));
     check(foreign === null, "G2. another client's getEvent is null (the route answers 404 — no existence oracle)", String(foreign));
     check(unknown === null, "G3. an unknown id is null, the same answer as another client's", String(unknown));
 
@@ -272,16 +273,17 @@ async function main() {
     mode = "slow"; received.length = 0;
     const racers = ic.deliveryId ? await Promise.all(Array.from({ length: 4 }, () => dispatch.attemptDelivery(ic.deliveryId as string))) : [];
     const won = racers.filter((r) => r.outcome === "delivered").length, lost = racers.filter((r) => r.outcome === "not_claimed").length;
+    check(dispatch.CLAIM_LEASE_MS > dispatch.TIMEOUT_MS, "I0. the claim lease outlasts the 10 s timeout (a live attempt never loses its lease)", `${dispatch.CLAIM_LEASE_MS} > ${dispatch.TIMEOUT_MS}`);
     check(received.length === 1 && won === 1 && lost === 3, "I1. four workers attempt one due delivery at once: exactly ONE POST, one delivered, three not_claimed", `posts=${received.length} ${racers.map((r) => r.outcome).join(",")}`);
     mode = "ok";
     const held = await enqueueDeposit(await mkAddress(`samaprime:m1:user:held`), "samaprime:m1:user:held");
-    if (held.deliveryId) await prisma.webhookDelivery.update({ where: { id: held.deliveryId }, data: { status: "sending", claimedAt: new Date() } }).catch((e: Error) => console.log(`  (claim columns not settable: ${e.message.slice(-120)})`));
+    if (held.deliveryId) await prisma.webhookDelivery.update({ where: { id: held.deliveryId }, data: { nextAttemptAt: new Date(Date.now() + dispatch.CLAIM_LEASE_MS - 5_000) } }); // a live lease another worker took moments ago
     received.length = 0;
     const heldOut = held.deliveryId ? await dispatch.attemptDelivery(held.deliveryId) : { outcome: "none" };
     check(heldOut.outcome === "not_claimed" && received.length === 0, "I2. a delivery another worker claimed moments ago is not sent again", `outcome=${heldOut.outcome} posts=${received.length}`);
-    if (held.deliveryId) await prisma.webhookDelivery.update({ where: { id: held.deliveryId }, data: { claimedAt: new Date(Date.now() - 2 * MIN) } }).catch((e: Error) => console.log(`  (claim columns not settable: ${e.message.slice(-120)})`));
+    if (held.deliveryId) await prisma.webhookDelivery.update({ where: { id: held.deliveryId }, data: { nextAttemptAt: new Date(Date.now() - 1_000) } }); // that worker died: its lease ran out
     const staleOut = held.deliveryId ? await dispatch.attemptDelivery(held.deliveryId) : { outcome: "none" };
-    check(staleOut.outcome === "delivered" && received.length === 1, "I3. a claim older than the stale window (a crashed worker) is reclaimed and delivered", `outcome=${staleOut.outcome} posts=${received.length}`);
+    check(staleOut.outcome === "delivered" && received.length === 1, "I3. a lease that ran out (a crashed worker) is taken over and delivered", `outcome=${staleOut.outcome} posts=${received.length}`);
 
     // ── J. redrive (A5/A9) ──────────────────────────────────────────────────
     const exBefore = d2 ? await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: d2 }, select: { status: true, attempts: true } }) : null;
