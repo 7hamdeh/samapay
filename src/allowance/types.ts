@@ -37,8 +37,10 @@ export const RETURNED_STATUSES: readonly WithdrawalStatus[] = ["cancelled", "exp
 export interface AllowancePosition {
   keyId: string;
   received: Prisma.Decimal;
+  /** Σ deposits.fee_amount over the confirmed rows — the merchant fee, stamped at confirmation. */
+  fees: Prisma.Decimal;
   withdrawn: Prisma.Decimal;
-  /** received − withdrawn. Never clamped. */
+  /** received − fees − withdrawn. Never clamped. */
   allowance: Prisma.Decimal;
   depositCount: number;
   withdrawalCount: number;
@@ -58,8 +60,9 @@ export class AllowanceExceeded extends AllowanceError {
     readonly received: string,
     readonly withdrawn: string,
     readonly requested: string,
+    readonly fees: string = "0",
   ) {
-    super("allowance_exceeded", `Only money that arrived on-chain under this key can be sent. Received ${received}, already withdrawn ${withdrawn}, requested ${requested}.`);
+    super("allowance_exceeded", `Only money that arrived on-chain under this key can be sent. Received ${received}, ${fees === "0" ? "" : `fees ${fees}, `}already withdrawn ${withdrawn}, requested ${requested}.`);
     this.name = "AllowanceExceeded";
   }
 }

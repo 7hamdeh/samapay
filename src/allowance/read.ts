@@ -3,7 +3,13 @@ import { prisma } from "@/db/client.js";
 import { RETURNED_STATUSES, type AllowancePosition, type Tx } from "./types.js";
 
 /**
- * allowance(key) = received − withdrawn. Clauses 1, 2, 3, 8.
+ * allowance(key) = received − fees − withdrawn. Clauses 1, 2, 3, 8.
+ *
+ * `fees` (Phase 0) is Σ deposits.fee_amount over the same confirmed rows —
+ * the merchant fee stamped at confirmation (src/allowance/fee.ts). It stays
+ * in SamaPay's wallet, so it is not the merchant's to withdraw; subtracting
+ * it here keeps GET /v1/balance's `available` and the withdrawal bound ONE
+ * number rather than a display figure and a charge figure.
  *
  * Reads two aggregates and subtracts. Takes the caller's transaction so
  * reserve() reads under its own lock; outside a transaction it is a plain
@@ -27,10 +33,11 @@ import { RETURNED_STATUSES, type AllowancePosition, type Tx } from "./types.js";
 // and can never pay out USDT, because the ledgers never touch.
 export async function read(keyId: string, tx: Pick<typeof prisma, "deposit" | "withdrawal"> | Tx = prisma): Promise<AllowancePosition> {
   const [inn, out] = await Promise.all([
-    tx.deposit.aggregate({ _sum: { amount: true }, _count: { _all: true }, where: { keyId, status: "confirmed" } }),
+    tx.deposit.aggregate({ _sum: { amount: true, feeAmount: true }, _count: { _all: true }, where: { keyId, status: "confirmed" } }),
     tx.withdrawal.aggregate({ _sum: { amount: true }, _count: { _all: true }, where: { keyId, status: { notIn: [...RETURNED_STATUSES] } } }),
   ]);
   const received = inn._sum.amount ?? new Prisma.Decimal(0);
+  const fees = inn._sum.feeAmount ?? new Prisma.Decimal(0);
   const withdrawn = out._sum.amount ?? new Prisma.Decimal(0);
-  return { keyId, received, withdrawn, allowance: received.minus(withdrawn), depositCount: inn._count._all, withdrawalCount: out._count._all };
+  return { keyId, received, fees, withdrawn, allowance: received.minus(fees).minus(withdrawn), depositCount: inn._count._all, withdrawalCount: out._count._all };
 }
