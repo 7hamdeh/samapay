@@ -18,7 +18,12 @@
 //
 // USAGE:
 //   pnpm exec tsx scripts/import-legacy-addresses.ts --in=<file> \
-//     --key=<merchantId>:<keyId> [--key=<merchantId>:<keyId> …] [--expect=<N>] [--apply] [--by=<who>]
+//     --key=<merchantId>:<keyId> [--key=<merchantId>:<keyId> …] [--expect=<N>] [--apply --backup=<dump>] [--by=<who>]
+//
+// WHERE-AM-I + BACKUP (G4's src/chain/seed/ops-gate.ts, the one ops gate): the
+// connected database must be production `samapay` on 5432, or — only with
+// --rehearsal — a *_sandbox database on a throwaway port. --apply also needs
+// --backup=<the samapay-backup.sh dump taken just before this step>.
 //
 // DRY RUN BY DEFAULT: every check runs and the plan is printed; nothing is
 // written without --apply. With --apply the inserts are ONE transaction.
@@ -52,6 +57,7 @@ import { deriveAddress } from "@/chain/hd/derive.js";
 import { derivationFloor } from "@/chain/derivation-floor.js";
 import { loadMasterSeed, wipeMasterSeedCache } from "@/chain/seed/master-seed.js";
 import { buildReference } from "@/reference/index.js";
+import { backupDirFor, openOpsRun, OpsRefused, requireFreshBackup, type OpsMode } from "@/chain/seed/ops-gate.js";
 
 const log = logger.child({ mod: "import-legacy-addresses" });
 
@@ -88,7 +94,10 @@ async function main(): Promise<number> {
   const apply = process.argv.includes("--apply");
   const by = flag("by") ?? "ibrahim";
   const expectRaw = flag("expect");
-  if (!file) { console.error("usage: tsx scripts/import-legacy-addresses.ts --in=<file> --key=<merchantId>:<keyId>… [--expect=N] [--apply]"); return 2; }
+  if (!file) { console.error("usage: tsx scripts/import-legacy-addresses.ts --in=<file> --key=<merchantId>:<keyId>… [--expect=N] [--apply --backup=<dump>] [--rehearsal]"); return 2; }
+  const mode: OpsMode = { apply, rehearsal: process.argv.includes("--rehearsal"), values: new Map() };
+  await openOpsRun("import-legacy-addresses", mode);
+  if (apply) await requireFreshBackup(flag("backup"), backupDirFor(mode));
 
   // ── the file ────────────────────────────────────────────────────────────
   let json: unknown;
@@ -186,7 +195,7 @@ async function main(): Promise<number> {
 main()
   .then((code) => { process.exitCode = code; })
   .catch((e) => {
-    const refused = e instanceof Refused;
+    const refused = e instanceof Refused || e instanceof OpsRefused;
     console.error(`${refused ? "REFUSED" : "FAILED"}: ${e instanceof Error ? e.message : String(e)} — nothing was written`);
     log.error({ action: "legacy_addresses.import", result: refused ? "refused" : "error", err: e instanceof Error ? e.message : String(e) }, "import-legacy-addresses");
     process.exitCode = refused ? 3 : 1;

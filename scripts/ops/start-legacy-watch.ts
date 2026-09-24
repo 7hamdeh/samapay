@@ -18,7 +18,9 @@
 // by UNIQUE(chain, tx_hash). Rules and refusals: src/chain/cursor.ts header.
 //
 // MAINNET ONLY: refuses (exit 3) unless CRYPTO_MODE=mainnet; --rehearsal lifts
-// that for a throwaway database. The network and the depth per chain are
+// that for a throwaway database.
+// WHERE-AM-I + BACKUP (G4's src/chain/seed/ops-gate.ts): production `samapay` on
+// 5432, or --rehearsal on a *_sandbox throwaway; --apply needs --backup=<dump>. The network and the depth per chain are
 // printed first, in dry run and apply alike.
 //
 // DRY RUN BY DEFAULT: prints, per chain, MNTAD's block, SamaPay's cursor, the
@@ -32,6 +34,7 @@ import { prisma } from "@/db/client.js";
 import logger from "@/log.js";
 import { appendAudit } from "@/audit/append.js";
 import { getChainConfig, getCryptoNetworkMode } from "@/chain/impl/config.js";
+import { backupDirFor, openOpsRun, OpsRefused, requireFreshBackup, type OpsMode } from "@/chain/seed/ops-gate.js";
 import { CHAINS, LegacyWatchRefused, lockCursor, parseCursorFile, planChain, setCursorAndEnableLegacyWatch, type ChainPlan } from "@/chain/cursor.js";
 
 const log = logger.child({ mod: "ops/start-legacy-watch" });
@@ -48,7 +51,7 @@ async function main(): Promise<number> {
   const file = flag("cursors");
   const apply = process.argv.includes("--apply");
   const by = flag("by") ?? "ibrahim";
-  if (!file) { console.error("usage: tsx scripts/ops/start-legacy-watch.ts --cursors=<file> [--apply] [--by=<who>] [--rehearsal]"); return 2; }
+  if (!file) { console.error("usage: tsx scripts/ops/start-legacy-watch.ts --cursors=<file> [--apply --backup=<dump>] [--by=<who>] [--rehearsal]"); return 2; }
 
   const cursors = parseCursorFile(readFileSync(file, "utf8"));
   console.log(`cursor file: TRC20 ${cursors.TRC20}, BEP20 ${cursors.BEP20}, MNTAD stopped at ${cursors.stoppedAt}`);
@@ -63,6 +66,10 @@ async function main(): Promise<number> {
     console.log(`network: ${network}`);
     throw new LegacyWatchRefused(null, `CRYPTO_MODE is ${network}, not mainnet — the handoff runs only with the production chain config (pass --rehearsal only on a throwaway database)`);
   }
+  const mode: OpsMode = { apply, rehearsal, values: new Map() };
+  await openOpsRun("start-legacy-watch", mode);
+  if (apply) await requireFreshBackup(flag("backup"), backupDirFor(mode));
+
   // The observer's own depth per chain; printed in dry run AND apply so the operator reads it.
   const depth = Object.fromEntries(CHAINS.map((c) => [c, BigInt(getChainConfig(c).confirmationsRequired)])) as Record<(typeof CHAINS)[number], bigint>;
   console.log(`network: ${network}${rehearsal ? " (REHEARSAL)" : ""}; confirmation depth TRC20 ${depth.TRC20}, BEP20 ${depth.BEP20}`);
@@ -100,7 +107,7 @@ async function main(): Promise<number> {
 main()
   .then((code) => { process.exitCode = code; })
   .catch((e) => {
-    const refused = e instanceof LegacyWatchRefused;
+    const refused = e instanceof LegacyWatchRefused || e instanceof OpsRefused;
     console.error(`${refused ? "REFUSED" : "FAILED"}: ${e instanceof Error ? e.message : String(e)} — nothing was written`);
     log.error({ action: "legacy_watch.start", result: refused ? "refused" : "error", err: e instanceof Error ? e.message : String(e) }, "start-legacy-watch");
     process.exitCode = refused ? 3 : 1;
