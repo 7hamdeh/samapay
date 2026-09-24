@@ -12,7 +12,9 @@
 import crypto from "node:crypto";
 process.env.SEED_ENCRYPTION_KEY ??= crypto.randomBytes(32).toString("base64");
 
-import { writeFileSync, utimesSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { isAbsolute, join } from "node:path";
 import { Hono } from "hono";
 import { Prisma } from "@prisma/client";
@@ -25,7 +27,7 @@ import { issueKey } from "@/keys/issue.js";
 import { provisionClientKey } from "@/keys/provision.js";
 import { MERCHANT_DEFAULT_SCOPES, normalizeArgv, termsFromArgv, TermsError } from "@/keys/terms.js";
 import { computeFee, feeForConfirmation, read, readClientByChain, reserve, AllowanceExceeded, InvalidFeeBps } from "@/allowance/index.js";
-import { backupProblem, disableAddress, parseArgs } from "./ops/disable-address.js";
+import { disableAddress, disableValues } from "./ops/disable-address.js";
 import { check, summary, thrown, voidCheck } from "./lib/check.js";
 
 const RUN = Date.now().toString(36);
@@ -121,6 +123,19 @@ async function main() {
     const body5 = await getBalance();
     check(body5.chains?.TRC20?.available === "97.5" && body5.fee_bps === 5000, "C5. fee_bps 250 → 5000 afterwards: the TRC20 available stays 97.5; fee_bps shows the new rate", JSON.stringify(body5));
 
+    // F. WATCH-DISABLED ADDRESSES DO NOT COUNT (review Q M4 — the written-off
+    //    3.01 USDT sits under the SamaPrime client in production).
+    const woAddr = await prisma.address.create({ data: { keyId, clientId: p.client.id, chain: "TRC20", reference: `verify:g6:writeoff:${RUN}`, address: `TG6wo${RUN}${"z".repeat(20)}`, derivationIndex: nextIndex() }, select: { id: true, address: true } });
+    await dep("TRC20", woAddr.id, "3.01", "confirmed", "0");
+    await dep("TRC20", woAddr.id, "1", "detected");
+    const beforeWo = await getBalance();
+    const allowBefore = (await read(keyId)).allowance.toString();
+    check(beforeWo.chains?.TRC20?.available === "100.51" && allowBefore === "107.51", "F1. CONTROL: while the address is watched, its 3.01 counts (TRC20 available 100.51, allowance 107.51)", `${JSON.stringify(beforeWo.chains?.TRC20)} allowance=${allowBefore}`);
+    await disableAddress(prisma, { address: woAddr.address, apply: true, by: "verify", reason: "write-off" });
+    const afterWo = (await getBalance()) as { chains?: Record<string, { available: string; pending: string }> };
+    const allowAfter = (await read(keyId)).allowance.toString();
+    check(afterWo.chains?.TRC20?.available === "97.5" && afterWo.chains?.TRC20?.pending === "7" && allowAfter === "104.5", "F2. once watch-disabled, its deposits leave available AND pending AND the withdrawal bound (97.5 / 7 / 104.5)", `${JSON.stringify(afterWo.chains?.TRC20)} allowance=${allowAfter}`);
+
     // C6. reserve honours the fee: 104.500001 refused, 104.5 accepted
     const over = await thrown(() => prisma.$transaction((tx) => reserve(tx, { keyId, amount: "104.500001", idempotencyKey: `g6-r1-${RUN}`, toAddress: "0xdest", chain: "BEP20" })));
     check(over.err instanceof AllowanceExceeded && (over.err as AllowanceExceeded).fees === "2.5", "C6. a withdrawal 0.000001 above received − fees − withdrawn is refused, the fee named", `${over.name} ${(over.err as Error | undefined)?.message ?? ""}`);
@@ -133,11 +148,9 @@ async function main() {
     const dry = await disableAddress(prisma, { address: target.address, apply: false });
     const afterDry = await prisma.address.findUniqueOrThrow({ where: { id: target.id }, select: { watchDisabledAt: true } });
     check(dry.outcome === "would_disable" && afterDry.watchDisabledAt === null, "D1. dry run (the default) reports would_disable and writes nothing", dry.outcome);
-    check(parseArgs(["--address=" + target.address]).apply === false, "D2. no --apply flag → dry run");
-    const noBackup = await thrown(async () => parseArgs(["--address=" + target.address, "--apply"]));
-    check(noBackup.name === "Error" && /--backup/.test(String((noBackup.err as Error)?.message)), "D3. --apply without --backup is refused at parse time", String((noBackup.err as Error | undefined)?.message));
-    const rb6 = parseArgs(["--address=" + target.address, "--apply", "--backup=/x/y.dump"]);
-    check(rb6.apply && rb6.by === "ibrahim" && rb6.backup === "/x/y.dump", "D3b. runbook §6 form: --address=… --apply (+ --backup) parses; --by defaults to ibrahim", JSON.stringify(rb6));
+    const dv = disableValues(new Map([["--address", target.address]]));
+    const badAddr = await thrown(async () => disableValues(new Map([["--address", "x y"]])));
+    check(dv.by === "ibrahim" && dv.address === target.address && badAddr.name === "Error", "D2. values: --by defaults to ibrahim; a malformed --address is refused", JSON.stringify(dv));
     const auditBefore = await prisma.auditEvent.count({ where: { action: "address.watch_disabled", subjectId: target.id } });
     const applied = await disableAddress(prisma, { address: target.address, apply: true, by: "verify", reason: "old seed" });
     const stamped = await prisma.address.findUniqueOrThrow({ where: { id: target.id }, select: { watchDisabledAt: true } });
@@ -152,19 +165,37 @@ async function main() {
     const ghost = await disableAddress(prisma, { address: `Tnosuch${RUN}xxxxxxxxxxxx`, apply: true, by: "verify" });
     check(ghost.outcome === "not_found", "D7. an unknown address → not_found, nothing written", ghost.outcome);
 
-    // D8. backup gate
+    // D8. THE CLI, through G4's ops gate (review Q M3): where-am-I + fresh-backup, spawned for real.
     const dir = process.env.G6_SCRATCH;
-    if (!dir || !isAbsolute(dir)) voidCheck("D8. backup gate", "G6_SCRATCH (absolute scratch dir) not set — fixtures are never written into the tree");
+    if (!dir || !isAbsolute(dir)) voidCheck("D8. disable-address CLI gate", "G6_SCRATCH (absolute scratch dir) not set — backup fixtures are never written into the tree");
     else {
-      const f = join(dir, `backup-${RUN}.dump`);
-      writeFileSync(f, "not really a dump");
-      const fresh = await backupProblem(prisma, f);
-      const past = new Date(Date.now() - 60 * 60 * 1000);
-      utimesSync(f, past, past); // an hour ago: BEFORE D4's hand-run write
-      const stale = await backupProblem(prisma, f);
-      const missing = await backupProblem(prisma, join(dir, `absent-${RUN}`));
-      const relative = await backupProblem(prisma, "backup.dump");
-      check(fresh === null && /predates the last hand-run write/.test(stale ?? "") && /does not exist/.test(missing ?? "") && /not absolute/.test(relative ?? ""), "D8. backup gate: fresh passes; older than the last ops/cli write, missing, or relative is refused", JSON.stringify({ fresh, stale, missing, relative }));
+      const cliTarget = await prisma.address.create({ data: { keyId, clientId: p.client.id, chain: "TRC20", reference: `verify:g6:cli:${RUN}`, address: `TG6cli${RUN}${"y".repeat(20)}`, derivationIndex: nextIndex() }, select: { id: true, address: true } });
+      const bkDir = join(dir, `bk-${RUN}`);
+      mkdirSync(bkDir, { recursive: true });
+      const cli = (...args: string[]) => {
+        const r = spawnSync("./node_modules/.bin/tsx", ["scripts/ops/disable-address.ts", ...args], { env: { ...process.env, SAMAPAY_OPS_REHEARSAL_BACKUP_DIR: bkDir }, encoding: "utf8" });
+        return { code: r.status, out: `${r.stdout}${r.stderr}` };
+      };
+      const stampOf = async () => (await prisma.address.findUniqueOrThrow({ where: { id: cliTarget.id }, select: { watchDisabledAt: true } })).watchDisabledAt;
+      const notProd = cli(`--address=${cliTarget.address}`);
+      check(notProd.code === 1 && /REFUSED: expected production database samapay/.test(notProd.out), "D8a. without --rehearsal the CLI refuses any database but production (where-am-I)", `exit=${notProd.code}`);
+      const noBk = cli(`--address=${cliTarget.address}`, "--rehearsal", "--apply");
+      check(noBk.code === 1 && /REFUSED: --apply needs --backup/.test(noBk.out) && (await stampOf()) === null, "D8b. --apply without --backup is REFUSED (exit 1), nothing written", `exit=${noBk.code}`);
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z").replace(/^(\d{4})(\d{2})(\d{2})T/, "$1-$2-$3T");
+      const junk = join(bkDir, `backup-${RUN}.dump`);
+      writeFileSync(junk, "x".repeat(20_000));
+      const wrongName = cli(`--address=${cliTarget.address}`, "--rehearsal", "--apply", `--backup=${junk}`);
+      check(wrongName.code === 1 && /is not named samapay-/.test(wrongName.out) && (await stampOf()) === null, "D8c. a backup not named like samapay-backup.sh's dump is REFUSED, nothing written", `exit=${wrongName.code}`);
+      const good = join(bkDir, `samapay-${stamp}.dump.gpg`);
+      writeFileSync(good, crypto.randomBytes(20_000));
+      const noSide = cli(`--address=${cliTarget.address}`, "--rehearsal", "--apply", `--backup=${good}`);
+      check(noSide.code === 1 && /no \.sha256 sidecar/.test(noSide.out) && (await stampOf()) === null, "D8d. a dump without its .sha256 sidecar is REFUSED, nothing written", `exit=${noSide.code}`);
+      writeFileSync(`${good}.sha256`, `${createHash("sha256").update(readFileSync(good)).digest("hex")}\n`);
+      const dryCli = cli(`--address=${cliTarget.address}`, "--rehearsal");
+      check(dryCli.code === 0 && /would_disable/.test(dryCli.out) && (await stampOf()) === null, "D8e. --rehearsal dry run: exit 0, would_disable, nothing written", `exit=${dryCli.code}`);
+      const ok = cli(`--address=${cliTarget.address}`, "--rehearsal", "--apply", `--backup=${good}`);
+      const stamped8 = await stampOf();
+      check(ok.code === 0 && /"outcome": "disabled"/.test(ok.out) && stamped8 !== null, "D8f. --apply with a fresh named dump + matching sidecar: exit 0, watch_disabled_at set", `exit=${ok.code} at=${stamped8?.toISOString()}`);
     }
 
     // ── E. schema: A7 / G3 uniqueness + the migration's backfill SQL ─────
@@ -189,7 +220,6 @@ async function main() {
     check(p2002(dupEv), "E4. UNIQUE(object_id, type) on events: a second payment_intent.succeeded for one intent is refused", dupEv.name);
 
     // E5. the migration's OWN backfill statements (read from the file, not retyped) fill client_id from the key
-    const { readFileSync } = await import("node:fs");
     const sql = readFileSync(new URL("../prisma/migrations/20260925000000_phase0/migration.sql", import.meta.url), "utf8");
     const updates = sql.split("\n").filter((l) => l.startsWith("UPDATE \""));
     const nullAddr = await prisma.address.create({ data: { keyId, chain: "BEP20", reference: `verify:g6:null:${RUN}`, address: `0xG6null${RUN}`, derivationIndex: nextIndex() }, select: { id: true } });

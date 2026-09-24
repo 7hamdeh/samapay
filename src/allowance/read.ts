@@ -33,7 +33,9 @@ import { RETURNED_STATUSES, type AllowancePosition, type Tx } from "./types.js";
 // and can never pay out USDT, because the ledgers never touch.
 export async function read(keyId: string, tx: Pick<typeof prisma, "deposit" | "withdrawal"> | Tx = prisma): Promise<AllowancePosition> {
   const [inn, out] = await Promise.all([
-    tx.deposit.aggregate({ _sum: { amount: true, feeAmount: true }, _count: { _all: true }, where: { keyId, status: "confirmed" } }),
+    // Deposits at a WATCH-DISABLED address (written-off funds, §9 step 0) are
+    // excluded — under-allow is the safe direction; same filter as readClientByChain.
+    tx.deposit.aggregate({ _sum: { amount: true, feeAmount: true }, _count: { _all: true }, where: { keyId, status: "confirmed", address: { watchDisabledAt: null } } }),
     tx.withdrawal.aggregate({ _sum: { amount: true }, _count: { _all: true }, where: { keyId, status: { notIn: [...RETURNED_STATUSES] } } }),
   ]);
   const received = inn._sum.amount ?? new Prisma.Decimal(0);
