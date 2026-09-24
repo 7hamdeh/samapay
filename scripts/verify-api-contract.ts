@@ -14,10 +14,11 @@ import { assertSandboxDatabase } from "@/db/guard.js";
 import { prisma } from "@/db/client.js";
 import { buildApp } from "@/http/app.js";
 import { issueKey } from "@/keys/issue.js";
+import { setChainAdapters, ChainUnavailable } from "@/chain/registry.js";
 // Loaded DYNAMICALLY so the suite still RUNS (and fails check by check) on
 // code where these wiring points do not exist yet — the red-first run.
 type CreateIntentInput = { amount: string; chain: "TRC20" | "BEP20"; reference: string; expiresInSec: number };
-type Wiring = { setCreateIntent?: (fn: (c: string, k: string, i: CreateIntentInput) => Promise<{ id: string }>) => void; setGetEvent?: (fn: (c: string, id: string) => Promise<Record<string, unknown> | null>) => void };
+type Wiring = { setHealthReaders?: unknown; setCreateIntent?: (fn: (c: string, k: string, i: CreateIntentInput) => Promise<{ id: string }>) => void; setGetEvent?: (fn: (c: string, id: string) => Promise<Record<string, unknown> | null>) => void };
 const loadWiring = async (spec: string): Promise<Wiring> => { try { return (await import(spec)) as Wiring; } catch { console.log(`  (wiring point ${spec} absent)`); return {}; } };
 
 let pass = 0, fail = 0;
@@ -37,12 +38,17 @@ async function main() {
   let createCalls = 0; let createDelayMs = 0; let createThrows: Error | null = null;
   const { setCreateIntent = () => undefined } = await loadWiring("@/http/routes/payment-intents.js");
   const { setGetEvent = () => undefined } = await loadWiring("@/http/routes/events.js");
+  const { setHealthReaders = () => undefined } = (await loadWiring("@/http/routes/health.js")) as { setHealthReaders?: (r: Record<string, () => Promise<unknown>>) => void };
+  // chain double for POST /addresses: deterministic, never a real derivation
+  let deriverDown = false;
+  setChainAdapters({ deriver: { async deriveNext(chain) { if (deriverDown) throw new ChainUnavailable("verify"); const i = nextIndex++; return { chain, address: `AVERIFY${RUN}${i}`, derivationIndex: i }; } } });
   setCreateIntent(async (clientId: string, keyId: string, input: CreateIntentInput) => {
     createCalls++;
     if (createDelayMs) await sleep(createDelayMs);
     if (createThrows) throw createThrows;
     const i = nextIndex++;
-    const address = await prisma.address.create({ data: { keyId, chain: input.chain, reference: input.reference, address: `TVERIFY${RUN}${i}`, derivationIndex: i } });
+    // Mirrors G2: an intent's address carries reference "payment_intent:<pi>", not the store's.
+    const address = await prisma.address.create({ data: { keyId, chain: input.chain, reference: `payment_intent:pi_verify${RUN}${i}`, address: `TVERIFY${RUN}${i}`, derivationIndex: i } });
     const row = await prisma.paymentIntent.create({ data: { id: `pi_verify${RUN}${i}`, clientId, keyId, addressId: address.id, chain: input.chain, amount: new Prisma.Decimal(input.amount), reference: input.reference, expiresAt: new Date(Date.now() + input.expiresInSec * 1000) } });
     return { id: row.id };
   });
@@ -198,21 +204,37 @@ async function main() {
     const g3 = await call("GET", `/v1/payment-intents/pi_does_not_exist_${RUN}`, B.plaintext);
     check(g2.status === 404 && g2.code === "not_found" && g3.status === 404 && g2.json.error?.message === g3.json.error?.message, "§2 another client's intent is 404 not_found, identical to an unknown id", `${g2.status}/${g3.status}`);
 
-    // ── list ──
-    for (let i = 0; i < 3; i++) await call("POST", "/v1/payment-intents", A.plaintext, { ...good, reference: `store-${RUN}-list` }, idem());
-    const l1 = await call("GET", `/v1/payment-intents?reference=store-${RUN}-list&limit=2`, A.plaintext);
+    // ── v1.1 A7: one intent per (client, reference) ──
+    const callsA7 = createCalls;
+    const same = await call("POST", "/v1/payment-intents", A.plaintext, { ...good, reference: `store-${RUN}-2` }, idem());
+    check(same.status === 200 && same.json.id === pi.id && createCalls === callsA7, "A7 same reference + same amount/chain under a NEW Idempotency-Key → 200, the existing intent, nothing created", `${same.status} ${same.json.id === pi.id ? "same id" : "DIFFERENT id"}`);
+    const conflict = await call("POST", "/v1/payment-intents", A.plaintext, { ...good, reference: `store-${RUN}-2`, amount: "13" }, idem());
+    const conflictChain = await call("POST", "/v1/payment-intents", A.plaintext, { ...good, reference: `store-${RUN}-2`, chain: "BEP20" }, idem());
+    check(conflict.status === 409 && conflict.code === "reference_conflict" && conflictChain.status === 409 && conflictChain.code === "reference_conflict" && createCalls === callsA7,
+      "A7 same reference, different amount / chain → 409 reference_conflict, nothing created", `${conflict.status} ${conflict.code} / ${conflictChain.status} ${conflictChain.code}`);
+    const otherClientSameRef = await call("POST", "/v1/payment-intents", B.plaintext, { ...good, reference: `store-${RUN}-2`, amount: "13" }, idem());
+    check(otherClientSameRef.status === 201, "A7 the uniqueness is per CLIENT: another client may use the same reference", `${otherClientSameRef.status}`);
+
+    // ── list (a dedicated client, so the count is exact) ──
+    const cL = await prisma.client.create({ data: { name: `verify-api-L-${RUN}`, kind: "merchant" } }); made.clients.push(cL.id);
+    const L = await iss(cL.id, "L", ALL);
+    await prisma.clientKey.update({ where: { id: L.id }, data: { rpsLimit: 100_000 } });
+    for (let i = 0; i < 3; i++) await call("POST", "/v1/payment-intents", L.plaintext, { ...good, reference: `store-${RUN}-list-${i}` }, idem());
+    const l1 = await call("GET", `/v1/payment-intents?limit=2`, L.plaintext);
     const l1d = (l1.json.data ?? []) as Array<{ id: string; reference: string }>;
-    const l2 = await call("GET", `/v1/payment-intents?reference=store-${RUN}-list&limit=2&starting_after=${l1d[1]?.id}`, A.plaintext);
+    const l2 = await call("GET", `/v1/payment-intents?limit=2&starting_after=${l1d[1]?.id}`, L.plaintext);
     const l2d = (l2.json.data ?? []) as Array<{ id: string }>;
     check(l1.status === 200 && l1.json.object === "list" && l1d.length === 2 && l1.json.has_more === true && l2d.length === 1 && l2.json.has_more === false && !l1d.some((x) => x.id === l2d[0]?.id),
-      "§5 list: reference filter, limit, has_more, starting_after pages without overlap", `${l1d.length}+${l2d.length} more=${l1.json.has_more}/${l2.json.has_more}`);
-    const lB = await call("GET", `/v1/payment-intents?reference=store-${RUN}-list`, B.plaintext);
+      "§5 list: limit, has_more, starting_after pages without overlap", `${l1d.length}+${l2d.length} more=${l1.json.has_more}/${l2.json.has_more}`);
+    const lr = await call("GET", `/v1/payment-intents?reference=store-${RUN}-list-1`, L.plaintext);
+    check(lr.status === 200 && (lr.json.data as Array<{ reference: string }>).length === 1 && (lr.json.data as Array<{ reference: string }>)[0]?.reference === `store-${RUN}-list-1`, "§5 list: reference filter", `${(lr.json.data as unknown[]).length}`);
+    const lB = await call("GET", `/v1/payment-intents?reference=store-${RUN}-list-1`, B.plaintext);
     check(lB.status === 200 && (lB.json.data as unknown[]).length === 0, "§2 list: another client sees none of them", `${(lB.json.data as unknown[]).length}`);
     const lBc = await call("GET", `/v1/payment-intents?starting_after=${l1d[0]?.id}`, B.plaintext);
     check(lBc.status === 404, "§2 list: another client's id as starting_after is 404", `${lBc.status}`);
     const lbad = await call("GET", `/v1/payment-intents?limit=101`, A.plaintext);
     check(lbad.status === 400 && lbad.code === "validation_failed", "§5 list: limit > 100 is validation_failed", `${lbad.status} ${lbad.code}`);
-    const lst = await call("GET", `/v1/payment-intents?status=requires_payment&reference=store-${RUN}-list`, A.plaintext);
+    const lst = await call("GET", `/v1/payment-intents?status=requires_payment`, L.plaintext);
     check(lst.status === 200 && (lst.json.data as unknown[]).length === 3, "§5 list: status filter", `${(lst.json.data as unknown[]).length}`);
 
     // ── deposits (fixtures written directly: this suite tests the READ side) ──
@@ -223,6 +245,8 @@ async function main() {
     const d = d1.json;
     check(d1.status === 200 && d.object === "deposit" && d.status === "confirmed" && d.amount === "5" && d.tx_hash === `tx${RUN}a` && d.payment_intent_id === pi.id && d.reference === `store-${RUN}-2` && typeof d.confirmed_at === "string" && typeof d.detected_at === "string",
       "§4 GET /deposits/:id renders a Deposit with payment_intent_id", JSON.stringify(d));
+    const dA2 = await call("GET", `/v1/deposits/${dep1.id}`, A2.plaintext);
+    check(dA2.status === 200 && dA2.json.id === dep1.id, "A6 another key of the SAME client reads the deposit (reachable after rotation)", `${dA2.status}`);
     const d2 = await call("GET", `/v1/deposits/${dep1.id}`, B.plaintext);
     const d3 = await call("GET", `/v1/deposits/nope_${RUN}`, B.plaintext);
     check(d2.status === 404 && d2.code === "not_found" && d3.status === 404, "§2 another client's deposit is 404, same as unknown", `${d2.status}/${d3.status}`);
@@ -263,8 +287,68 @@ async function main() {
     // ── §5 routing ──
     const nf = await call("GET", "/v1/nope", A.plaintext);
     check(nf.status === 404 && nf.code === "not_found" && !!nf.json.error?.request_id, "§6 404 not_found — unknown route under /v1, error shape with request_id", `${nf.status}`);
-    const h = await call("GET", "/v1/health", null);
-    check(h.status === 200 && h.json.ok === true, "§5 GET /v1/health needs no key", `${h.status}`);
+    // ── /v1/health (A2/A9) ──
+    const h0 = await call("GET", "/v1/health", null);
+    const lw0 = h0.json.legacy_watch as Record<string, unknown> | undefined;
+    check(h0.status === 200 && h0.json.vault === "unproven" && h0.json.derivation === "unavailable" && !!lw0 && "TRC20" in lw0 && "BEP20" in lw0 && typeof h0.json.observer_lag_blocks === "object",
+      "A9 GET /v1/health needs no key; unwired readers answer the SAFE values (unproven / unavailable)", JSON.stringify(h0.json));
+    const hadCursor = await prisma.scanCursor.findUnique({ where: { chain: "TRC20" } });
+    const stamp = new Date("2026-09-24T12:00:00.000Z");
+    if (hadCursor) await prisma.scanCursor.update({ where: { chain: "TRC20" }, data: { legacyWatchEnabledAt: stamp } });
+    else await prisma.scanCursor.create({ data: { chain: "TRC20", lastScannedBlock: 1n, legacyWatchEnabledAt: stamp } });
+    const h1 = await call("GET", "/v1/health", null);
+    if (hadCursor) await prisma.scanCursor.update({ where: { chain: "TRC20" }, data: { legacyWatchEnabledAt: hadCursor.legacyWatchEnabledAt } });
+    else await prisma.scanCursor.delete({ where: { chain: "TRC20" } });
+    check((h1.json.legacy_watch as Record<string, unknown> | undefined)?.TRC20 === stamp.toISOString() && (h1.json.legacy_watch as Record<string, unknown> | undefined)?.BEP20 === null,
+      "A2 legacy_watch reports scan_cursors.legacy_watch_enabled_at per chain", JSON.stringify(h1.json.legacy_watch));
+    setHealthReaders({ observerLagBlocks: async () => ({ TRC20: 3, BEP20: 7 }), vault: async () => "proven", derivation: async () => "ready" });
+    const h2 = await call("GET", "/v1/health", null);
+    check(h2.json.ok === true && h2.json.vault === "proven" && h2.json.derivation === "ready" && JSON.stringify(h2.json.observer_lag_blocks) === JSON.stringify({ TRC20: 3, BEP20: 7 }),
+      "A9 wired readers are reported as-is", JSON.stringify(h2.json));
+    setHealthReaders({ legacyWatch: async () => { throw new Error("db down"); } });
+    const h3 = await call("GET", "/v1/health", null);
+    check(h3.status === 200 && h3.json.ok === false && !("legacy_watch" in h3.json), "A2 a failing legacy_watch reader is ok:false and the field is ABSENT (never a null that reads as 'not watching')", JSON.stringify(h3.json));
+    const hRoot = await call("GET", "/health", null);
+    check(hRoot.status === 200, "unversioned /health stays for supervision", `${hRoot.status}`);
+
+    // ── /v1/addresses (A9, M-6) ──
+    const aRef = `samaprime:m${RUN}:user:u1`;
+    const ad1 = await call("POST", "/v1/addresses", A.plaintext, { chain: "TRC20", reference: aRef }, idem());
+    check(ad1.status === 201 && ad1.json.object === "address" && ad1.json.chain === "TRC20" && ad1.json.reference === aRef && typeof ad1.json.address === "string" && Object.keys(ad1.json).length === 4,
+      "M-6 POST /v1/addresses → 201 {object:\"address\", chain, address, reference}", JSON.stringify(ad1.json));
+    const ad2 = await call("POST", "/v1/addresses", A2.plaintext, { chain: "TRC20", reference: aRef }, idem());
+    check(ad2.status === 200 && ad2.json.address === ad1.json.address, "A6 same (client, chain, reference) from ANOTHER key of the client → 200, the same address", `${ad2.status}`);
+    const ad3 = await call("POST", "/v1/addresses", B.plaintext, { chain: "TRC20", reference: aRef }, idem());
+    check(ad3.status === 201 && ad3.json.address !== ad1.json.address, "A6 another client with the same reference gets its OWN address", `${ad3.status}`);
+    const ad4 = await call("POST", "/v1/addresses", A.plaintext, { chain: "TRC20", reference: `payment_intent:${pi.id}` }, idem());
+    check(ad4.status === 422 && ad4.code === "reference_invalid", "A9 an intent address's reference (payment_intent:<pi>) can never be requested — 422 reference_invalid", `${ad4.status} ${ad4.code}`);
+    const ad5 = await call("POST", "/v1/addresses", A.plaintext, { chain: "ETH", reference: aRef }, idem());
+    const ad6 = await call("POST", "/v1/addresses", T.plaintext, { chain: "BEP20", reference: aRef }, idem());
+    check(ad5.status === 422 && ad5.code === "unsupported_chain" && ad6.status === 422 && ad6.code === "unsupported_chain", "A9 unsupported / not-enabled chain → 422 unsupported_chain", `${ad5.code}/${ad6.code}`);
+    const ad7 = await call("POST", "/v1/addresses", A.plaintext, { chain: "TRC20" }, idem());
+    check(ad7.status === 400 && ad7.code === "validation_failed" && (ad7.json.error?.details?.fields as string[] | undefined)?.includes("reference") === true, "M-6 missing reference → 400 validation_failed (not the legacy invalid_input)", `${ad7.status} ${ad7.code}`);
+    const ad8 = await call("POST", "/v1/addresses", RO.plaintext, { chain: "TRC20", reference: aRef }, idem());
+    check(ad8.status === 403 && ad8.json.error?.details?.required === "addresses.write", "§6 403 insufficient_scope — addresses without addresses.write", `${ad8.status}`);
+    deriverDown = true;
+    const ad9 = await call("POST", "/v1/addresses", A.plaintext, { chain: "BEP20", reference: aRef }, idem());
+    deriverDown = false;
+    check(ad9.status === 503 && ad9.code === "derivation_unavailable", "§6 503 derivation_unavailable — POST /addresses with no deriver; nothing created", `${ad9.status} ${ad9.code}`);
+    const kAd = idem();
+    const [ra, rb] = await Promise.all([
+      call("POST", "/v1/addresses", A.plaintext, { chain: "BEP20", reference: `samaprime:m${RUN}:user:race` }, kAd),
+      call("POST", "/v1/addresses", A2.plaintext, { chain: "BEP20", reference: `samaprime:m${RUN}:user:race` }, idem()),
+    ]);
+    const raceRows = await prisma.address.count({ where: { reference: `samaprime:m${RUN}:user:race` } });
+    check(ra.json.address === rb.json.address && raceRows === 1 && [ra.status, rb.status].sort().join() === "200,201",
+      "A7 two concurrent POST /addresses for one (client, chain, reference) → ONE address, one 201 + one 200 (per-reference advisory lock; G6 UNIQUE is the backstop)", `${ra.status}/${rb.status} rows=${raceRows}`);
+
+    // ── Phase 0: withdrawals refuse (A9 gate) ──
+    const wBefore = await prisma.withdrawal.count();
+    const w1 = await call("POST", "/v1/withdrawals", A.plaintext, { to: "T" + "x".repeat(33), amount: "1", chain: "TRC20" }, idem());
+    const w2 = await call("POST", "/withdrawals", A.plaintext, { to: "T" + "x".repeat(33), amount: "1", chain: "TRC20" }, idem());
+    const w3 = await call("GET", "/v1/withdrawals/x", A.plaintext);
+    const wAfter = await prisma.withdrawal.count();
+    check(w1.status === 404 && w2.status === 404 && w3.status === 404 && wAfter === wBefore, "A9 GATE — Phase 0 has no withdrawal route: POST /v1/withdrawals and /withdrawals are 404 and no withdrawal row is written", `${w1.status}/${w2.status}/${w3.status} rows ${wBefore}→${wAfter}`);
   } catch (err) {
     fail++;
     console.error(`\n*** THE SUITE THREW — nothing below this point ran ***\n`, err);

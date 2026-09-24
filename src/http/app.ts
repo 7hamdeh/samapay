@@ -2,19 +2,19 @@ import { randomBytes } from "node:crypto";
 import { Hono } from "hono";
 import { ApiError } from "./errors.js";
 import { logger } from "@/log.js";
-// ⚠️ `adminKeys` IS DELIBERATELY NOT MOUNTED IN v1 — see routes/admin-keys.ts.
+// ⚠️ `adminKeys` IS DELIBERATELY NOT MOUNTED — see routes/admin-keys.ts.
 // Its only caller was SamaPrime's merchant-enable action, retired by the
 // 2026-09-04 model correction; keys now come from the CLI (his hand).
+// ⚠️ `withdrawals` IS DELIBERATELY NOT MOUNTED IN PHASE 0 (contract §4
+// Balance, §10; v1.1 A9): the sender stays disabled until the vault is
+// proven. No route can create a withdrawal row; scripts/verify-api-contract.ts
+// proves POST /v1/withdrawals is 404 and writes nothing.
 import { addresses } from "./routes/addresses.js";
-import { deposits, depositsV1 } from "./routes/deposits.js";
-import { withdrawals } from "./routes/withdrawals.js";
+import { deposits } from "./routes/deposits.js";
 import { balance } from "./routes/balance.js";
 import { paymentIntents } from "./routes/payment-intents.js";
 import { events } from "./routes/events.js";
-
-function health(): Record<string, unknown> {
-  return { ok: true, service: "samapay", version: "0.1.0" };
-}
+import { health } from "./routes/health.js";
 
 export function buildApp(): Hono {
   const app = new Hono();
@@ -27,23 +27,18 @@ export function buildApp(): Hono {
     c.res.headers.set("X-Request-Id", requestId);
   });
 
-  // THE CONTRACT SURFACE (contract §5): everything under /v1.
+  // THE CONTRACT SURFACE (contract §5): everything under /v1. The
+  // pre-contract unversioned paths are gone; only /health stays unversioned
+  // for process supervision.
   const v1 = new Hono();
-  v1.get("/health", (c) => c.json(health()));
+  v1.route("/health", health);
   v1.route("/payment-intents", paymentIntents);
-  v1.route("/deposits", depositsV1);
+  v1.route("/deposits", deposits);
   v1.route("/events", events);
   v1.route("/addresses", addresses);
-  v1.route("/withdrawals", withdrawals);
   v1.route("/balance", balance);
   app.route("/v1", v1);
-
-  // Pre-contract unversioned paths, unchanged, for existing callers.
-  app.get("/health", (c) => c.json(health()));
-  app.route("/addresses", addresses);
-  app.route("/deposits", deposits);
-  app.route("/withdrawals", withdrawals);
-  app.route("/balance", balance);
+  app.route("/health", health);
 
   app.notFound((c) => c.json(new ApiError("not_found", "No such route.").toBody(c.get("requestId")), 404));
   app.onError((err, c) => {

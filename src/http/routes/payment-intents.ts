@@ -81,9 +81,24 @@ export function renderIntent(row: IntentRow): Record<string, unknown> {
   };
 }
 
+async function existingForReference(clientId: string, reference: string, amount: string, chain: Chain): Promise<IntentRow | null> {
+  const row = await prisma.paymentIntent.findFirst({ where: { clientId, reference }, select: INTENT_SELECT });
+  if (!row) return null;
+  if (row.chain !== chain || !row.amount.eq(amount)) {
+    throw new ApiError("reference_conflict", "A payment intent with this reference already exists with a different amount or chain.", { payment_intent_id: row.id });
+  }
+  return row;
+}
+
 /** Map G2's typed failures to §6. Anything else propagates to onError → 500 internal. */
 function mapCreateError(e: unknown): never {
   const name = e instanceof Error ? e.name : "";
+  if (name === "IntentInputInvalid") {
+    const fields = (e as { fields?: unknown }).fields;
+    throw new ApiError("validation_failed", "The payment intent input is invalid.", { fields: Array.isArray(fields) ? fields : [] });
+  }
+  if (name === "ReferenceInvalid") throw new ApiError("reference_invalid", "reference must be 1-200 characters of [A-Za-z0-9:_-].");
+  if (name === "ReferenceConflict") throw new ApiError("reference_conflict", "A payment intent with this reference already exists with a different amount or chain.");
   if (name === "AmountOutOfRange") throw new ApiError("amount_out_of_range", "amount is outside this account's allowed range for a payment intent.");
   if (name === "UnsupportedChain") throw new ApiError("unsupported_chain", "This chain is not enabled for this account.");
   if (name === "DerivationUnavailable") throw new ApiError("derivation_unavailable", "Address derivation is unavailable; nothing was created. Retry later.");
@@ -116,9 +131,22 @@ paymentIntents.post("/", scope("payment_intents.write"), idempotent, async (c) =
   // would create a second intent.
   confirmationsRequired(chain as Chain);
 
+  // v1.1 A7: one intent per (client, reference). The same reference with the
+  // same amount + chain IS the existing intent (a store retry with a fresh
+  // Idempotency-Key); a different amount or chain is 409 reference_conflict.
+  // G6's UNIQUE(client_id, reference) is what holds under a race; this read
+  // is the clean answer for the ordinary case.
+  const existing = await existingForReference(key.clientId, reference, amount, chain as Chain);
+  if (existing) return c.json(renderIntent(existing), 200);
+
   let created: { id: string };
   try { created = await createIntentImpl(key.clientId, key.id, { amount, chain: chain as Chain, reference, expiresInSec }); }
   catch (e) {
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+      // Lost the UNIQUE(client_id, reference) race: the winner's row decides.
+      const winner = await existingForReference(key.clientId, reference, amount, chain as Chain);
+      if (winner) return c.json(renderIntent(winner), 200);
+    }
     logger.warn({ actor: `key:${key.id}`, action: "payment_intent.create", result: "refused", reason: e instanceof Error ? e.name : "unknown", requestId: c.get("requestId") }, "payment intent not created");
     mapCreateError(e);
   }
