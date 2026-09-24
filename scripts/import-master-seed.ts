@@ -5,7 +5,7 @@
 //
 //   pnpm exec tsx --env-file=.env scripts/import-master-seed.ts \
 //     --expect-fingerprint=a4434b0b --replace-fingerprint=02e0fb61 \
-//     --backup=/root/backups/samapay-<stamp>.dump            # dry run (backup checked if given)
+//     --backup=/root/backups/samapay/samapay-<stamp>.dump.gpg   # dry run (backup checked if given)
 //   … same … --apply                                         # writes (--backup required)
 //
 // ⚠️ THE 24 WORDS ARE TYPED HERE AND NOWHERE ELSE. Never in argv, never in env,

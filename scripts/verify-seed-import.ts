@@ -19,7 +19,7 @@
 //            ECHOED right after its prompt, and what follows every prompt is checked.
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, utimesSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, utimesSync, readFileSync, renameSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import * as bip39 from "bip39";
 import { prisma } from "@/db/client.js";
@@ -227,13 +227,15 @@ function runInPty(scriptPath: string, args: string[], steps: Array<[RegExp, stri
   });
 }
 
-/** A backup fixture the gate accepts: the runbook's plain samapay-<stamp>.dump, > 10 KiB, no sidecar. */
+/** A backup fixture the gate accepts: samapay-<stamp>.dump.gpg, > 10 KiB, with its bare-hex .sha256 sidecar. */
 function freshBackup(): string {
   const d = new Date(Date.now() + 2000);
   const stamp = d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
   const s = `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 11)}${stamp.slice(11)}`;
-  const p = join(BACKUP_DIR, `samapay-${s}.dump`);
-  writeFileSync(p, crypto.randomBytes(20_000));
+  const p = join(BACKUP_DIR, `samapay-${s}.dump.gpg`);
+  const body = crypto.randomBytes(20_000);
+  writeFileSync(p, body);
+  writeFileSync(`${p}.sha256`, crypto.createHash("sha256").update(body).digest("hex") + "\n");
   const t = (d.getTime() + 1000) / 1000;
   utimesSync(p, t, t);
   return p;
@@ -264,12 +266,14 @@ console.log("\n── CLI: TTY gate (no pty)");
 console.log("\n── LIBRARY: backup path shape");
 {
   const d = "/x/backups";
-  check("stampMs" in backupPathShape(`${d}/samapay-2026-09-24T101500Z.dump`, d), "the runbook's samapay-<stamp>.dump name is accepted");
-  check("problem" in backupPathShape(`${d}/samaprime-2026-09-24T101500Z.dump`, d), "the SamaPrime database's dump is refused (wrong database)");
-  check("problem" in backupPathShape(`${d}/samapay-2026-09-24T101500Z.sql`, d), "another extension is refused");
-  check("problem" in backupPathShape(`/elsewhere/samapay-2026-09-24T101500Z.dump`, d), "a dump outside the backup dir is refused");
-  check("problem" in backupPathShape(`${d}/samapay-2026-02-30T101500Z.dump`, d), "an impossible stamp is refused");
-  check("problem" in backupPathShape(`samapay-2026-09-24T101500Z.dump`, d), "a relative path is refused");
+  check("stampMs" in backupPathShape(`${d}/samapay-2026-09-24T101500Z.dump.gpg`, d), "samapay-backup.sh's samapay-<stamp>.dump.gpg name is accepted");
+  check("problem" in backupPathShape(`${d}/samapay-2026-09-24T101500Z.dump`, d), "an unencrypted .dump is refused");
+  check("problem" in backupPathShape(`${d}/samaprime-2026-09-24T101500Z.dump.gpg`, d), "the SamaPrime database's dump is refused (wrong database)");
+  check("problem" in backupPathShape(`/elsewhere/samapay-2026-09-24T101500Z.dump.gpg`, d), "a dump outside the backup dir is refused");
+  check("problem" in backupPathShape(`${d}/samapay-2026-02-30T101500Z.dump.gpg`, d), "an impossible stamp is refused");
+  check("problem" in backupPathShape(`samapay-2026-09-24T101500Z.dump.gpg`, d), "a relative path is refused");
+  const { PROD_BACKUP_DIR } = await import("@/chain/seed/ops-gate.js");
+  check(PROD_BACKUP_DIR === "/root/backups/samapay" && "stampMs" in backupPathShape("/root/backups/samapay/samapay-2026-09-24T101500Z.dump.gpg", PROD_BACKUP_DIR), "production dir is /root/backups/samapay (samapay-backup.sh's DEST)");
 }
 
 console.log("\n── CLI: import through a pty");
@@ -293,11 +297,15 @@ console.log("\n── CLI: import through a pty");
   const nob = await runInPty("scripts/import-master-seed.ts", ["--rehearsal", `--expect-fingerprint=${NEW_FP}`, `--replace-fingerprint=${OLD_FP}`, "--apply"], [], "import-no-backup");
   check(nob.code === 1 && /--backup/.test(nob.out) && !/word 1 of 24/.test(nob.out), "pty: --apply without --backup → REFUSED before asking for words", `exit ${nob.code}`);
 
-  // an optional sidecar that is present but wrong is refused
+  // the sidecar is REQUIRED and must match
   const badSide = freshBackup();
   writeFileSync(`${badSide}.sha256`, "0".repeat(64) + "\n");
   const bs = await runInPty("scripts/import-master-seed.ts", ["--rehearsal", `--expect-fingerprint=${NEW_FP}`, `--replace-fingerprint=${OLD_FP}`, "--apply", `--backup=${badSide}`], [], "import-bad-sidecar");
-  check(bs.code === 1 && /does not match its .sha256 sidecar/.test(bs.out) && !/word 1 of 24/.test(bs.out), "pty: a present sidecar that does not match → REFUSED before asking for words", `exit ${bs.code}`);
+  check(bs.code === 1 && /does not match its .sha256 sidecar/.test(bs.out) && !/word 1 of 24/.test(bs.out), "pty: a sidecar that does not match → REFUSED before asking for words", `exit ${bs.code}`);
+  const fresh = freshBackup();
+  renameSync(`${fresh}.sha256`, `${fresh}.sha256.moved`);
+  const ns = await runInPty("scripts/import-master-seed.ts", ["--rehearsal", `--expect-fingerprint=${NEW_FP}`, `--replace-fingerprint=${OLD_FP}`, "--apply", `--backup=${fresh}`], [], "import-no-sidecar");
+  check(ns.code === 1 && /has no \.sha256 sidecar/.test(ns.out) && !/word 1 of 24/.test(ns.out), "pty: a dump with NO sidecar → REFUSED before asking for words", `exit ${ns.code}`);
 
   // a stale backup (older than the crypto_config row) is refused
   const stale = freshBackup();
