@@ -25,7 +25,29 @@ export function requireInteractiveTerminal(): void {
     console.error("Run this yourself, directly in a terminal — never through a pipe, a file, or an agent.");
     process.exit(1);
   }
+  // Whatever way the process ends — refusal, crash, process.exit mid-read —
+  // the terminal gets its echo back. (In raw mode Ctrl-C is not a signal; it
+  // arrives as \x03 and aborts the read; SIGTERM/SIGHUP still end up here.)
+  process.once("exit", restoreTerminal);
+  for (const sig of ["SIGTERM", "SIGHUP", "SIGINT"] as const) {
+    process.once(sig, () => { restoreTerminal(); process.exit(130); });
+  }
 }
+
+function restoreTerminal(): void {
+  try {
+    if (process.stdin.isTTY && process.stdin.isRaw) process.stdin.setRawMode(false);
+  } catch {
+    // the terminal is already gone; nothing to restore
+  }
+}
+
+/**
+ * Keystrokes received after the Enter that ended the previous line — a PASTE
+ * of newline-separated words arrives as one chunk. They are kept (in memory
+ * only) and consumed by the next readHiddenLine instead of being dropped.
+ */
+let pendingInput = "";
 
 /**
  * Reads one line from the TTY with echo OFF. Enter ends the line; Backspace
@@ -40,9 +62,10 @@ export function readHiddenLine(prompt: string, input: NodeJS.ReadStream = proces
     }
     output.write(prompt);
     let buf = "";
+    let done = false;
     input.setRawMode(true);
-    input.resume();
     const finish = (err: Error | null) => {
+      done = true;
       input.removeListener("data", onData);
       input.setRawMode(false);
       input.pause();
@@ -50,17 +73,33 @@ export function readHiddenLine(prompt: string, input: NodeJS.ReadStream = proces
       if (err) reject(err);
       else resolve(buf);
     };
-    const onData = (chunk: Buffer) => {
-      const s = chunk.toString("utf8").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\x1b./g, "");
-      for (const ch of s) {
-        if (ch === "\r" || ch === "\n") return finish(null);
-        if (ch === "\x03" || ch === "\x04") return finish(new InputAborted());
+    const consume = (s: string) => {
+      const chars = [...s];
+      for (let i = 0; i < chars.length; i++) {
+        const ch = chars[i] as string;
+        if (ch === "\r" || ch === "\n") {
+          // \r\n from a paste is ONE line end, not an empty line after it.
+          const rest = chars.slice(chars[i + 1] === "\n" && ch === "\r" ? i + 2 : i + 1).join("");
+          pendingInput = rest;
+          return finish(null);
+        }
+        if (ch === "\x03" || ch === "\x04") { pendingInput = ""; return finish(new InputAborted()); }
         if (ch === "\x7f" || ch === "\b") { buf = buf.slice(0, -1); continue; }
         if (ch < " ") continue;
         buf += ch;
       }
     };
+    const onData = (chunk: Buffer) => {
+      consume(chunk.toString("utf8").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\x1b./g, ""));
+    };
+    if (pendingInput) {
+      const s = pendingInput;
+      pendingInput = "";
+      consume(s);
+      if (done) return;
+    }
     input.on("data", onData);
+    input.resume();
   });
 }
 
