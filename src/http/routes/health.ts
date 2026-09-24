@@ -32,7 +32,7 @@ export interface HealthReaders {
   observerLagBlocks(): Promise<PerChain<number | null>>;
   vault(): Promise<"proven" | "unproven">;
   derivation(): Promise<"ready" | "unavailable">;
-  legacyWatch(): Promise<PerChain<Date | null>>;
+  legacyWatch(): Promise<PerChain<string | null>>; // ISO strings (G2 legacyWatchStatus)
 }
 
 let readers: HealthReaders = {
@@ -65,6 +65,6 @@ health.get("/", async (c) => {
     vault: vault.ok ? vault.value : "unproven",
     derivation: derivation.ok ? derivation.value : "unavailable",
   };
-  if (legacy.ok) body.legacy_watch = { TRC20: legacy.value.TRC20?.toISOString() ?? null, BEP20: legacy.value.BEP20?.toISOString() ?? null };
+  if (legacy.ok) body.legacy_watch = { TRC20: legacy.value.TRC20, BEP20: legacy.value.BEP20 };
   return c.json(body, 200);
 });
