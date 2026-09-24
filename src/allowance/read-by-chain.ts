@@ -7,6 +7,11 @@
 //   available = Σ confirmed deposits.amount − Σ their fee_amount − withdrawn
 //   pending   = Σ detected deposits.amount (gross; the fee is stamped only
 //               when the deposit confirms, so none is known yet)
+// WATCH-DISABLED ADDRESSES DO NOT COUNT (review Q M4): a deposit at an
+// address with watch_disabled_at set (the written-off 3.01 USDT under the old
+// seed, contract §8.4/§9 step 0 — owned by the SamaPrime client in production)
+// is money no code can move, so it is neither available nor pending. read()
+// applies the same filter, so the display and the withdrawal bound agree.
 // `withdrawn` uses the same CONSUMING set as read(): every status except
 // RETURNED_STATUSES. Never clamped, never rounded — a negative is a defect
 // made visible. Σ over chains of `available` equals Σ over the client's keys
@@ -29,7 +34,7 @@ export interface ChainPosition {
 
 export async function readClientByChain(clientId: string, tx: Pick<typeof prisma, "deposit" | "withdrawal"> | Tx = prisma): Promise<Record<Chain, ChainPosition>> {
   const [deps, outs] = await Promise.all([
-    tx.deposit.groupBy({ by: ["chain", "status"], _sum: { amount: true, feeAmount: true }, where: { key: { clientId }, status: { in: ["confirmed", "detected"] } } }),
+    tx.deposit.groupBy({ by: ["chain", "status"], _sum: { amount: true, feeAmount: true }, where: { key: { clientId }, status: { in: ["confirmed", "detected"] }, address: { watchDisabledAt: null } } }),
     tx.withdrawal.groupBy({ by: ["chain"], _sum: { amount: true }, where: { key: { clientId }, status: { notIn: [...RETURNED_STATUSES] } } }),
   ]);
   const zero = () => new Prisma.Decimal(0);

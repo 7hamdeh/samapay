@@ -52,14 +52,21 @@ export async function saveMasterSeedConfig(seed: Buffer): Promise<void> {
 }
 
 let cachedSeed: Buffer | null = null;
+/** seedFingerprint(cachedSeed), computed once when it was loaded and verified. */
+let cachedFingerprint: string | null = null;
 let wipeTimer: ReturnType<typeof setTimeout> | null = null;
+/** When the current wipe timer was (re)armed — observable so a test can prove a reader never re-arms it. */
+let wipeArmedAt: number | null = null;
 
 function scheduleWipe(): void {
   if (wipeTimer) clearTimeout(wipeTimer);
+  wipeArmedAt = Date.now();
   wipeTimer = setTimeout(() => {
     cachedSeed?.fill(0);
     cachedSeed = null;
+    cachedFingerprint = null;
     wipeTimer = null;
+    wipeArmedAt = null;
   }, SEED_MEMORY_TTL_MS);
   wipeTimer.unref();
 }
@@ -69,11 +76,26 @@ function scheduleWipe(): void {
  * (resetting the inactivity timer), otherwise from CryptoConfig + decrypt +
  * fingerprint verification. Throws SeedNotConfiguredError if no CryptoConfig
  * row exists yet — run the CLI generator first.
+ *
+ * THE CACHE IS CHECKED AGAINST THE ROW ON EVERY CALL (one primary-key read of
+ * seed_fingerprint). scripts/import-master-seed.ts replaces the row while the
+ * API may be running; before this check a running process kept deriving from
+ * the OLD seed for as long as it stayed busy (the TTL resets on every use),
+ * while /health read the new row and said "ready" (review Q, p0/g4 fb3cc3e).
+ * On mismatch the cache is dropped and the row is decrypted + verified afresh.
+ * The superseded buffer is NOT zeroed here: a concurrent caller may still hold
+ * it across an await, and zeroing it would make that caller derive from 32
+ * zero bytes instead of failing — it is simply released to the GC.
  */
 export async function loadMasterSeed(): Promise<Buffer> {
   if (cachedSeed) {
-    scheduleWipe();
-    return cachedSeed;
+    const row = await prisma.cryptoConfig.findUnique({ where: { id: 1 }, select: { seedFingerprint: true } });
+    if (row && row.seedFingerprint === cachedFingerprint) {
+      scheduleWipe();
+      return cachedSeed;
+    }
+    cachedSeed = null;
+    cachedFingerprint = null;
   }
 
   const config = await prisma.cryptoConfig.findUnique({ where: { id: 1 } });
@@ -89,8 +111,22 @@ export async function loadMasterSeed(): Promise<Buffer> {
   }
 
   cachedSeed = seed;
+  cachedFingerprint = config.seedFingerprint;
   scheduleWipe();
   return cachedSeed;
+}
+
+/**
+ * The fingerprint of the seed THIS PROCESS currently holds (loaded and
+ * verified), or null if none is loaded. For /health: compared with the row.
+ */
+export function loadedSeedFingerprint(): string | null {
+  return cachedSeed ? cachedFingerprint : null;
+}
+
+/** Test/diagnostic view of the cache: never the seed, only whether one is held and when its wipe was armed. */
+export function seedCacheState(): { loaded: boolean; wipeArmedAt: number | null } {
+  return { loaded: cachedSeed !== null, wipeArmedAt };
 }
 
 export interface CryptoConfigStatus {
@@ -112,6 +148,8 @@ export async function getCryptoConfigStatus(): Promise<CryptoConfigStatus> {
 export function wipeMasterSeedCache(): void {
   if (wipeTimer) clearTimeout(wipeTimer);
   wipeTimer = null;
+  wipeArmedAt = null;
   cachedSeed?.fill(0);
   cachedSeed = null;
+  cachedFingerprint = null;
 }

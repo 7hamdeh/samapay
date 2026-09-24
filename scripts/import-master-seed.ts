@@ -4,7 +4,7 @@
 // real terminal, from the SamaPay directory:
 //
 //   pnpm exec tsx --env-file=.env scripts/import-master-seed.ts \
-//     --expect-fingerprint=a4434b0b --replace-fingerprint=02e0fb61 \
+//     --expect-fingerprint=a4434b0b --replace-fingerprint=<OLD_FP> \
 //     --backup=/root/backups/samapay/samapay-<stamp>.dump.gpg   # dry run (backup checked if given)
 //   … same … --apply                                         # writes (--backup required)
 //

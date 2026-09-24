@@ -14,7 +14,7 @@ import { z } from "zod";
 import { prisma } from "@/db/client.js";
 import { logger } from "@/log.js";
 import { getSeedEncryptionKey } from "@/chain/impl/config.js";
-import { decryptSeed, seedFingerprint } from "@/chain/seed/master-seed.js";
+import { decryptSeed, seedFingerprint, loadedSeedFingerprint } from "@/chain/seed/master-seed.js";
 import { deriveArgon2Key, combineAndStretchKey } from "@/chain/seed/passphrase.js";
 import { encryptWithVaultKey, verifyVaultPassphrase } from "@/chain/seed/vault.js";
 
@@ -96,14 +96,40 @@ export async function writeVaultVerifier(input: { passphrase: string; apply: boo
   return { outcome: "written", fingerprint };
 }
 
+/** The one seed row's shape, read WITHOUT decrypting anything. */
+async function readSeedRowShape(): Promise<{ fingerprint: string; vaultVerifier: string | null } | null> {
+  const rows = await prisma.cryptoConfig.findMany({ select: { id: true, seedFingerprint: true, vaultVerifier: true }, take: 2 });
+  const row = rows[0];
+  if (rows.length !== 1 || !row || row.id !== 1 || !fingerprintShape.safeParse(row.seedFingerprint).success) return null;
+  return { fingerprint: row.seedFingerprint, vaultVerifier: row.vaultVerifier };
+}
+
+const fingerprintShape = z.string().regex(/^[0-9a-f]{8}$/);
+
 /**
- * /v1/health reader (contract v1.1 A9): "ready" = crypto_config holds exactly
- * one seed row and it decrypts with SEED_ENCRYPTION_KEY to its own fingerprint.
- * Anything else — no row, two rows, missing key, wrong key — is "unavailable".
+ * /v1/health reader (contract v1.1 A9). /health is unauthenticated and polled
+ * every few seconds, so this NEVER loads or decrypts the seed and NEVER touches
+ * master-seed.ts's wipe timer (review Q low, p0/g4 84ee6ba: calling
+ * loadMasterSeed here kept the plaintext resident and the 60-minute wipe from
+ * ever firing). One indexed read of crypto_config, then:
+ *   - a seed IS cached in this process → "ready" only if its fingerprint equals
+ *     the row's (a process still holding the pre-import seed is "unavailable");
+ *   - nothing cached → "ready" when exactly one well-formed row exists, it
+ *     equals SAMAPAY_EXPECTED_SEED_FINGERPRINT when that is set, and
+ *     SEED_ENCRYPTION_KEY is present and 32 bytes.
+ * Not knowable without decrypting, and therefore NOT claimed: that the stored
+ * blob opens with the configured key. The first real derivation
+ * (loadMasterSeed) verifies that and refuses loudly if it does not.
  */
 export async function derivationStatus(): Promise<"ready" | "unavailable"> {
   try {
-    await readProvenSeedRow();
+    const row = await readSeedRowShape();
+    if (!row) return "unavailable";
+    const loaded = loadedSeedFingerprint();
+    if (loaded !== null) return loaded === row.fingerprint ? "ready" : "unavailable";
+    const expected = process.env.SAMAPAY_EXPECTED_SEED_FINGERPRINT;
+    if (expected !== undefined && expected !== "" && (!fingerprintShape.safeParse(expected).success || expected !== row.fingerprint)) return "unavailable";
+    getSeedEncryptionKey();
     return "ready";
   } catch {
     return "unavailable";
@@ -117,8 +143,9 @@ export async function derivationStatus(): Promise<"ready" | "unavailable"> {
  */
 export async function vaultStatus(): Promise<"proven" | "unproven"> {
   try {
-    const { vaultVerifier } = await readProvenSeedRow();
-    return vaultVerifier === null ? "unproven" : "proven";
+    const row = await readSeedRowShape();
+    if (!row || (await derivationStatus()) !== "ready") return "unproven";
+    return row.vaultVerifier === null ? "unproven" : "proven";
   } catch {
     return "unproven";
   }
