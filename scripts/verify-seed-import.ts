@@ -46,6 +46,9 @@ const seedMod = await import("@/chain/seed/import.js");
 const { mnemonicFromWords, seedFromMnemonic, replaceMasterSeed, SeedImportRefused } = seedMod;
 const masterSeedMod = await import("@/chain/seed/master-seed.js");
 const { encryptSeed, seedFingerprint, loadMasterSeed, wipeMasterSeedCache } = masterSeedMod;
+/** Optional access, like loadedFp: the health-poll check must also RUN on code without the export. */
+const cacheState = (): { loaded: boolean; wipeArmedAt: number | null } =>
+  (masterSeedMod as { seedCacheState?: () => { loaded: boolean; wipeArmedAt: number | null } }).seedCacheState?.() ?? { loaded: true, wipeArmedAt: -1 };
 /** Optional access: this check must also RUN (and fail) on code that predates the export. */
 const loadedFp = (): string | null | undefined => (masterSeedMod as { loadedSeedFingerprint?: () => string | null }).loadedSeedFingerprint?.();
 const { writeVaultVerifier, vaultStatus, derivationStatus, VaultProofRefused } = await import("@/chain/seed/vault-proof.js");
@@ -202,10 +205,37 @@ console.log("\n── LIBRARY: vault proof");
   const other = await thrown(() => writeVaultVerifier({ passphrase: "a different passphrase entirely", apply: true }));
   check(codeOf(other.err) === "verifier_exists", "re-run with a DIFFERENT passphrase → REFUSED (never overwrites a verifier)", codeOf(other.err));
   const realKey = process.env.SEED_ENCRYPTION_KEY;
-  process.env.SEED_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
-  const wrongKey = [await derivationStatus(), await vaultStatus()];
+  wipeMasterSeedCache();
+  delete process.env.SEED_ENCRYPTION_KEY;
+  const noKey = [await derivationStatus(), await vaultStatus()];
   process.env.SEED_ENCRYPTION_KEY = realKey;
-  check(wrongKey[0] === "unavailable" && wrongKey[1] === "unproven", "health under a WRONG SEED_ENCRYPTION_KEY: derivation unavailable, vault unproven", wrongKey.join(","));
+  check(noKey[0] === "unavailable" && noKey[1] === "unproven", "health with SEED_ENCRYPTION_KEY missing: derivation unavailable, vault unproven", noKey.join(","));
+  process.env.SAMAPAY_EXPECTED_SEED_FINGERPRINT = OLD_FP;
+  const pinnedOther = await derivationStatus();
+  process.env.SAMAPAY_EXPECTED_SEED_FINGERPRINT = NEW_FP;
+  const pinnedThis = await derivationStatus();
+  delete process.env.SAMAPAY_EXPECTED_SEED_FINGERPRINT;
+  check(pinnedOther === "unavailable" && pinnedThis === "ready", "SAMAPAY_EXPECTED_SEED_FINGERPRINT set: ready only when the row equals it", `${pinnedOther},${pinnedThis}`);
+
+  // /health is polled every ~10 s: it must never load the seed, never re-arm the wipe.
+  wipeMasterSeedCache();
+  const polls: string[] = [];
+  for (let i = 0; i < 6; i++) polls.push(`${await derivationStatus()}/${await vaultStatus()}`);
+  const cold = cacheState();
+  check(polls.every((p) => p === "ready/proven") && !cold.loaded && cold.wipeArmedAt === null, "6 health polls on a WIPED cache: ready/proven, the seed stays UNLOADED, no wipe timer armed", `${polls[0]}, loaded=${cold.loaded}, armedAt=${cold.wipeArmedAt}`);
+  await loadMasterSeed();
+  const armed = cacheState().wipeArmedAt;
+  await new Promise((r) => setTimeout(r, 30));
+  for (let i = 0; i < 6; i++) await derivationStatus();
+  const warm = cacheState();
+  check(armed !== null && armed !== -1 && warm.loaded && warm.wipeArmedAt === armed, "6 health polls on a WARM cache: the wipe timer is NOT re-armed", `armed ${armed} → ${warm.wipeArmedAt}`);
+  // a process holding a seed the row no longer names is "unavailable" — without reloading it
+  await prisma.cryptoConfig.update({ where: { id: 1 }, data: { seedFingerprint: "ffffffff" } });
+  const stale = await derivationStatus();
+  const staleState = cacheState();
+  await prisma.cryptoConfig.update({ where: { id: 1 }, data: { seedFingerprint: NEW_FP } });
+  check(stale === "unavailable" && staleState.wipeArmedAt === armed, "cached seed ≠ row → unavailable, and health did not reload/re-arm", `${stale}`);
+  wipeMasterSeedCache();
 }
 
 // ─── CLI through a pseudo-terminal
