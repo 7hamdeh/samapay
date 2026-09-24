@@ -193,7 +193,10 @@ async function main() {
     const sql = readFileSync(new URL("../prisma/migrations/20260925000000_phase0/migration.sql", import.meta.url), "utf8");
     const updates = sql.split("\n").filter((l) => l.startsWith("UPDATE \""));
     const nullAddr = await prisma.address.create({ data: { keyId, chain: "BEP20", reference: `verify:g6:null:${RUN}`, address: `0xG6null${RUN}`, derivationIndex: nextIndex() }, select: { id: true } });
-    const nullDep = await prisma.deposit.create({ data: { keyId, addressId: nullAddr.id, chain: "BEP20", txHash: `g6-null-${RUN}`, amount: new Prisma.Decimal("1") }, select: { id: true } });
+    // CONFIRMED, not detected: a detected BEP20 row left on the shared throwaway
+    // DB would be promoted by the next script's observer tick (measured: it broke
+    // verify-routes-end-to-end check 4 when run after this script).
+    const nullDep = await prisma.deposit.create({ data: { keyId, addressId: nullAddr.id, chain: "BEP20", txHash: `g6-null-${RUN}`, amount: new Prisma.Decimal("1"), status: "confirmed", creditedAt: new Date() }, select: { id: true } });
     const nullDl = await prisma.webhookDelivery.create({ data: { keyId, eventType: "deposit.confirmed", eventId: `evt_g6null${RUN}`, payload: {} }, select: { id: true } });
     for (const u of updates) await prisma.$executeRawUnsafe(u);
     const [fa, fd, fw] = await Promise.all([
