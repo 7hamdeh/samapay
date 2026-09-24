@@ -94,7 +94,7 @@ async function main() {
   // fixtures
   const clientA = await prisma.client.create({ data: { name: `g3-a-${RUN}`, kind: "merchant" }, select: { id: true } });
   const clientB = await prisma.client.create({ data: { name: `g3-b-${RUN}`, kind: "merchant" }, select: { id: true } });
-  const keyA = await issueKey({ clientId: clientA.id, name: "a", scopes: ["events.read"], issuedBy: "verify", issuedVia: "cli", webhookUrl: hook });
+  const keyA = await issueKey({ clientId: clientA.id, name: "a", scopes: ["deposits.read"], issuedBy: "verify", issuedVia: "cli", webhookUrl: hook });
   const plainSecret = keyA.webhookSecret ?? "";
   let idx = 900_000 + Math.floor(Math.random() * 50_000);
   const mkAddress = async (reference: string) => prisma.address.create({ data: { keyId: keyA.id, reference, chain: "TRC20", address: `T${RUN}${idx}`.padEnd(34, "x"), derivationIndex: idx++ }, select: { id: true, address: true } });
