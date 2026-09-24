@@ -319,12 +319,6 @@ model IdempotencyKey {
 
 enum DeliveryStatus {
   pending
-  // v1.1 A7 (G3): claimed by a worker by a conditional update
-  // pending → sending, stamped claimed_at; a claim older than G3's stale
-  // window is re-claimable. Added by ALTER TYPE … ADD VALUE in
-  // 20260925000000_phase0 and NOT used anywhere in that file (Postgres
-  // forbids using a new enum value in the transaction that adds it).
-  sending
   delivered
   failed
   exhausted
@@ -345,8 +339,6 @@ model WebhookDelivery {
   nextAttemptAt  DateTime?      @map("next_attempt_at")
   lastStatusCode Int?           @map("last_status_code")
   lastError      String?        @map("last_error")
-  // v1.1 A7 (G3): when a worker claimed this row (pending → sending). UTC via Prisma Date.
-  claimedAt      DateTime?      @map("claimed_at")
   createdAt      DateTime       @default(now()) @map("created_at")
   deliveredAt    DateTime?      @map("delivered_at")
 
