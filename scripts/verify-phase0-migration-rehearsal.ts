@@ -171,7 +171,7 @@ async function main() {
     const idx = await one<{ n: bigint }>(`select count(*) as n from pg_indexes where schemaname='public' and indexname in ('addresses_client_id_chain_reference_key','webhook_deliveries_key_id_event_id_key','payment_intents_client_id_reference_key','events_object_id_type_key')`);
     const gone = await one<{ n: bigint }>(`select count(*) as n from pg_indexes where indexname = 'payment_intents_client_id_reference_idx'`);
     check(Number(idx.n) === 4 && Number(gone.n) === 0, "R6. the 4 UNIQUE indexes exist; the replaced plain index is gone", `unique=${idx.n} old=${gone.n}`);
-    const dup = await prisma.$executeRawUnsafe(`insert into addresses (id, key_id, client_id, reference, chain, address, derivation_index) values ('a_dup2', 'k_adm', 'c_sp', 'samaprime:m_samaprime:user:u_42', 'TRC20', 'TRehearsalDup2xxxxxxxxxxxxxxxxxxxx', 59)`).then(() => "inserted", (e: Error) => (/unique/i.test(e.message) ? "unique_violation" : e.message));
+    const dup = await prisma.$executeRawUnsafe(`insert into addresses (id, key_id, client_id, reference, chain, address, derivation_index) values ('a_dup2', 'k_adm', 'c_sp', 'samaprime:m_samaprime:user:u_42', 'TRC20', 'TRehearsalDup2xxxxxxxxxxxxxxxxxxxx', 59)`).then(() => "inserted", (e: Error) => (/23505/.test(e.message) && /\(client_id, chain, reference\)/.test(e.message) ? "unique_violation" : e.message));
     check(dup === "unique_violation", "R7. after phase0, a duplicate (client, chain, reference) is refused by the index", dup);
   }
   await prisma.$disconnect();
