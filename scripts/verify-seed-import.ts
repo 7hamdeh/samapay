@@ -227,15 +227,13 @@ function runInPty(scriptPath: string, args: string[], steps: Array<[RegExp, stri
   });
 }
 
-/** A backup fixture the gate accepts: named by the SamaPay backup convention, > 10 KiB, sha256 sidecar. */
+/** A backup fixture the gate accepts: the runbook's plain samapay-<stamp>.dump, > 10 KiB, no sidecar. */
 function freshBackup(): string {
   const d = new Date(Date.now() + 2000);
   const stamp = d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
   const s = `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 11)}${stamp.slice(11)}`;
-  const p = join(BACKUP_DIR, `samapay-${s}.dump.gpg`);
-  const body = crypto.randomBytes(20_000);
-  writeFileSync(p, body);
-  writeFileSync(`${p}.sha256`, crypto.createHash("sha256").update(body).digest("hex") + "\n");
+  const p = join(BACKUP_DIR, `samapay-${s}.dump`);
+  writeFileSync(p, crypto.randomBytes(20_000));
   const t = (d.getTime() + 1000) / 1000;
   utimesSync(p, t, t);
   return p;
@@ -266,11 +264,12 @@ console.log("\n── CLI: TTY gate (no pty)");
 console.log("\n── LIBRARY: backup path shape");
 {
   const d = "/x/backups";
-  check("stampMs" in backupPathShape(`${d}/samapay-2026-09-24T101500Z.dump.gpg`, d), "the backup convention's name is accepted");
-  check("problem" in backupPathShape(`${d}/samaprime-2026-09-24T101500Z.dump.gpg`, d), "the SamaPrime database's dump is refused (wrong database)");
-  check("problem" in backupPathShape(`/elsewhere/samapay-2026-09-24T101500Z.dump.gpg`, d), "a dump outside the backup dir is refused");
-  check("problem" in backupPathShape(`${d}/samapay-2026-02-30T101500Z.dump.gpg`, d), "an impossible stamp is refused");
-  check("problem" in backupPathShape(`samapay-2026-09-24T101500Z.dump.gpg`, d), "a relative path is refused");
+  check("stampMs" in backupPathShape(`${d}/samapay-2026-09-24T101500Z.dump`, d), "the runbook's samapay-<stamp>.dump name is accepted");
+  check("problem" in backupPathShape(`${d}/samaprime-2026-09-24T101500Z.dump`, d), "the SamaPrime database's dump is refused (wrong database)");
+  check("problem" in backupPathShape(`${d}/samapay-2026-09-24T101500Z.sql`, d), "another extension is refused");
+  check("problem" in backupPathShape(`/elsewhere/samapay-2026-09-24T101500Z.dump`, d), "a dump outside the backup dir is refused");
+  check("problem" in backupPathShape(`${d}/samapay-2026-02-30T101500Z.dump`, d), "an impossible stamp is refused");
+  check("problem" in backupPathShape(`samapay-2026-09-24T101500Z.dump`, d), "a relative path is refused");
 }
 
 console.log("\n── CLI: import through a pty");
@@ -293,6 +292,12 @@ console.log("\n── CLI: import through a pty");
   // --apply without --backup: refused BEFORE a single word is asked for
   const nob = await runInPty("scripts/import-master-seed.ts", ["--rehearsal", `--expect-fingerprint=${NEW_FP}`, `--replace-fingerprint=${OLD_FP}`, "--apply"], [], "import-no-backup");
   check(nob.code === 1 && /--backup/.test(nob.out) && !/word 1 of 24/.test(nob.out), "pty: --apply without --backup → REFUSED before asking for words", `exit ${nob.code}`);
+
+  // an optional sidecar that is present but wrong is refused
+  const badSide = freshBackup();
+  writeFileSync(`${badSide}.sha256`, "0".repeat(64) + "\n");
+  const bs = await runInPty("scripts/import-master-seed.ts", ["--rehearsal", `--expect-fingerprint=${NEW_FP}`, `--replace-fingerprint=${OLD_FP}`, "--apply", `--backup=${badSide}`], [], "import-bad-sidecar");
+  check(bs.code === 1 && /does not match its .sha256 sidecar/.test(bs.out) && !/word 1 of 24/.test(bs.out), "pty: a present sidecar that does not match → REFUSED before asking for words", `exit ${bs.code}`);
 
   // a stale backup (older than the crypto_config row) is refused
   const stale = freshBackup();
@@ -325,8 +330,8 @@ console.log("\n── CLI: prove-vault through a pty");
   check((await vaultStatus()) === "unproven", "before prove-vault: vault unproven");
   const mism = await runInPty("scripts/prove-vault.ts", ["--rehearsal", "--apply", `--backup=${freshBackup()}`], [[/New vault passphrase: $/, pass], [/Type it again: $/, pass + "!"]], "vault-mismatch");
   check(mism.code === 1 && /did not match/.test(mism.out) && (await vaultStatus()) === "unproven", "pty: two different entries → REFUSED, still unproven", `exit ${mism.code}`);
-  const ok = await runInPty("scripts/prove-vault.ts", ["--rehearsal", "--apply", `--backup=${freshBackup()}`], [[/New vault passphrase: $/, pass], [/Type it again: $/, pass]], "vault-apply");
-  check(ok.code === 0 && /vault: proven/.test(ok.out), "pty: prove-vault --apply → exit 0, prints vault: proven", `exit ${ok.code}`);
+  const ok = await runInPty("scripts/prove-vault.ts", ["--rehearsal", "--apply"], [[/New vault passphrase: $/, pass], [/Type it again: $/, pass]], "vault-apply");
+  check(ok.code === 0 && /vault: proven/.test(ok.out), "pty: prove-vault --apply (no --backup, runbook §4) → exit 0, prints vault: proven", `exit ${ok.code}`);
   check((await vaultStatus()) === "proven", "health: vault proven after the CLI");
   check(!ok.out.includes(pass) && !ok.out.includes("typed at the tty"), "pty: ECHO OFF — the passphrase is not in what the terminal displayed");
 }

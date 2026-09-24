@@ -4,7 +4,11 @@
 // Ibrahim at a real terminal, from the SamaPay directory:
 //
 //   pnpm exec tsx --env-file=.env scripts/prove-vault.ts                                    # dry run
-//   pnpm exec tsx --env-file=.env scripts/prove-vault.ts --apply --backup=<fresh dump>      # writes
+//   pnpm exec tsx --env-file=.env scripts/prove-vault.ts --apply                            # writes
+//
+// --backup is OPTIONAL here (runbook §4): the only write is vault_verifier
+// NULL → value, conditional on the row still holding this seed and no
+// verifier. If --backup is given it is gated exactly like the import's.
 //
 // Asks for a NEW vault passphrase twice (echo OFF), proves the stored seed
 // decrypts to its fingerprint, writes crypto_config.vault_verifier, and opens
@@ -29,7 +33,7 @@ async function main(): Promise<number> {
   getSeedEncryptionKey();
   getPassphraseSalt();
   await openOpsRun("prove-vault", mode);
-  if (mode.apply) await requireFreshBackup(mode.values.get("--backup"), backupDirFor(mode));
+  if (mode.values.has("--backup")) await requireFreshBackup(mode.values.get("--backup"), backupDirFor(mode));
 
   const derivation = await derivationStatus();
   process.stdout.write(`before: derivation ${derivation}, vault ${await vaultStatus()}\n`);
@@ -42,7 +46,7 @@ async function main(): Promise<number> {
 
   const r = await writeVaultVerifier({ passphrase: pass, apply: mode.apply });
   process.stdout.write(`\nseed fingerprint: ${r.fingerprint}\n`);
-  if (r.outcome === "would_write") process.stdout.write("DRY RUN — the verifier opens with this passphrase. Nothing written. Re-run with --apply --backup=<fresh dump>.\n");
+  if (r.outcome === "would_write") process.stdout.write("DRY RUN — the verifier opens with this passphrase. Nothing written. Re-run with --apply.\n");
   else if (r.outcome === "already_proven") process.stdout.write("ALREADY PROVEN — a verifier for this seed and this passphrase is stored. Nothing written.\n");
   else process.stdout.write("WRITTEN — the vault verifier is stored and opens with this passphrase.\n");
   process.stdout.write(`vault: ${await vaultStatus()}\n`);

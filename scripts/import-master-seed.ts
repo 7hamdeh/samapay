@@ -4,8 +4,9 @@
 // real terminal, from the SamaPay directory:
 //
 //   pnpm exec tsx --env-file=.env scripts/import-master-seed.ts \
-//     --expect-fingerprint=a4434b0b --replace-fingerprint=02e0fb61                 # dry run
-//   … same … --apply --backup=/root/backups/samapay/samapay-<stamp>.dump.gpg      # writes
+//     --expect-fingerprint=a4434b0b --replace-fingerprint=02e0fb61 \
+//     --backup=/root/backups/samapay-<stamp>.dump            # dry run (backup checked if given)
+//   … same … --apply                                         # writes (--backup required)
 //
 // ⚠️ THE 24 WORDS ARE TYPED HERE AND NOWHERE ELSE. Never in argv, never in env,
 // never piped. The script:
@@ -39,7 +40,7 @@ async function main(): Promise<number> {
   getSeedEncryptionKey(); // refuse now, not after 24 words, if the key is missing
 
   await openOpsRun("import-master-seed", mode);
-  if (mode.apply) await requireFreshBackup(mode.values.get("--backup"), backupDirFor(mode));
+  if (mode.apply || mode.values.has("--backup")) await requireFreshBackup(mode.values.get("--backup"), backupDirFor(mode));
 
   process.stdout.write(`Type the ${MNEMONIC_WORD_COUNT} words of seed ${expectFp.data}. Nothing you type is shown. Ctrl-C aborts.\n\n`);
   const words = await collectMnemonicWords((p) => readHiddenLine(p), (l) => process.stdout.write(l), MNEMONIC_WORD_COUNT);

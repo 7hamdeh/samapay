@@ -3,10 +3,10 @@
 //
 //   - DRY RUN by default; `--apply` writes.
 //   - Production mode: current_database() must be `samapay` on port 5432.
-//     `--apply` also needs `--backup=<file>`: a dump in /root/backups/samapay
-//     named samapay-<YYYY-MM-DDTHHMMSSZ>.dump[.gpg], with its .sha256 sidecar,
+//     The import's `--apply` also needs `--backup=<file>`: the runbook's plain
+//     `pg_dump -Fc samapay` file, /root/backups/samapay-<YYYY-MM-DDTHHMMSSZ>.dump,
 //     taken AFTER the last write to crypto_config (its created_at, which the
-//     import sets) — so one dump cannot cover both the import and the vault proof.
+//     import sets). A .sha256 sidecar is optional; if one exists it must match.
 //   - `--rehearsal`: the ONLY way to run anywhere else, and then only on a
 //     `*_sandbox` database on 127.0.0.1 away from the real ports (5432/5433),
 //     with the backup fixture dir from env SAMAPAY_OPS_REHEARSAL_BACKUP_DIR.
@@ -19,8 +19,8 @@ import { databaseNameFromUrl } from "@/db/guard.js";
 
 export const PROD_DATABASE = "samapay";
 export const PROD_PORT = 5432;
-export const PROD_BACKUP_DIR = "/root/backups/samapay";
-const BACKUP_NAME = /^samapay-(\d{4})-(\d{2})-(\d{2})T(\d{2})(\d{2})(\d{2})Z\.dump(\.gpg)?$/;
+export const PROD_BACKUP_DIR = "/root/backups";
+const BACKUP_NAME = /^samapay-(\d{4})-(\d{2})-(\d{2})T(\d{2})(\d{2})(\d{2})Z\.dump$/;
 
 export class OpsRefused extends Error {
   constructor(message: string) {
@@ -90,7 +90,7 @@ export function backupPathShape(path: string, dir: string): { stampMs: number } 
   const abs = resolve(path);
   if (dirname(abs) !== resolve(dir)) return { problem: `backup ${path} is not in ${dir}` };
   const m = BACKUP_NAME.exec(basename(abs));
-  if (!m) return { problem: `backup ${path} is not named samapay-<YYYY-MM-DDTHHMMSSZ>.dump[.gpg]` };
+  if (!m) return { problem: `backup ${path} is not named samapay-<YYYY-MM-DDTHHMMSSZ>.dump (the runbook's pg_dump -Fc file)` };
   const [y, mo, d, h, mi, se] = m.slice(1, 7).map(Number) as [number, number, number, number, number, number];
   const stampMs = Date.UTC(y, mo - 1, d, h, mi, se);
   const back = new Date(stampMs);
@@ -113,8 +113,9 @@ export async function lastSeedWriteMs(): Promise<number | null> {
 
 /**
  * Refuses unless `path` is a fresh dump: right dir + name, a regular file
- * > 10 KiB, matching its .sha256 sidecar, modified within 120 min and not
- * before its own stamp, and started AND finished after the last seed write.
+ * > 10 KiB, modified within 120 min and not before its own stamp, started AND
+ * finished after the last seed write, and — only if a .sha256 sidecar exists —
+ * matching it.
  */
 export async function requireFreshBackup(path: string | undefined, dir: string): Promise<void> {
   expect(!!path, "--apply needs --backup=<path of the SamaPay dump taken just before this step>");
@@ -131,14 +132,17 @@ export async function requireFreshBackup(path: string | undefined, dir: string):
   expect(st.mtimeMs <= now + 60_000, `backup ${p} is modified in the future (${new Date(st.mtimeMs).toISOString()})`);
   expect(st.mtimeMs + 1_000 >= shape.stampMs, `backup ${p} was modified (${new Date(st.mtimeMs).toISOString()}) before the time in its own name`);
   const side = `${p}.sha256`;
-  expect(existsSync(side) && lstatSync(side).isFile(), `backup ${p} has no .sha256 sidecar (${side})`);
-  const want = readFileSync(side, "utf8").trim().split(/\s+/)[0] ?? "";
-  expect(/^[0-9a-f]{64}$/.test(want), `backup sidecar ${side} does not hold a sha256`);
-  const got = createHash("sha256").update(readFileSync(p)).digest("hex");
-  expect(want === got, `backup ${p} does not match its .sha256 sidecar`);
+  const hasSide = existsSync(side);
+  if (hasSide) {
+    expect(lstatSync(side).isFile(), `backup sidecar ${side} is not a regular file`);
+    const want = readFileSync(side, "utf8").trim().split(/\s+/)[0] ?? "";
+    expect(/^[0-9a-f]{64}$/.test(want), `backup sidecar ${side} does not hold a sha256`);
+    const got = createHash("sha256").update(readFileSync(p)).digest("hex");
+    expect(want === got, `backup ${p} does not match its .sha256 sidecar`);
+  }
   const last = await lastSeedWriteMs();
   if (last !== null) {
     expect(shape.stampMs > last && st.mtimeMs > last, `backup ${p} (started ${new Date(shape.stampMs).toISOString()}) is not newer than the last crypto_config write (${new Date(last).toISOString()}) — take a fresh backup now`);
   }
-  console.log(`backup: ${p} (${st.size} bytes, ${ageMin.toFixed(0)} min old, sha256 ok; last crypto_config write ${last === null ? "none" : new Date(last).toISOString()})\n`);
+  console.log(`backup: ${p} (${st.size} bytes, ${ageMin.toFixed(0)} min old, ${hasSide ? "sha256 sidecar ok" : "no sidecar"}; last crypto_config write ${last === null ? "none" : new Date(last).toISOString()})\n`);
 }
