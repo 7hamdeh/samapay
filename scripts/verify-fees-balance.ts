@@ -23,7 +23,7 @@ import { ApiError } from "@/http/errors.js";
 import { balance } from "@/http/routes/balance.js";
 import { issueKey } from "@/keys/issue.js";
 import { provisionClientKey } from "@/keys/provision.js";
-import { MERCHANT_DEFAULT_SCOPES, termsFromArgv, TermsError } from "@/keys/terms.js";
+import { MERCHANT_DEFAULT_SCOPES, normalizeArgv, termsFromArgv, TermsError } from "@/keys/terms.js";
 import { computeFee, feeForConfirmation, read, readClientByChain, reserve, AllowanceExceeded, InvalidFeeBps } from "@/allowance/index.js";
 import { backupProblem, disableAddress, parseArgs } from "./ops/disable-address.js";
 import { check, summary, thrown, voidCheck } from "./lib/check.js";
@@ -54,6 +54,8 @@ async function main() {
   const argv = termsFromArgv(["x", "--fee-bps", "250", "--min-intent", "5", "--max-intent", "500.5", "--chains", "TRC20"]);
   check(JSON.stringify(argv) === JSON.stringify({ feeBps: 250, minIntent: "5", maxIntent: "500.5", enabledChains: ["TRC20"] }), "B3. the CLI flags parse into terms", JSON.stringify(argv));
   check(JSON.stringify(termsFromArgv(["x", "--name", "k"])) === "{}", "B4. no terms flags → no change requested");
+  const runbook = normalizeArgv(["x", "--client=SamaPrime", "--kind=merchant", "--fee-bps=0", "--webhook-url=http://127.0.0.1:3033/api/webhooks/samapay/c1?a=b"]);
+  check(JSON.stringify(runbook) === JSON.stringify(["x", "--client", "SamaPrime", "--kind", "merchant", "--fee-bps", "0", "--webhook-url", "http://127.0.0.1:3033/api/webhooks/samapay/c1?a=b"]) && JSON.stringify(termsFromArgv(runbook)) === JSON.stringify({ feeBps: 0 }), "B9. the runbook's --flag=value form parses the same as --flag value (value may contain '=')", JSON.stringify(runbook));
 
   const made: string[] = [];
   const name = `verify-g6-${RUN}`;
@@ -133,7 +135,9 @@ async function main() {
     check(dry.outcome === "would_disable" && afterDry.watchDisabledAt === null, "D1. dry run (the default) reports would_disable and writes nothing", dry.outcome);
     check(parseArgs(["--address=" + target.address]).apply === false, "D2. no --apply flag → dry run");
     const noBackup = await thrown(async () => parseArgs(["--address=" + target.address, "--apply"]));
-    check(noBackup.name === "Error" && /--backup/.test(String((noBackup.err as Error)?.message)), "D3. --apply without --backup/--by is refused at parse time", String((noBackup.err as Error | undefined)?.message));
+    check(noBackup.name === "Error" && /--backup/.test(String((noBackup.err as Error)?.message)), "D3. --apply without --backup is refused at parse time", String((noBackup.err as Error | undefined)?.message));
+    const rb6 = parseArgs(["--address=" + target.address, "--apply", "--backup=/x/y.dump"]);
+    check(rb6.apply && rb6.by === "ibrahim" && rb6.backup === "/x/y.dump", "D3b. runbook §6 form: --address=… --apply (+ --backup) parses; --by defaults to ibrahim", JSON.stringify(rb6));
     const auditBefore = await prisma.auditEvent.count({ where: { action: "address.watch_disabled", subjectId: target.id } });
     const applied = await disableAddress(prisma, { address: target.address, apply: true, by: "verify", reason: "old seed" });
     const stamped = await prisma.address.findUniqueOrThrow({ where: { id: target.id }, select: { watchDisabledAt: true } });
@@ -189,7 +193,10 @@ async function main() {
     const sql = readFileSync(new URL("../prisma/migrations/20260925000000_phase0/migration.sql", import.meta.url), "utf8");
     const updates = sql.split("\n").filter((l) => l.startsWith("UPDATE \""));
     const nullAddr = await prisma.address.create({ data: { keyId, chain: "BEP20", reference: `verify:g6:null:${RUN}`, address: `0xG6null${RUN}`, derivationIndex: nextIndex() }, select: { id: true } });
-    const nullDep = await prisma.deposit.create({ data: { keyId, addressId: nullAddr.id, chain: "BEP20", txHash: `g6-null-${RUN}`, amount: new Prisma.Decimal("1") }, select: { id: true } });
+    // CONFIRMED, not detected: a detected BEP20 row left on the shared throwaway
+    // DB would be promoted by the next script's observer tick (measured: it broke
+    // verify-routes-end-to-end check 4 when run after this script).
+    const nullDep = await prisma.deposit.create({ data: { keyId, addressId: nullAddr.id, chain: "BEP20", txHash: `g6-null-${RUN}`, amount: new Prisma.Decimal("1"), status: "confirmed", creditedAt: new Date() }, select: { id: true } });
     const nullDl = await prisma.webhookDelivery.create({ data: { keyId, eventType: "deposit.confirmed", eventId: `evt_g6null${RUN}`, payload: {} }, select: { id: true } });
     for (const u of updates) await prisma.$executeRawUnsafe(u);
     const [fa, fd, fw] = await Promise.all([

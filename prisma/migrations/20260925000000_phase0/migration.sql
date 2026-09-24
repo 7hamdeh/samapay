@@ -28,7 +28,14 @@
 -- DESTRUCTIVE STATEMENTS: exactly one — DROP INDEX
 -- "payment_intents_client_id_reference_idx" (a plain index from
 -- 20260924000000, replaced in the same file by the UNIQUE index on the same
--- two columns). No table, column or data is dropped. No ALTER TYPE … ADD VALUE.
+-- two columns). No table, column or data is dropped.
+--
+-- ENUM ADD VALUE: exactly one — ALTER TYPE "DeliveryStatus" ADD VALUE
+-- 'sending' (v1.1 A7, G3's delivery claim). PostgreSQL forbids USING a new
+-- enum value inside the transaction that added it; NO statement in this file
+-- uses 'sending' (the checks and backfills never touch status). The generator
+-- emits it without BEFORE, so the value sorts last in the type
+-- (pending, delivered, failed, exhausted, sending); no code orders by status.
 --
 -- WHAT CAN FAIL, AND WHEN: the three new UNIQUE indexes fail on existing
 -- duplicates. The PRE-CHECK below raises FIRST, before any statement has
@@ -63,6 +70,8 @@
 --   deposits.client_id           TEXT NULL, FK clients           backfilled; NOT NULL in contract-pending
 --   deposits.fee_amount          DECIMAL(18,6) NOT NULL DEFAULT 0 stamped at confirmation (src/allowance/fee.ts)
 --   webhook_deliveries.client_id TEXT NULL, FK clients           backfilled; NOT NULL in contract-pending
+--   webhook_deliveries.claimed_at TIMESTAMP(3) NULL              A7: stamped on the pending → sending claim (G3)
+--   "DeliveryStatus" + 'sending'                                  A7: claimed by a worker, not yet answered (G3)
 --   scan_cursors.legacy_watch_enabled_at TIMESTAMP(3) NULL       THE single legacy-handover switch (§9 step 5b, A3)
 --   events: id TEXT PK (evt_…), client_id FK clients, key_id FK client_keys,
 --           type TEXT, object_kind "EventObjectKind" (payment_intent|deposit),
@@ -93,6 +102,9 @@ END $$;
 -- CreateEnum
 CREATE TYPE "EventObjectKind" AS ENUM ('payment_intent', 'deposit');
 
+-- AlterEnum
+ALTER TYPE "DeliveryStatus" ADD VALUE 'sending';
+
 -- DropIndex
 DROP INDEX "payment_intents_client_id_reference_idx";
 
@@ -111,7 +123,8 @@ ALTER TABLE "deposits" ADD COLUMN     "client_id" TEXT,
 ADD COLUMN     "fee_amount" DECIMAL(18,6) NOT NULL DEFAULT 0;
 
 -- AlterTable
-ALTER TABLE "webhook_deliveries" ADD COLUMN     "client_id" TEXT;
+ALTER TABLE "webhook_deliveries" ADD COLUMN     "claimed_at" TIMESTAMP(3),
+ADD COLUMN     "client_id" TEXT;
 
 -- HAND-ADDED BACKFILL: client_id from the row's key (client_keys.client_id is NOT NULL + FK)
 UPDATE "addresses" a SET "client_id" = k."client_id" FROM "client_keys" k WHERE k."id" = a."key_id" AND a."client_id" IS NULL;

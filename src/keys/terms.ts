@@ -49,7 +49,15 @@ export function resolveTerms(
   return out;
 }
 
-/** The terms flags of scripts/issue-key.ts, read from argv. A flag that is absent stays absent (no change). */
+/**
+ * `--flag=value` → `--flag`, `value` (the runbook's form); `--flag value`
+ * passes through unchanged. So both spellings reach one parser.
+ */
+export function normalizeArgv(argv: readonly string[]): string[] {
+  return argv.flatMap((a) => { const m = /^(--[a-z][a-z0-9-]*)=(.*)$/s.exec(a); return m ? [m[1] as string, m[2] as string] : [a]; });
+}
+
+/** The terms flags of scripts/issue-key.ts, read from (normalized) argv. A flag that is absent stays absent (no change). */
 export function termsFromArgv(argv: readonly string[]): Record<string, unknown> {
   // A flag given with no value reads as "" and is REFUSED by Zod, never silently skipped.
   const val = (name: string) => { const i = argv.indexOf(`--${name}`); return i >= 0 ? (argv[i + 1] ?? "") : undefined; };
