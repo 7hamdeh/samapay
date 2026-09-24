@@ -14,7 +14,7 @@ import { z } from "zod";
 import { prisma } from "@/db/client.js";
 import { logger } from "@/log.js";
 import { getSeedEncryptionKey } from "@/chain/impl/config.js";
-import { decryptSeed, seedFingerprint } from "@/chain/seed/master-seed.js";
+import { decryptSeed, seedFingerprint, loadMasterSeed, loadedSeedFingerprint } from "@/chain/seed/master-seed.js";
 import { deriveArgon2Key, combineAndStretchKey } from "@/chain/seed/passphrase.js";
 import { encryptWithVaultKey, verifyVaultPassphrase } from "@/chain/seed/vault.js";
 
@@ -98,13 +98,18 @@ export async function writeVaultVerifier(input: { passphrase: string; apply: boo
 
 /**
  * /v1/health reader (contract v1.1 A9): "ready" = crypto_config holds exactly
- * one seed row and it decrypts with SEED_ENCRYPTION_KEY to its own fingerprint.
- * Anything else — no row, two rows, missing key, wrong key — is "unavailable".
+ * one seed row that decrypts with SEED_ENCRYPTION_KEY to its own fingerprint,
+ * AND the seed THIS PROCESS derives from (master-seed.ts's cache, loaded and
+ * verified via loadMasterSeed) has that same fingerprint. Reading only the row
+ * reported "ready" while a running process still held the pre-import seed
+ * (review Q, p0/g4 fb3cc3e). Anything else — no row, two rows, missing or
+ * wrong key, a process seed that differs from the row — is "unavailable".
  */
 export async function derivationStatus(): Promise<"ready" | "unavailable"> {
   try {
-    await readProvenSeedRow();
-    return "ready";
+    const { fingerprint } = await readProvenSeedRow();
+    await loadMasterSeed();
+    return loadedSeedFingerprint() === fingerprint ? "ready" : "unavailable";
   } catch {
     return "unavailable";
   }
@@ -118,6 +123,7 @@ export async function derivationStatus(): Promise<"ready" | "unavailable"> {
 export async function vaultStatus(): Promise<"proven" | "unproven"> {
   try {
     const { vaultVerifier } = await readProvenSeedRow();
+    if ((await derivationStatus()) !== "ready") return "unproven";
     return vaultVerifier === null ? "unproven" : "proven";
   } catch {
     return "unproven";

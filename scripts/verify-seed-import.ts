@@ -44,7 +44,10 @@ process.env.SAMAPAY_OPS_REHEARSAL_BACKUP_DIR = BACKUP_DIR;
 // Imported only after the env above exists (they read it lazily, but be explicit).
 const seedMod = await import("@/chain/seed/import.js");
 const { mnemonicFromWords, seedFromMnemonic, replaceMasterSeed, SeedImportRefused } = seedMod;
-const { encryptSeed, seedFingerprint, loadMasterSeed, wipeMasterSeedCache } = await import("@/chain/seed/master-seed.js");
+const masterSeedMod = await import("@/chain/seed/master-seed.js");
+const { encryptSeed, seedFingerprint, loadMasterSeed, wipeMasterSeedCache } = masterSeedMod;
+/** Optional access: this check must also RUN (and fail) on code that predates the export. */
+const loadedFp = (): string | null | undefined => (masterSeedMod as { loadedSeedFingerprint?: () => string | null }).loadedSeedFingerprint?.();
 const { writeVaultVerifier, vaultStatus, derivationStatus, VaultProofRefused } = await import("@/chain/seed/vault-proof.js");
 const { verifyVaultPassphrase, encryptWithVaultKey } = await import("@/chain/seed/vault.js");
 const { deriveArgon2Key, combineAndStretchKey } = await import("@/chain/seed/passphrase.js");
@@ -154,6 +157,11 @@ console.log("\n── LIBRARY: replaceMasterSeed");
   await prisma.cryptoConfig.delete({ where: { id: 2 } });
   check((await snapshot()) === before, "…0 rows changed");
 
+  // Q's probe (p0/g4 fb3cc3e review): the SAME process derives before the import —
+  // the old seed is now cached — and must derive from the NEW seed after it,
+  // with no cache wipe in between. A running API is exactly this process.
+  const pre = await loadMasterSeed();
+  check(pre.equals(oldSeed), "before the import this process holds the old seed (cache warm)");
   const t0 = Date.now();
   const done = await replaceMasterSeed({ seed: newSeed, expectFingerprint: NEW_FP, replaceFingerprint: OLD_FP, apply: true });
   check(done.outcome === "replaced" && done.fingerprint === NEW_FP, "success → replaced", done.outcome);
@@ -161,9 +169,11 @@ console.log("\n── LIBRARY: replaceMasterSeed");
   check(after.length === 1 && after[0]?.id === 1 && after[0]?.seedFingerprint === NEW_FP, "exactly one row, id 1, new fingerprint", `${after.length} row(s)`);
   check(after[0]?.vaultVerifier === null && after[0]?.hotWalletAddressTrc20 === null && after[0]?.hotWalletAddressBep20 === null, "old seed's vault verifier + hot-wallet cache cleared (they belonged to the old seed)");
   check((after[0]?.createdAt.getTime() ?? 0) >= t0 - 1000, "created_at moved to the import time (the next backup gate is measured from it)");
-  wipeMasterSeedCache();
+  // NO wipeMasterSeedCache() here — that wipe is what hid the stale-cache bug.
   const loaded = await loadMasterSeed();
-  check(loaded.equals(newSeed), "loadMasterSeed() now returns the imported seed (decrypts with SEED_ENCRYPTION_KEY, fingerprint verified)");
+  check(loaded.equals(newSeed), "same process, warm cache, NO wipe: loadMasterSeed() returns the IMPORTED seed", `process holds ${seedFingerprint(Buffer.from(loaded))}, row ${NEW_FP}`);
+  check(loadedFp() === NEW_FP, "the process's loaded fingerprint equals the row's", String(loadedFp()));
+  check((await derivationStatus()) === "ready", "derivationStatus() ready only now that the process holds the row's seed");
   wipeMasterSeedCache();
 
   const snapAfter = await snapshot();
@@ -315,6 +325,11 @@ console.log("\n── CLI: import through a pty");
   check(st.code === 1 && /minutes old|before the time in its own name|not newer/.test(st.out), "pty: a stale backup → REFUSED", `exit ${st.code}`);
 
   // dry run: words typed, checksum + fingerprint verified, nothing written
+  const paste = await runInPty("scripts/import-master-seed.ts", ["--rehearsal", `--expect-fingerprint=${NEW_FP}`, `--replace-fingerprint=${OLD_FP}`], [[/word 1 of 24: $/, words.join("\r")]], "import-paste");
+  const pe = echoedAfterPrompts(paste.out);
+  check(paste.code === 0 && /DRY RUN/.test(paste.out) && pe.prompts === 24 && pe.echoed === 0, "pty: 24 words PASTED as one newline-separated chunk → all consumed, dry run exit 0, nothing echoed", `exit ${paste.code}, ${pe.prompts} prompts, ${pe.echoed} echoed`);
+  check((await snapshot()) === before, "pty: …paste dry run wrote nothing");
+
   const dry = await runInPty("scripts/import-master-seed.ts", ["--rehearsal", `--expect-fingerprint=${NEW_FP}`, `--replace-fingerprint=${OLD_FP}`], wordSteps, "import-dry");
   check(dry.code === 0 && /DRY RUN/.test(dry.out) && dry.out.includes(NEW_FP), "pty: dry run (default) → exit 0, prints the fingerprint", `exit ${dry.code}`);
   check((await snapshot()) === before, "pty: …dry run wrote nothing");
