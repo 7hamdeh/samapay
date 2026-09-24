@@ -9,7 +9,7 @@
 //                                          └─ late Σ confirmed ≥ amount ─▶ succeeded_late
 //
 // Rules, each one a check in the suite:
-// - amount_received = Σ CONFIRMED deposits (orphaned never count). It is not
+// - amount_received = Σ CONFIRMED deposits (orphaned and zero-amount never count). It is not
 //   stored anywhere; this is the one calculator.
 // - PAID when amount_received ≥ amount (overpay allowed: amount_received > amount).
 //   ON TIME vs LATE is decided by the detectedAt of the deposit that COMPLETED
@@ -53,7 +53,9 @@ export function isTerminal(s: IntentStatus): boolean { return SUCCEEDED.has(s); 
 
 export function computeIntentState(input: { amount: Decimal; expiresAt: Date; current: IntentStatus; deposits: IntentDeposit[]; now: Date }): IntentState {
   const { amount, expiresAt, current, now } = input;
-  const live = input.deposits.filter((d) => d.status !== "orphaned");
+  // A ZERO-amount deposit (e.g. BEP20 dust truncated to 6 dp) is not a payment:
+  // it never moves an intent to processing and never holds one open (contract A7).
+  const live = input.deposits.filter((d) => d.status !== "orphaned" && d.amount.gt(0));
   const confirmed = live
     .filter((d) => d.status === "confirmed")
     .sort((a, b) => a.detectedAt.getTime() - b.detectedAt.getTime() || (a.txHash < b.txHash ? -1 : a.txHash > b.txHash ? 1 : 0));
