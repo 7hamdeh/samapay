@@ -43,6 +43,8 @@ import { DEPOSIT_RENDER_SELECT, publicDepositId, renderDeposit } from "@/render/
 import { cursorLockKey } from "@/chain/cursor.js";
 import { getChainAdapter } from "@/chain/impl/index.js";
 import logger from "@/log.js";
+import { rawToDecimalString } from "@/chain/live.js";
+import { z } from "zod";
 
 const log = logger.child({ mod: "observer" });
 
@@ -52,13 +54,52 @@ export interface ObserveResult { seen: number; recorded: number; alreadyKnown: n
 // Record-first (B1) means ONE transfer whose insert fails DETERMINISTICALLY
 // (a malformed amount, say) would hold the chain's cursor for ever and stall
 // every later deposit. After POISON_AFTER consecutive tick failures on the
-// same (chain, tx), the transfer is QUARANTINED: a scan_gaps row (existing
+// same (chain, tx) WITH AN ERROR CLASSIFIED AS DETERMINISTIC (below), the
+// transfer is QUARANTINED: a scan_gaps row (existing
 // columns only — from/to = its block, reason, evidence = the tx and the error)
 // is written ON THE LOCK TRANSACTION, so it commits together with the cursor
 // advance past it, and an error-level alert is logged. The money is not lost:
 // the gap stays OPEN (closed_at NULL) for manual handling. The count is per
 // process; a restart only means a few more retries before quarantine.
+//
+// ⚠️ ONLY DETERMINISTIC ERRORS ARE EVER QUARANTINED (Q's run3 HIGH, lead
+// 2026-09-25). "Three failures in a row" alone quarantined a TRANSIENT outage
+// too — a deposits table that is down for ~90 s had the cursor skip a real
+// deposit: B1 again. Anything not on the explicit list below (DB, connection,
+// lock, constraint, trigger, unknown) keeps the B1 behaviour: throw and hold
+// the cursor, for ever if need be. /health observer_lag_blocks is the alarm.
+// Deliberately NOT on the list: P2011/P2012 (null constraint / missing
+// required value). Those are CODE or SCHEMA defects that hit EVERY row (the
+// A12 NOT NULL on client_id meeting code that does not write it) — quarantining
+// them would route every deposit into scan_gaps instead of stopping.
+// BREADTH GUARD: quarantine is for ONE bad transfer. If two or more DISTINCT
+// txs would be quarantined in the same tick, the cause is not the transfers —
+// nothing is quarantined, the tick throws and the cursor holds.
 export const POISON_AFTER = 3;
+
+export class QuarantineBreadthRefused extends Error {
+  constructor(chain: Chain, txs: string[]) { super(`${txs.length} distinct transfers on ${chain} would be quarantined in one tick (${txs.join(", ")}) — refusing all, cursor held`); this.name = "QuarantineBreadthRefused"; }
+}
+/** Prisma request errors that are properties of the ROW'S VALUES, not of the database's state. */
+export const DETERMINISTIC_PRISMA_CODES: ReadonlySet<string> = new Set([
+  "P2000", // value too long for the column
+  "P2006", // invalid value for the field type
+  "P2007", // data validation error
+]);
+
+/** The observed amount is not a non-negative decimal (live.ts's invalid-raw: marker, or anything else). */
+export class InvalidObservedAmount extends Error {
+  constructor(readonly amount: string) { super(`observed amount is not a non-negative decimal: ${amount}`); this.name = "InvalidObservedAmount"; }
+}
+
+export function isDeterministicRecordError(e: unknown): boolean {
+  if (e instanceof InvalidObservedAmount) return true;
+  // NOT PrismaClientValidationError (lead, Q 5159d30 medium): it is raised by the CLIENT for a
+  // create that does not fit the schema — a code/schema defect that hits EVERY row (e.g. a
+  // create missing clientId once the NOT NULL step lands). Systemic: hold, never quarantine.
+  if (e instanceof Prisma.PrismaClientKnownRequestError) return DETERMINISTIC_PRISMA_CODES.has(e.code);
+  return false;
+}
 export const POISON_GAP_REASON = "poison_transfer";
 const failures = new Map<string, number>();
 
@@ -116,6 +157,10 @@ export async function observeChain(chain: Chain, observer: ChainObserver, requir
     // RECORD FIRST. Any failure throws out of the tick with the cursor where it
     // was, and the next tick scans the same range again — UNIQUE(chain, tx_hash)
     // makes the re-scan safe (Q's review B1).
+    // A deterministic failure does not stop the loop: the rest of the batch is
+    // still recorded, and every deterministic failure of the tick is counted, so
+    // the breadth guard below sees all of them at once.
+    const deterministic: Array<{ t: ObservedTransfer; e: unknown; n: number }> = [];
     for (const t of batch.transfers) {
       inTime();
       const fkey = `${chain}:${t.txHash}`;
@@ -124,13 +169,27 @@ export async function observeChain(chain: Chain, observer: ChainObserver, requir
         result[outcome]++;
         failures.delete(fkey);
       } catch (e) {
+        // Not deterministic → B1: hold the cursor, re-scan next tick, never quarantine.
+        if (!isDeterministicRecordError(e)) { failures.delete(fkey); throw e; }
         const n = (failures.get(fkey) ?? 0) + 1;
         failures.set(fkey, n);
-        if (n < POISON_AFTER) throw e; // not yet: no advance, the next tick re-scans
-        await quarantineTransfer(lockTx, chain, t, e, n);
-        failures.delete(fkey);
-        result.quarantined++;
+        deterministic.push({ t, e, n });
       }
+    }
+    if (deterministic.length > 0) {
+      const first = deterministic[0] as { e: unknown };
+      // Any of them still below the threshold → no advance, the next tick re-scans.
+      if (deterministic.some((d) => d.n < POISON_AFTER)) throw first.e;
+      const txs = [...new Set(deterministic.map((d) => d.t.txHash))];
+      if (txs.length >= 2) {
+        const refused = new QuarantineBreadthRefused(chain, txs);
+        log.error({ actor: "observer", action: "deposit.quarantine", result: "breadth_refused", chain, txs }, `ALERT: ${refused.message}`);
+        throw refused;
+      }
+      const only = deterministic[0] as { t: ObservedTransfer; e: unknown; n: number };
+      await quarantineTransfer(lockTx, chain, only.t, only.e, only.n);
+      failures.delete(`${chain}:${only.t.txHash}`);
+      result.quarantined++;
     }
     // THEN the cursor — only now that every transfer in the range is recorded or already known.
     inTime();
@@ -151,6 +210,57 @@ async function quarantineTransfer(lockTx: Prisma.TransactionClient, chain: Chain
   log.error({ actor: "observer", action: "deposit.quarantine", result: "scan_gap_opened", chain, txHash: t.txHash, block: t.blockNumber.toString(), failures: failuresSoFar, err: error }, "ALERT: transfer could not be recorded after repeated ticks; quarantined in scan_gaps for manual handling, cursor moves past it");
 }
 
+// ── RE-RECORDING A QUARANTINED TRANSFER (scripts/ops/rerecord-gap.ts) ─────────
+// After a human fixed the cause, re-scan the gap's block range on-chain for
+// THAT tx at THAT address, record it through recordTransfer (this module stays
+// the only writer of `deposits`), and close the gap ONLY when the deposit row
+// exists. Dry run by default. The gap's evidence is only a pointer; the amount
+// is always re-read from the chain, never taken from the evidence.
+const GapEvidence = z.object({ txHash: z.string().min(1).max(200), toAddress: z.string().min(1).max(200), blockNumber: z.string().regex(/^\d+$/) }).passthrough();
+
+export type RerecordOutcome =
+  | { outcome: "not_found" | "not_a_poison_gap" | "already_closed" | "bad_evidence" | "address_unknown" | "address_disabled" | "tx_not_in_range" }
+  | { outcome: "still_invalid"; error: string }
+  | { outcome: "would_record"; txHash: string; amount: string; block: string }
+  | { outcome: "recorded" | "already_known"; txHash: string; amount: string; depositId: string; gapClosed: boolean };
+
+export async function rerecordGap(gapId: string, opts: { apply: boolean; actor: string }): Promise<RerecordOutcome> {
+  const gap = await prisma.scanGap.findUnique({ where: { id: gapId } });
+  if (!gap) return { outcome: "not_found" };
+  if (gap.reason !== POISON_GAP_REASON) return { outcome: "not_a_poison_gap" };
+  if (gap.closedAt) return { outcome: "already_closed" };
+  let ev: z.infer<typeof GapEvidence>;
+  try { ev = GapEvidence.parse(JSON.parse(gap.evidence ?? "")); } catch { return { outcome: "bad_evidence" }; }
+  const chain = gap.chain;
+  const norm = (a: string) => (chain === "BEP20" ? a.toLowerCase() : a);
+  const addr = (await prisma.address.findMany({ where: { chain }, select: { id: true, address: true, keyId: true, watchDisabledAt: true, key: { select: { clientId: true } } } })).find((a) => norm(a.address) === norm(ev.toAddress));
+  if (!addr) return { outcome: "address_unknown" };
+  if (addr.watchDisabledAt) return { outcome: "address_disabled" };
+
+  const adapter = getChainAdapter(chain);
+  const head = await adapter.getLatestBlock();
+  const scan = await adapter.getIncomingTransfers(gap.fromBlock, gap.toBlock, new Set([addr.address]));
+  const hit = scan.transfers.find((t) => t.txHash === ev.txHash && norm(t.toAddress) === norm(addr.address));
+  if (!hit) return { outcome: "tx_not_in_range" };
+  let amount: string;
+  try { amount = truncateAmount(rawToDecimalString(hit.amountRaw, adapter.tokenDecimals)).toFixed(); }
+  catch (e) { return { outcome: "still_invalid", error: e instanceof Error ? e.message : String(e) }; }
+  const transfer: ObservedTransfer = { chain, txHash: hit.txHash, toAddress: hit.toAddress, amount, blockNumber: hit.blockNumber, confirmations: Number(head - hit.blockNumber + 1n) };
+  if (!opts.apply) return { outcome: "would_record", txHash: hit.txHash, amount, block: hit.blockNumber.toString() };
+
+  const recorded = await recordTransfer(chain, transfer, addr);
+  const dep = await prisma.deposit.findUnique({ where: { chain_txHash: { chain, txHash: hit.txHash } }, select: { id: true } });
+  if (recorded === "unknownAddress" || !dep) return { outcome: "tx_not_in_range" }; // nothing written; the gap stays open
+  // Close ONLY now that the deposit row exists; audited with who ran it.
+  const closed = await prisma.$transaction(async (tx) => {
+    const c = await tx.scanGap.updateMany({ where: { id: gap.id, closedAt: null }, data: { closedAt: new Date() } });
+    if (c.count === 1) await appendAudit(tx, { keyId: addr.keyId, actor: opts.actor, action: "scan_gap.rerecorded", subjectId: gap.id, params: { chain, txHash: hit.txHash, depositId: dep.id, amount, block: hit.blockNumber.toString() } });
+    return c.count === 1;
+  });
+  log.warn({ actor: opts.actor, action: "scan_gap.rerecord", result: recorded, chain, gapId: gap.id, txHash: hit.txHash, depositId: dep.id, gapClosed: closed }, "quarantined transfer re-recorded");
+  return { outcome: recorded === "recorded" ? "recorded" : "already_known", txHash: hit.txHash, amount, depositId: dep.id, gapClosed: closed };
+}
+
 /** Monotonic: a late tick can never move the cursor backwards. On the LOCK transaction. */
 async function advanceCursor(lockTx: Prisma.TransactionClient, chain: Chain, to: bigint): Promise<void> {
   const updated = await lockTx.scanCursor.updateMany({ where: { chain, lastScannedBlock: { lt: to } }, data: { lastScannedBlock: to } });
@@ -164,8 +274,9 @@ function watchedAddressWhere(legacyWatchEnabled: boolean): Prisma.AddressWhereIn
 
 /** Token units → at most 6 dp, rounded DOWN (never half-up by the column). */
 export function truncateAmount(amount: string): Prisma.Decimal {
-  const d = new Prisma.Decimal(amount);
-  if (!d.isFinite() || d.isNegative()) throw new Error(`observed amount is not a non-negative decimal: ${amount}`);
+  let d: Prisma.Decimal;
+  try { d = new Prisma.Decimal(amount); } catch { throw new InvalidObservedAmount(amount); }
+  if (!d.isFinite() || d.isNegative()) throw new InvalidObservedAmount(amount);
   return d.toDecimalPlaces(6, Prisma.Decimal.ROUND_DOWN);
 }
 

@@ -26,10 +26,20 @@
 //     fails once is NOT behind the cursor — the next tick records it.
 //  P. a poison transfer is quarantined into scan_gaps after 3 failed ticks;
 //     the good transfer behind it is recorded and the cursor moves on.
+//  T. a TRANSIENT failure (4 ticks, then heals) is never quarantined: no gap,
+//     the cursor holds, the deposit is recorded once the table heals.
+//  V. PrismaClientValidationError is systemic: held, never quarantined.
+//  B. breadth guard: >= 2 distinct txs to quarantine in one tick → none, cursor held.
+//  G. scripts/ops/rerecord-gap.ts: dry run by default; --apply re-reads the tx
+//     from the chain, records it, and only then closes the gap.
 //  S. (Q M1) 200 abandoned intents do not starve a newer one (sweep + expiry).
 //  W. (Q H2) the worker's composition root refuses to boot with a port unwired.
 //  M. (A7) amounts truncated to 6 dp (never half-up); a zero deposit never
 //     moves an intent; (A1) deposit.confirmed for every deposit with the fee.
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Prisma, type Chain } from "@prisma/client";
 import { assertSandboxDatabase } from "@/db/guard.js";
 import { prisma } from "@/db/client.js";
@@ -166,6 +176,108 @@ async function main() {
     check(ticks[0] !== "NO THROW" && ticks[1] !== "NO THROW" && cursors[0] === 1000n && cursors[1] === 1000n, "P1. ticks 1-2: the poison transfer fails, the tick throws, the cursor HOLDS (record-first still wins below the threshold)", `${ticks.slice(0, 2).join(",")} cursor ${cursors.slice(0, 2).join(",")}`);
     check(ticks[2] === "NO THROW" && good === 1 && cursors[2] === safe, "P2. tick 3: the poison is quarantined, the GOOD transfer behind it is recorded, the cursor moves on", `${ticks[2]}, good rows ${good}, cursor ${cursors[2]}`);
     check(gaps.length === 1 && gaps[0]?.fromBlock === 1100n && gaps[0]?.toBlock === 1100n && gaps[0]?.closedAt === null && (gaps[0]?.evidence ?? "").includes("12x"), "P3. exactly ONE open scan_gaps row at block 1100 carrying the tx and the error evidence (existing columns only)", JSON.stringify(gaps.map((g) => ({ f: g.fromBlock.toString(), open: g.closedAt === null }))));
+  }
+
+  // ── T. a TRANSIENT failure is never quarantined (Q run3 HIGH) ────────────
+  console.log("\nT. a trigger fails 4 ticks, then heals → recorded, no gap, the cursor never skipped it");
+  {
+    const tc = await prisma.client.create({ data: { name: `verify-transient-${RUN}`, kind: "merchant" }, select: { id: true } });
+    const tk = await prisma.clientKey.create({ data: { clientId: tc.id, name: "transient", keyPrefix: `vtr_${RUN}`.slice(0, 12).padEnd(12, "x"), keyHash: "x", keyLast4: "0000", scopes: [], environment: "test", issuedBy: "verify", issuedVia: "cli" }, select: { id: true } });
+    const ADDR = `TQtransient${RUN}`; const TX = `transient${RUN}`.padEnd(64, "0");
+    await prisma.address.create({ data: { keyId: tk.id, clientId: tc.id, reference: `probe:m:user:t${RUN}`, chain: "TRC20", address: ADDR, derivationIndex: 900_002 } });
+    await prisma.scanCursor.upsert({ where: { chain: "TRC20" }, create: { chain: "TRC20", lastScannedBlock: 3000n }, update: { lastScannedBlock: 3000n } });
+    const t = tronAdapter as unknown as Record<string, unknown>;
+    const saved = { getLatestBlock: t.getLatestBlock, getConfirmations: t.getConfirmations, getIncomingTransfers: t.getIncomingTransfers };
+    t.getLatestBlock = async () => 4000n;
+    t.getConfirmations = async () => 0;
+    t.getIncomingTransfers = async (from: bigint, to: bigint, addrs: Set<string>) => ({
+      transfers: 3100n >= from && 3100n <= to && addrs.has(ADDR) ? [{ txHash: TX, toAddress: ADDR, amountRaw: "9000000", blockNumber: 3100n }] : [],
+      scannedThrough: to,
+    });
+    // An outage of the deposits table for 4 ticks (more than POISON_AFTER), then it heals.
+    await prisma.$executeRawUnsafe(`CREATE SEQUENCE g2_transient_seq`);
+    await prisma.$executeRawUnsafe(`CREATE OR REPLACE FUNCTION g2_transient_fail() RETURNS trigger AS $$ BEGIN IF nextval('g2_transient_seq') <= 4 THEN RAISE EXCEPTION 'g2 transient: deposits table unavailable'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql`);
+    await prisma.$executeRawUnsafe(`CREATE TRIGGER g2_transient_trg BEFORE INSERT ON deposits FOR EACH ROW EXECUTE FUNCTION g2_transient_fail()`);
+    const cur = async () => (await prisma.scanCursor.findUniqueOrThrow({ where: { chain: "TRC20" }, select: { lastScannedBlock: true } })).lastScannedBlock;
+    const ticks: string[] = []; const cursors: bigint[] = [];
+    for (let k = 0; k < 5; k++) { ticks.push((await thrown(() => observeChain("TRC20", liveObserver, REQ))).name); cursors.push(await cur()); }
+    await prisma.$executeRawUnsafe(`DROP TRIGGER g2_transient_trg ON deposits`);
+    Object.assign(t, saved);
+    const gaps = await prisma.scanGap.count({ where: { evidence: { contains: TX } } });
+    const rows = await prisma.deposit.count({ where: { txHash: TX } });
+    check(ticks.slice(0, 4).every((x) => x !== "NO THROW") && cursors.slice(0, 4).every((c) => c === 3000n) && gaps === 0, "T1. 4 failing ticks (past POISON_AFTER): every tick throws, the cursor HOLDS at 3000, NO gap row — a transient error is never quarantined", `${ticks.join(",")} cursors ${cursors.join(",")} gaps ${gaps}`);
+    check(ticks[4] === "NO THROW" && rows === 1 && cursors[4] === 4000n - BigInt(getChainConfig("TRC20").confirmationsRequired) + 1n && gaps === 0, "T2. the table heals → tick 5 records the deposit, THEN the cursor advances; still no gap", `rows ${rows} cursor ${cursors[4]}`);
+  }
+
+  // ── V / B. systemic failures are never quarantined (lead, Q 5159d30 medium) ──
+  {
+    const vc = await prisma.client.create({ data: { name: `verify-systemic-${RUN}`, kind: "merchant" }, select: { id: true } });
+    const vk = await prisma.clientKey.create({ data: { clientId: vc.id, name: "systemic", keyPrefix: `vsy_${RUN}`.slice(0, 12).padEnd(12, "x"), keyHash: "x", keyLast4: "0000", scopes: [], environment: "test", issuedBy: "verify", issuedVia: "cli" }, select: { id: true } });
+    const VADDR = `TQsystemic${RUN}`;
+    await prisma.address.create({ data: { keyId: vk.id, clientId: vc.id, reference: `probe:m:user:v${RUN}`, chain: "TRC20", address: VADDR, derivationIndex: 900_003 } });
+    const cur = async () => (await prisma.scanCursor.findUniqueOrThrow({ where: { chain: "TRC20" }, select: { lastScannedBlock: true } })).lastScannedBlock;
+    // A ScanBatch fake (like live.ts: it never writes the cursor; the observer does).
+    const batchObserver = (transfers: ObservedTransfer[], through: bigint) => ({ async scan() { return { transfers, scannedThrough: through }; }, async confirmationsFor() { return 0; } });
+    const gapsFor = (txs: string[]) => prisma.scanGap.count({ where: { OR: txs.map((x) => ({ evidence: { contains: x } })) } });
+
+    console.log("\nV. a PrismaClientValidationError (client-side schema misfit) is systemic: held, never quarantined");
+    await prisma.scanCursor.update({ where: { chain: "TRC20" }, data: { lastScannedBlock: 5000n } });
+    const VTX = `systemicv${RUN}`.padEnd(64, "0");
+    const vObs = batchObserver([{ chain: "TRC20", txHash: VTX, toAddress: VADDR, amount: "3", blockNumber: 5100n, confirmations: "x" as unknown as number }], 5500n);
+    const vt: string[] = []; const vc2: bigint[] = [];
+    for (let k = 0; k < 5; k++) { vt.push((await thrown(() => observeChain("TRC20", vObs, REQ))).name); vc2.push(await cur()); }
+    check(vt.every((x) => x === "PrismaClientValidationError") && vc2.every((c) => c === 5000n) && (await gapsFor([VTX])) === 0, "V1. 5 ticks (past POISON_AFTER) of PrismaClientValidationError → every tick throws, cursor HOLDS at 5000, NO gap", `${vt.join(",")} cursors ${vc2.join(",")}`);
+
+    console.log("\nB. breadth guard: 2 distinct poison txs in one tick → none quarantined, cursor held");
+    await prisma.scanCursor.update({ where: { chain: "TRC20" }, data: { lastScannedBlock: 6000n } });
+    const BA = `breadtha${RUN}`.padEnd(64, "0"); const BB = `breadthb${RUN}`.padEnd(64, "0"); const BG = `breadthg${RUN}`.padEnd(64, "0");
+    const bObs = batchObserver([
+      { chain: "TRC20", txHash: BA, toAddress: VADDR, amount: "invalid-raw:1a", blockNumber: 6100n, confirmations: 30 },
+      { chain: "TRC20", txHash: BB, toAddress: VADDR, amount: "invalid-raw:2b", blockNumber: 6200n, confirmations: 30 },
+      { chain: "TRC20", txHash: BG, toAddress: VADDR, amount: "4", blockNumber: 6300n, confirmations: 30 },
+    ], 6500n);
+    const bt: string[] = []; const bc: bigint[] = [];
+    for (let k = 0; k < 6; k++) { bt.push((await thrown(() => observeChain("TRC20", bObs, REQ))).name); bc.push(await cur()); }
+    check(bt.every((x) => x !== "NO THROW") && bc.every((c) => c === 6000n) && (await gapsFor([BA, BB])) === 0, "B1. 6 ticks with TWO malformed txs → none quarantined, every tick throws, cursor HOLDS at 6000", `${bt.join(",")} cursors ${bc.join(",")}`);
+    check(bt.slice(2).every((x) => x === "QuarantineBreadthRefused"), "B2. from the threshold on, the refusal is named QuarantineBreadthRefused (the alert fires)", bt.join(","));
+  }
+
+  // ── G. scripts/ops/rerecord-gap.ts re-records the quarantined P transfer ──
+  console.log("\nG. rerecord-gap: dry run by default, closes the gap only once the deposit exists");
+  {
+    const BAD = `poisonbad${RUN}`.padEnd(64, "0"); const ADDR = `TQpoison${RUN}`;
+    const gap = await prisma.scanGap.findFirst({ where: { reason: "poison_transfer", evidence: { contains: BAD } }, select: { id: true } });
+    const dir = mkdtempSync(join(tmpdir(), "g2-rerecord-"));
+    const stamp = new Date(Date.now() - 60_000).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z").replace(/^(\d{4})(\d{2})(\d{2})T/, "$1-$2-$3T");
+    const dump = join(dir, `samapay-${stamp}.dump.gpg`);
+    writeFileSync(dump, Buffer.alloc(20_000, 7));
+    writeFileSync(`${dump}.sha256`, createHash("sha256").update(readFileSync(dump)).digest("hex") + "\n");
+    process.env.SAMAPAY_OPS_REHEARSAL_BACKUP_DIR = dir;
+    const t = tronAdapter as unknown as Record<string, unknown>;
+    const saved = { getLatestBlock: t.getLatestBlock, getIncomingTransfers: t.getIncomingTransfers };
+    let raw = "12x";
+    t.getLatestBlock = async () => 2000n;
+    t.getIncomingTransfers = async (from: bigint, to: bigint, addrs: Set<string>) => ({
+      transfers: 1100n >= from && 1100n <= to && addrs.has(ADDR) ? [{ txHash: BAD, toAddress: ADDR, amountRaw: raw, blockNumber: 1100n }] : [],
+      scannedThrough: to,
+    });
+    let script: { main?: (argv: readonly string[]) => Promise<number> } = {};
+    try { script = (await import("./ops/rerecord-gap.js")) as typeof script; } catch (e) { console.log(`  (rerecord-gap not importable: ${(e as Error).message.slice(0, 120)})`); }
+    const run = async (...a: string[]) => (script.main ? script.main([`--gap=${gap?.id ?? "missing"}`, "--rehearsal", ...a]) : -1);
+    const state = async () => ({ rows: await prisma.deposit.count({ where: { txHash: BAD } }), open: (await prisma.scanGap.findUnique({ where: { id: gap?.id ?? "" }, select: { closedAt: true } }))?.closedAt === null });
+    const g1 = await run("--apply", `--backup=${dump}`); const s1 = await state();
+    check(gap !== null && g1 === 1 && s1.rows === 0 && s1.open, "G1. cause NOT fixed (amount still malformed) → --apply REFUSES (still_invalid), no deposit, the gap stays open", `exit ${g1} ${JSON.stringify(s1)}`);
+    raw = "12000000"; // the human fixed the cause
+    const g2 = await run(); const s2 = await state();
+    check(g2 === 0 && s2.rows === 0 && s2.open, "G2. DRY RUN (default) → exit 0, writes nothing, the gap stays open", `exit ${g2} ${JSON.stringify(s2)}`);
+    const g3 = await run("--apply", `--backup=${dump}`); const s3 = await state();
+    const dep = await prisma.deposit.findFirst({ where: { txHash: BAD }, select: { amount: true, status: true } });
+    check(g3 === 0 && s3.rows === 1 && !s3.open && dep?.amount.toFixed() === "12" && dep.status === "detected", "G3. --apply → the deposit is recorded from the CHAIN (12 USDT, detected), THEN the gap is closed", `exit ${g3} ${JSON.stringify(s3)} ${dep?.amount.toFixed()}`);
+    const g4 = await run("--apply", `--backup=${dump}`); const s4 = await state();
+    check(g4 === 0 && s4.rows === 1 && !s4.open, "G4. re-run → already closed, still ONE deposit row", `exit ${g4} ${JSON.stringify(s4)}`);
+    const g5 = script.main ? await script.main([`--gap=${gap?.id ?? ""}`, "--rehearsal", "--apply"]) : -1;
+    check(g5 === 1, "G5. --apply without --backup → REFUSED (G4's ops gate)", `exit ${g5}`);
+    Object.assign(t, saved);
   }
 
   const client = await prisma.client.create({ data: { name: `verify-intents-${RUN}`, kind: "merchant", enabledChains: ["TRC20"], feeBps: 100 }, select: { id: true } });
