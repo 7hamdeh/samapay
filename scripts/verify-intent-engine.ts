@@ -28,6 +28,8 @@
 //     the good transfer behind it is recorded and the cursor moves on.
 //  T. a TRANSIENT failure (4 ticks, then heals) is never quarantined: no gap,
 //     the cursor holds, the deposit is recorded once the table heals.
+//  V. PrismaClientValidationError is systemic: held, never quarantined.
+//  B. breadth guard: >= 2 distinct txs to quarantine in one tick → none, cursor held.
 //  G. scripts/ops/rerecord-gap.ts: dry run by default; --apply re-reads the tx
 //     from the chain, records it, and only then closes the gap.
 //  S. (Q M1) 200 abandoned intents do not starve a newer one (sweep + expiry).
@@ -205,6 +207,39 @@ async function main() {
     const rows = await prisma.deposit.count({ where: { txHash: TX } });
     check(ticks.slice(0, 4).every((x) => x !== "NO THROW") && cursors.slice(0, 4).every((c) => c === 3000n) && gaps === 0, "T1. 4 failing ticks (past POISON_AFTER): every tick throws, the cursor HOLDS at 3000, NO gap row — a transient error is never quarantined", `${ticks.join(",")} cursors ${cursors.join(",")} gaps ${gaps}`);
     check(ticks[4] === "NO THROW" && rows === 1 && cursors[4] === 4000n - BigInt(getChainConfig("TRC20").confirmationsRequired) + 1n && gaps === 0, "T2. the table heals → tick 5 records the deposit, THEN the cursor advances; still no gap", `rows ${rows} cursor ${cursors[4]}`);
+  }
+
+  // ── V / B. systemic failures are never quarantined (lead, Q 5159d30 medium) ──
+  {
+    const vc = await prisma.client.create({ data: { name: `verify-systemic-${RUN}`, kind: "merchant" }, select: { id: true } });
+    const vk = await prisma.clientKey.create({ data: { clientId: vc.id, name: "systemic", keyPrefix: `vsy_${RUN}`.slice(0, 12).padEnd(12, "x"), keyHash: "x", keyLast4: "0000", scopes: [], environment: "test", issuedBy: "verify", issuedVia: "cli" }, select: { id: true } });
+    const VADDR = `TQsystemic${RUN}`;
+    await prisma.address.create({ data: { keyId: vk.id, clientId: vc.id, reference: `probe:m:user:v${RUN}`, chain: "TRC20", address: VADDR, derivationIndex: 900_003 } });
+    const cur = async () => (await prisma.scanCursor.findUniqueOrThrow({ where: { chain: "TRC20" }, select: { lastScannedBlock: true } })).lastScannedBlock;
+    // A ScanBatch fake (like live.ts: it never writes the cursor; the observer does).
+    const batchObserver = (transfers: ObservedTransfer[], through: bigint) => ({ async scan() { return { transfers, scannedThrough: through }; }, async confirmationsFor() { return 0; } });
+    const gapsFor = (txs: string[]) => prisma.scanGap.count({ where: { OR: txs.map((x) => ({ evidence: { contains: x } })) } });
+
+    console.log("\nV. a PrismaClientValidationError (client-side schema misfit) is systemic: held, never quarantined");
+    await prisma.scanCursor.update({ where: { chain: "TRC20" }, data: { lastScannedBlock: 5000n } });
+    const VTX = `systemicv${RUN}`.padEnd(64, "0");
+    const vObs = batchObserver([{ chain: "TRC20", txHash: VTX, toAddress: VADDR, amount: "3", blockNumber: 5100n, confirmations: "x" as unknown as number }], 5500n);
+    const vt: string[] = []; const vc2: bigint[] = [];
+    for (let k = 0; k < 5; k++) { vt.push((await thrown(() => observeChain("TRC20", vObs, REQ))).name); vc2.push(await cur()); }
+    check(vt.every((x) => x === "PrismaClientValidationError") && vc2.every((c) => c === 5000n) && (await gapsFor([VTX])) === 0, "V1. 5 ticks (past POISON_AFTER) of PrismaClientValidationError → every tick throws, cursor HOLDS at 5000, NO gap", `${vt.join(",")} cursors ${vc2.join(",")}`);
+
+    console.log("\nB. breadth guard: 2 distinct poison txs in one tick → none quarantined, cursor held");
+    await prisma.scanCursor.update({ where: { chain: "TRC20" }, data: { lastScannedBlock: 6000n } });
+    const BA = `breadtha${RUN}`.padEnd(64, "0"); const BB = `breadthb${RUN}`.padEnd(64, "0"); const BG = `breadthg${RUN}`.padEnd(64, "0");
+    const bObs = batchObserver([
+      { chain: "TRC20", txHash: BA, toAddress: VADDR, amount: "invalid-raw:1a", blockNumber: 6100n, confirmations: 30 },
+      { chain: "TRC20", txHash: BB, toAddress: VADDR, amount: "invalid-raw:2b", blockNumber: 6200n, confirmations: 30 },
+      { chain: "TRC20", txHash: BG, toAddress: VADDR, amount: "4", blockNumber: 6300n, confirmations: 30 },
+    ], 6500n);
+    const bt: string[] = []; const bc: bigint[] = [];
+    for (let k = 0; k < 6; k++) { bt.push((await thrown(() => observeChain("TRC20", bObs, REQ))).name); bc.push(await cur()); }
+    check(bt.every((x) => x !== "NO THROW") && bc.every((c) => c === 6000n) && (await gapsFor([BA, BB])) === 0, "B1. 6 ticks with TWO malformed txs → none quarantined, every tick throws, cursor HOLDS at 6000", `${bt.join(",")} cursors ${bc.join(",")}`);
+    check(bt.slice(2).every((x) => x === "QuarantineBreadthRefused"), "B2. from the threshold on, the refusal is named QuarantineBreadthRefused (the alert fires)", bt.join(","));
   }
 
   // ── G. scripts/ops/rerecord-gap.ts re-records the quarantined P transfer ──

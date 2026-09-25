@@ -72,7 +72,14 @@ export interface ObserveResult { seen: number; recorded: number; alreadyKnown: n
 // required value). Those are CODE or SCHEMA defects that hit EVERY row (the
 // A12 NOT NULL on client_id meeting code that does not write it) — quarantining
 // them would route every deposit into scan_gaps instead of stopping.
+// BREADTH GUARD: quarantine is for ONE bad transfer. If two or more DISTINCT
+// txs would be quarantined in the same tick, the cause is not the transfers —
+// nothing is quarantined, the tick throws and the cursor holds.
 export const POISON_AFTER = 3;
+
+export class QuarantineBreadthRefused extends Error {
+  constructor(chain: Chain, txs: string[]) { super(`${txs.length} distinct transfers on ${chain} would be quarantined in one tick (${txs.join(", ")}) — refusing all, cursor held`); this.name = "QuarantineBreadthRefused"; }
+}
 /** Prisma request errors that are properties of the ROW'S VALUES, not of the database's state. */
 export const DETERMINISTIC_PRISMA_CODES: ReadonlySet<string> = new Set([
   "P2000", // value too long for the column
@@ -87,7 +94,9 @@ export class InvalidObservedAmount extends Error {
 
 export function isDeterministicRecordError(e: unknown): boolean {
   if (e instanceof InvalidObservedAmount) return true;
-  if (e instanceof Prisma.PrismaClientValidationError) return true; // rejected by the client before any SQL ran
+  // NOT PrismaClientValidationError (lead, Q 5159d30 medium): it is raised by the CLIENT for a
+  // create that does not fit the schema — a code/schema defect that hits EVERY row (e.g. a
+  // create missing clientId once the NOT NULL step lands). Systemic: hold, never quarantine.
   if (e instanceof Prisma.PrismaClientKnownRequestError) return DETERMINISTIC_PRISMA_CODES.has(e.code);
   return false;
 }
@@ -148,6 +157,10 @@ export async function observeChain(chain: Chain, observer: ChainObserver, requir
     // RECORD FIRST. Any failure throws out of the tick with the cursor where it
     // was, and the next tick scans the same range again — UNIQUE(chain, tx_hash)
     // makes the re-scan safe (Q's review B1).
+    // A deterministic failure does not stop the loop: the rest of the batch is
+    // still recorded, and every deterministic failure of the tick is counted, so
+    // the breadth guard below sees all of them at once.
+    const deterministic: Array<{ t: ObservedTransfer; e: unknown; n: number }> = [];
     for (const t of batch.transfers) {
       inTime();
       const fkey = `${chain}:${t.txHash}`;
@@ -160,11 +173,23 @@ export async function observeChain(chain: Chain, observer: ChainObserver, requir
         if (!isDeterministicRecordError(e)) { failures.delete(fkey); throw e; }
         const n = (failures.get(fkey) ?? 0) + 1;
         failures.set(fkey, n);
-        if (n < POISON_AFTER) throw e; // not yet: no advance, the next tick re-scans
-        await quarantineTransfer(lockTx, chain, t, e, n);
-        failures.delete(fkey);
-        result.quarantined++;
+        deterministic.push({ t, e, n });
       }
+    }
+    if (deterministic.length > 0) {
+      const first = deterministic[0] as { e: unknown };
+      // Any of them still below the threshold → no advance, the next tick re-scans.
+      if (deterministic.some((d) => d.n < POISON_AFTER)) throw first.e;
+      const txs = [...new Set(deterministic.map((d) => d.t.txHash))];
+      if (txs.length >= 2) {
+        const refused = new QuarantineBreadthRefused(chain, txs);
+        log.error({ actor: "observer", action: "deposit.quarantine", result: "breadth_refused", chain, txs }, `ALERT: ${refused.message}`);
+        throw refused;
+      }
+      const only = deterministic[0] as { t: ObservedTransfer; e: unknown; n: number };
+      await quarantineTransfer(lockTx, chain, only.t, only.e, only.n);
+      failures.delete(`${chain}:${only.t.txHash}`);
+      result.quarantined++;
     }
     // THEN the cursor — only now that every transfer in the range is recorded or already known.
     inTime();
