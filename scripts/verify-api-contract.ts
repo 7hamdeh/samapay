@@ -231,9 +231,12 @@ async function main() {
     ]);
     createDelayMs = 0;
     const createdForKc = await prisma.paymentIntent.count({ where: { clientId: cA.id, reference: `store-${RUN}-3` } });
-    check(c1.status === 201 && c2.status === 409 && c2.code === "idempotency_in_progress" && createdForKc === 1, "§6 409 idempotency_in_progress — 2 concurrent same-key POSTs: one 201, one 409, ONE intent", `${c1.status}/${c2.status} ${c2.code} rows=${createdForKc}`);
+    // ORDER-FREE: which of the two claims the key first is argon2 timing, not the
+    // contract. The contract is exactly one 201 and one 409 in_progress, ONE intent.
+    const won = c1.status === 201 ? c1 : c2; const lost = won === c1 ? c2 : c1;
+    check(won.status === 201 && lost.status === 409 && lost.code === "idempotency_in_progress" && createdForKc === 1, "§6 409 idempotency_in_progress — 2 concurrent same-key POSTs: one 201, one 409, ONE intent", `${c1.status}/${c2.status} ${lost.code} rows=${createdForKc}`);
     const c3 = await call("POST", "/v1/payment-intents", A.plaintext, { ...good, reference: `store-${RUN}-3` }, kc);
-    check(c3.status === 201 && c3.res.headers.get("idempotent-replayed") === "true" && c3.json.id === c1.json.id, "§3 after the first finishes, the same key replays it", `${c3.status}`);
+    check(c3.status === 201 && c3.res.headers.get("idempotent-replayed") === "true" && c3.json.id === won.json.id, "§3 after the first finishes, the same key replays it", `${c3.status}`);
 
     // ── GET / 404 cross-client ──
     const g1 = await call("GET", `/v1/payment-intents/${pi.id}`, A.plaintext);
@@ -329,10 +332,20 @@ async function main() {
     check(e2.status === 404 && e2.code === "not_found" && e3.status === 404, "§2 another client's event is 404, same as unknown", `${e2.status}/${e3.status}`);
 
     // ── §6 429 ──
-    const rl = [] as Array<{ status: number; retry: string | null; code?: string }>;
-    for (let i = 0; i < 4; i++) { const r = await call("GET", "/v1/payment-intents", SLOW.plaintext); rl.push({ status: r.status, retry: r.res.headers.get("retry-after"), ...(r.code ? { code: r.code } : {}) }); }
+    // Timing-honest: sequential calls each pay one argon2, and on a loaded box that alone can
+    // outlast the refill (2/s) so the bucket never empties. The calls go CONCURRENTLY and the
+    // bound is DERIVED: served ≤ RPS + floor(elapsed × RPS) + 1, and with N = 12 at least one
+    // must be 429 unless the whole burst took longer than (N − RPS − 1) / RPS seconds.
+    const RPS = 2, N = 12;
+    const tR = Date.now();
+    const rl = (await Promise.all(Array.from({ length: N }, () => call("GET", "/v1/payment-intents", SLOW.plaintext))))
+      .map((r) => ({ status: r.status, retry: r.res.headers.get("retry-after"), ...(r.code ? { code: r.code } : {}) }));
+    const rlElapsed = (Date.now() - tR) / 1000;
     const limited = rl.filter((r) => r.status === 429);
-    check(limited.length >= 1 && limited.every((r) => r.code === "rate_limited" && Number(r.retry) >= 1) && rl[0]?.status === 200, "§6 429 rate_limited with Retry-After (rps_limit=2, 4 quick calls)", JSON.stringify(rl));
+    const served = rl.filter((r) => r.status === 200).length;
+    const maxServed = RPS + Math.floor(rlElapsed * RPS) + 1;
+    check(limited.length >= 1 && served <= maxServed && served + limited.length === N && limited.every((r) => r.code === "rate_limited" && Number(r.retry) >= 1),
+      `§6 429 rate_limited with Retry-After (rps_limit=${RPS}, ${N} concurrent calls in ${rlElapsed.toFixed(2)} s: served ${served} ≤ ${maxServed})`, JSON.stringify(rl));
     await sleep(1100);
     const rl2 = await call("GET", "/v1/payment-intents", SLOW.plaintext);
     check(rl2.status === 200, "§2 the bucket refills: after 1 s the key is served again", `${rl2.status}`);
@@ -415,15 +428,30 @@ async function main() {
     const BR = await iss(cA.id, "brake", ALL);
     await prisma.clientKey.update({ where: { id: BR.id }, data: { rpsLimit: 100_000 } });
     const brWrong = BR.plaintext.slice(0, 12) + "z".repeat(BR.plaintext.length - 12);
-    // Timing-honest: each failed verify costs one argon2 (~0.1 s) and the bucket refills 1/s, so
-    // the 11th or 12th wrong secret may still reach argon2. The claim is: at least the first 10
-    // are verified, the brake engages within a few more, and from then on it answers 429.
+    // The claim is "no argon2 once engaged" — proven by COUNTING verifies through
+    // auth.ts's read-only seam, not by the answer code (Q delta, 6ab225b: a brake
+    // moved after verifyKey still answered 429 and passed). The tolerance is
+    // DERIVED from the imported constants and the measured time, never copied:
+    // the bucket refills FAILED_VERIFY_PER_SEC while argon2 runs.
+    const auth = (await loadWiring("@/http/auth.js")) as { argon2VerifyCount?: () => number; FAILED_VERIFY_BURST?: number; FAILED_VERIFY_PER_SEC?: number };
+    const BURST = auth.FAILED_VERIFY_BURST ?? NaN, PER_SEC = auth.FAILED_VERIFY_PER_SEC ?? NaN;
+    const verifies = () => (auth.argon2VerifyCount ? auth.argon2VerifyCount() : NaN);
     const brakeCodes: string[] = [];
-    for (let i = 0; i < 20 && !brakeCodes.includes("rate_limited"); i++) brakeCodes.push(String((await call("GET", "/v1/payment-intents", brWrong)).code));
+    const t0 = Date.now();
+    for (let i = 0; i < 40 && !brakeCodes.includes("rate_limited"); i++) brakeCodes.push(String((await call("GET", "/v1/payment-intents", brWrong)).code));
+    const elapsedSec = (Date.now() - t0) / 1000;
     const firstLimited = brakeCodes.indexOf("rate_limited");
+    const maxBeforeBrake = BURST + Math.floor(elapsedSec * PER_SEC) + 1;
+    const K = 8;
+    const before = verifies();
+    const afterCodes: string[] = [];
+    for (let i = 0; i < K; i++) afterCodes.push(String((await call("GET", "/v1/payment-intents", brWrong)).code));
     const brRight = await call("GET", "/v1/payment-intents", BR.plaintext);
-    check(firstLimited >= 10 && firstLimited <= 13 && brakeCodes.slice(0, firstLimited).every((x) => x === "invalid_key") && brRight.status === 429 && Number(brRight.res.headers.get("retry-after")) >= 1,
-      "Q-M1 after 10 failed verifies on one prefix the prefix is 429 BEFORE argon2 (the real holder too, while it lasts — the stated trade-off)", brakeCodes.join(","));
+    const extraVerifies = verifies() - before;
+    check(firstLimited >= BURST && firstLimited <= maxBeforeBrake && brakeCodes.slice(0, firstLimited).every((x) => x === "invalid_key"),
+      `Q-M1 the brake engages after the burst: first 429 at attempt ${firstLimited + 1}, allowed ${BURST + 1}..${maxBeforeBrake + 1} (BURST ${BURST} + floor(${elapsedSec.toFixed(2)} s × ${PER_SEC}/s) + 1)`, brakeCodes.join(","));
+    check(extraVerifies === 0 && afterCodes.every((x) => x === "rate_limited") && brRight.status === 429 && Number(brRight.res.headers.get("retry-after")) >= 1,
+      `Q-M1 once engaged the brake is BEFORE argon2: ${K} more wrong secrets + the right key ran ${extraVerifies} argon2 verifies (must be 0), all 429 with Retry-After (the real holder too — the stated trade-off)`, `verifies +${extraVerifies} · ${afterCodes.join(",")} · right=${brRight.status}`);
     const brOther = await call("GET", "/v1/payment-intents", A.plaintext);
     check(brOther.status === 200, "Q-M1 the brake is per prefix: other keys are unaffected", `${brOther.status}`);
 
