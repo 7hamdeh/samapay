@@ -105,6 +105,7 @@ async function main() {
   const dump = crypto.randomBytes(12_000);
   writeFileSync(BACKUP, dump);
   writeFileSync(`${BACKUP}.sha256`, `${crypto.createHash("sha256").update(dump).digest("hex")}\n`);
+  writeFileSync(`${BACKUP}.content`, `content-check stamp=${stampName.slice(8, -9)} tables=12/12 sha256=${crypto.createHash("sha256").update(dump).digest("hex")}\n`);
 
   const mA = `mA${RUN}`, mB = `mB${RUN}`;
   const keyA = await mkKey("merchant", "a");

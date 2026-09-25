@@ -114,7 +114,8 @@ export async function lastSeedWriteMs(): Promise<number | null> {
 
 /**
  * Refuses unless `path` is a fresh dump: right dir + name, a regular file
- * > 10 KiB, matching its REQUIRED .sha256 sidecar, modified within 120 min and
+ * (non-empty; no byte floor), matching its REQUIRED .sha256 sidecar AND its REQUIRED .content sidecar
+ * (samapay-backup.sh's content check: N/N tables, same stamp, same sha256), modified within 120 min and
  * not before its own stamp, started AND finished after the last seed write.
  */
 export async function requireFreshBackup(path: string | undefined, dir: string): Promise<void> {
@@ -125,7 +126,11 @@ export async function requireFreshBackup(path: string | undefined, dir: string):
   expect(existsSync(p), `backup ${p} does not exist`);
   const st = lstatSync(p);
   expect(st.isFile() && !st.isSymbolicLink(), `backup ${p} is not a regular file`);
-  expect(st.size > 10_240, `backup ${p} is only ${st.size} bytes`);
+  // No byte floor (2026-09-25): a COMPLETE dump of this small database is ~8–10 KB, so any floor either
+  // refuses good dumps or passes a gutted one. Completeness is proven by samapay-backup.sh's content check
+  // (every live table has TABLE + TABLE DATA in the archive; core tables keep their rows), which it records
+  // in the REQUIRED `.content` sidecar, bound to this exact file by the sha256 inside it (checked below).
+  expect(st.size > 0, `backup ${p} is empty`);
   const now = Date.now();
   const ageMin = (now - st.mtimeMs) / 60_000;
   expect(ageMin <= 120, `backup ${p} is ${ageMin.toFixed(0)} minutes old — take a fresh one before this step`);
@@ -137,6 +142,15 @@ export async function requireFreshBackup(path: string | undefined, dir: string):
   expect(/^[0-9a-f]{64}$/.test(want), `backup sidecar ${side} does not hold a sha256`);
   const got = createHash("sha256").update(readFileSync(p)).digest("hex");
   expect(want === got, `backup ${p} does not match its .sha256 sidecar`);
+  const content = `${p}.content`;
+  expect(existsSync(content) && lstatSync(content).isFile() && !lstatSync(content).isSymbolicLink(), `backup ${p} has no .content sidecar (${content}) — samapay-backup.sh writes it only after its content check passed; refusing an unproven dump`);
+  const cl = readFileSync(content, "utf8");
+  const cm = /^content-check stamp=(\S+) tables=(\d+)\/(\d+) sha256=([0-9a-f]{64})$/m.exec(cl);
+  expect(!!cm, `backup content sidecar ${content} is not in the expected form`);
+  const [, cStamp, cOk, cAll, cSha] = cm as RegExpExecArray;
+  expect(`samapay-${cStamp}.dump.gpg` === basename(p), `backup content sidecar ${content} names stamp ${cStamp}, not this file's`);
+  expect(Number(cAll) > 0 && cOk === cAll, `backup content sidecar ${content} records ${cOk}/${cAll} tables complete — refusing`);
+  expect(cSha === got, `backup content sidecar ${content} was written for a different file (sha256 mismatch)`);
   const last = await lastSeedWriteMs();
   if (last !== null) {
     expect(shape.stampMs > last && st.mtimeMs > last, `backup ${p} (started ${new Date(shape.stampMs).toISOString()}) is not newer than the last crypto_config write (${new Date(last).toISOString()}) — take a fresh backup now`);

@@ -191,6 +191,7 @@ async function main() {
       const noSide = cli(`--address=${cliTarget.address}`, "--rehearsal", "--apply", `--backup=${good}`);
       check(noSide.code === 1 && /no \.sha256 sidecar/.test(noSide.out) && (await stampOf()) === null, "D8d. a dump without its .sha256 sidecar is REFUSED, nothing written", `exit=${noSide.code}`);
       writeFileSync(`${good}.sha256`, `${createHash("sha256").update(readFileSync(good)).digest("hex")}\n`);
+      writeFileSync(`${good}.content`, `content-check stamp=${stamp} tables=12/12 sha256=${createHash("sha256").update(readFileSync(good)).digest("hex")}\n`);
       const dryCli = cli(`--address=${cliTarget.address}`, "--rehearsal");
       check(dryCli.code === 0 && /would_disable/.test(dryCli.out) && (await stampOf()) === null, "D8e. --rehearsal dry run: exit 0, would_disable, nothing written", `exit=${dryCli.code}`);
       const ok = cli(`--address=${cliTarget.address}`, "--rehearsal", "--apply", `--backup=${good}`);

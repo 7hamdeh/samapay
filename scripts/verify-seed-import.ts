@@ -284,9 +284,13 @@ function freshBackup(): string {
   const stamp = d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
   const s = `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 11)}${stamp.slice(11)}`;
   const p = join(BACKUP_DIR, `samapay-${s}.dump.gpg`);
-  const body = crypto.randomBytes(20_000);
+  // 9 000 bytes on purpose: a REAL complete SamaPay dump is ~8–10 KB (2026-09-25). The old 10 KiB floor refused
+  // it; the successful --apply below proves a small, complete, content-proven dump is accepted.
+  const body = crypto.randomBytes(9_000);
   writeFileSync(p, body);
-  writeFileSync(`${p}.sha256`, crypto.createHash("sha256").update(body).digest("hex") + "\n");
+  const sha = crypto.createHash("sha256").update(body).digest("hex");
+  writeFileSync(`${p}.sha256`, sha + "\n");
+  writeFileSync(`${p}.content`, `content-check stamp=${s} tables=12/12 sha256=${sha}\n`);
   const t = (d.getTime() + 1000) / 1000;
   utimesSync(p, t, t);
   return p;
@@ -357,6 +361,20 @@ console.log("\n── CLI: import through a pty");
   renameSync(`${fresh}.sha256`, `${fresh}.sha256.moved`);
   const ns = await runInPty("scripts/import-master-seed.ts", ["--rehearsal", `--expect-fingerprint=${NEW_FP}`, `--replace-fingerprint=${OLD_FP}`, "--apply", `--backup=${fresh}`], [], "import-no-sidecar");
   check(ns.code === 1 && /has no \.sha256 sidecar/.test(ns.out) && !/word 1 of 24/.test(ns.out), "pty: a dump with NO sidecar → REFUSED before asking for words", `exit ${ns.code}`);
+
+  // the .content sidecar (samapay-backup.sh's content check) is REQUIRED, complete, and bound to this file
+  const nc = freshBackup();
+  renameSync(`${nc}.content`, `${nc}.content.moved`);
+  const ncr = await runInPty("scripts/import-master-seed.ts", ["--rehearsal", `--expect-fingerprint=${NEW_FP}`, `--replace-fingerprint=${OLD_FP}`, "--apply", `--backup=${nc}`], [], "import-no-content");
+  check(ncr.code === 1 && /has no \.content sidecar/.test(ncr.out) && !/word 1 of 24/.test(ncr.out), "pty: a dump with NO .content sidecar → REFUSED before asking for words", `exit ${ncr.code}`);
+  const partial = freshBackup();
+  writeFileSync(`${partial}.content`, readFileSync(`${partial}.content`, "utf8").replace("tables=12/12", "tables=11/12"));
+  const pr = await runInPty("scripts/import-master-seed.ts", ["--rehearsal", `--expect-fingerprint=${NEW_FP}`, `--replace-fingerprint=${OLD_FP}`, "--apply", `--backup=${partial}`], [], "import-partial-content");
+  check(pr.code === 1 && /records 11\/12 tables complete/.test(pr.out) && !/word 1 of 24/.test(pr.out), "pty: a .content sidecar recording 11/12 tables → REFUSED", `exit ${pr.code}`);
+  const other = freshBackup();
+  writeFileSync(`${other}.content`, readFileSync(`${other}.content`, "utf8").replace(/sha256=[0-9a-f]{64}/, `sha256=${"a".repeat(64)}`));
+  const orr = await runInPty("scripts/import-master-seed.ts", ["--rehearsal", `--expect-fingerprint=${NEW_FP}`, `--replace-fingerprint=${OLD_FP}`, "--apply", `--backup=${other}`], [], "import-other-content");
+  check(orr.code === 1 && /written for a different file/.test(orr.out) && !/word 1 of 24/.test(orr.out), "pty: a .content sidecar written for a different file → REFUSED", `exit ${orr.code}`);
 
   // a stale backup (older than the crypto_config row) is refused
   const stale = freshBackup();

@@ -252,6 +252,7 @@ async function main() {
     const dump = join(dir, `samapay-${stamp}.dump.gpg`);
     writeFileSync(dump, Buffer.alloc(20_000, 7));
     writeFileSync(`${dump}.sha256`, createHash("sha256").update(readFileSync(dump)).digest("hex") + "\n");
+    writeFileSync(`${dump}.content`, `content-check stamp=${stamp} tables=12/12 sha256=${createHash("sha256").update(readFileSync(dump)).digest("hex")}\n`);
     process.env.SAMAPAY_OPS_REHEARSAL_BACKUP_DIR = dir;
     const t = tronAdapter as unknown as Record<string, unknown>;
     const saved = { getLatestBlock: t.getLatestBlock, getIncomingTransfers: t.getIncomingTransfers };
