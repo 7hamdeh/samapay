@@ -1,0 +1,63 @@
+/* pay.mntad.com — one stylesheet, system fonts only, no external requests. */
+:root {
+  --bg: #fbfbf9; --fg: #16181d; --muted: #5b6070; --line: #e3e4e8; --card: #ffffff;
+  --accent: #0f7b5f; --accent-fg: #ffffff; --code-bg: #f1f2f4; --pre-bg: #111418; --pre-fg: #e8eaee;
+  --radius: 10px;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Noto Sans Arabic", Tahoma, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1115; --fg: #e8eaee; --muted: #a0a6b4; --line: #262a33; --card: #161920; --accent: #3cc49b; --accent-fg: #0b0d10; --code-bg: #1d2129; --pre-bg: #0a0c10; }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 var(--font); }
+a { color: var(--accent); }
+.wrap { max-width: 980px; margin: 0 auto; padding: 0 16px; }
+
+.top { border-bottom: 1px solid var(--line); background: var(--card); }
+.top .wrap { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding-top: 12px; padding-bottom: 12px; }
+.brand { font-weight: 700; color: var(--fg); text-decoration: none; }
+.top nav { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.top nav a { text-decoration: none; padding: 4px 0; }
+.top nav a[aria-current="page"] { font-weight: 700; }
+
+.hero { padding: 48px 0 24px; }
+.hero h1 { font-size: clamp(1.7rem, 6vw, 2.6rem); line-height: 1.2; margin: 0 0 12px; }
+.hero p { color: var(--muted); font-size: 1.1rem; max-width: 42em; margin: 0 0 20px; }
+.btn { display: inline-block; background: var(--accent); color: var(--accent-fg); text-decoration: none; padding: 12px 18px; border-radius: var(--radius); font-weight: 600; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 24px; padding: 0; list-style: none; }
+.chips li { border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; font-size: .9rem; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin: 8px 0 32px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+.card h2 { font-size: 1.15rem; margin: 0 0 8px; }
+.card p, .card li { color: var(--muted); }
+.card ul { padding-inline-start: 20px; margin: 8px 0 0; }
+section h2 { margin-top: 32px; }
+
+.doc { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 32px; padding-top: 24px; padding-bottom: 24px; }
+.toc { position: sticky; top: 16px; align-self: start; font-size: .92rem; }
+.toc ul { list-style: none; padding: 0; margin: 8px 0 0; }
+.toc li { margin: 4px 0; }
+article { min-width: 0; }
+article h1 { font-size: clamp(1.5rem, 5vw, 2.1rem); line-height: 1.25; }
+article h2 { margin-top: 40px; padding-top: 8px; border-top: 1px solid var(--line); }
+article hr { display: none; }
+code { font-family: var(--mono); font-size: .9em; background: var(--code-bg); padding: 1px 5px; border-radius: 5px; overflow-wrap: anywhere; }
+pre { background: var(--pre-bg); color: var(--pre-fg); padding: 14px 16px; border-radius: var(--radius); overflow-x: auto; font-size: .85rem; line-height: 1.5; direction: ltr; text-align: left; }
+pre code { background: none; padding: 0; overflow-wrap: normal; color: inherit; }
+.table-wrap { overflow-x: auto; margin: 12px 0; border: 1px solid var(--line); border-radius: var(--radius); }
+table { border-collapse: collapse; width: 100%; font-size: .93rem; }
+th, td { text-align: start; vertical-align: top; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+th { background: var(--code-bg); }
+tr:last-child td { border-bottom: 0; }
+.foot { color: var(--muted); font-size: .9rem; padding-top: 24px; padding-bottom: 40px; border-top: 1px solid var(--line); }
+
+/* Arabic: the prose runs right-to-left; code, routes and hashes stay left-to-right. */
+[dir="rtl"] code { direction: ltr; unicode-bidi: isolate; }
+
+@media (max-width: 760px) {
+  .doc { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .toc { position: static; border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 16px; }
+  .hero { padding-top: 32px; }
+}

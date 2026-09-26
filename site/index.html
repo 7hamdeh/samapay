@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>pay.mntad.com — USDT payments for merchants</title>
+<meta name="description" content="Accept USDT on TRC20 and BEP20: payment intents for checkout, permanent addresses for top-ups, and signed webhooks for every confirmed deposit.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a class="brand" href="index.html">pay.mntad.com</a><nav><a href="index.html" aria-current="page">Home</a><a href="docs.html">Docs</a><a href="ar.html" lang="ar">العربية</a></nav></div></header>
+<main class="wrap">
+<section class="hero">
+<h1>USDT payments for merchants</h1>
+<p>pay.mntad.com gives your store crypto addresses, watches the chains for you, and tells your server about every confirmed payment with a signed webhook. What you receive becomes your gateway balance.</p>
+<ul class="chips"><li>USDT</li><li>TRC20 (Tron)</li><li>BEP20 (BNB Smart Chain)</li></ul>
+<a class="btn" href="docs.html">Read the API docs</a>
+</section>
+<div class="grid">
+<div class="card">
+<h2>Flow 1 · Checkout</h2>
+<p>Create a payment intent for an exact amount. You get a fresh address and an expiry time.</p>
+<ul><li>The status moves from waiting, to processing, to paid.</li><li>Late, partial and extra payments are all handled.</li><li>No payment is lost.</li></ul>
+<p><a href="docs.html#sec-6">Payment intents →</a></p>
+</div>
+<div class="card">
+<h2>Flow 2 · Permanent address</h2>
+<p>Give each customer one address for life, for wallets and top-ups.</p>
+<ul><li>Asking again returns the same address.</li><li>Customers can send any amount, at any time.</li><li>You get one event per deposit.</li></ul>
+<p><a href="docs.html#sec-7">Permanent addresses →</a></p>
+</div>
+<div class="card">
+<h2>Signed webhooks</h2>
+<p>Every event is signed with HMAC-SHA256 and retried for up to a day.</p>
+<ul><li>Verify the signature.</li><li>Re-fetch the deposit before you credit it.</li><li>Credit each deposit once.</li></ul>
+<p><a href="docs.html#sec-9">Webhooks →</a></p>
+</div>
+</div>
+<section>
+<h2>Contact</h2>
+<p>To open a merchant account or get your API key, contact the MNTAD team.</p>
+</section>
+</main>
+<footer class="wrap foot">pay.mntad.com: USDT payments on TRC20 and BEP20. No tracking, no cookies.</footer>
+</body>
+</html>

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>pay.mntad.com — API documentation</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a class="brand" href="index.html">pay.mntad.com</a><nav><a href="index.html">Home</a><a href="docs.html" aria-current="page">Docs</a><a href="docs.ar.html" lang="ar">العربية</a></nav></div></header>
+<main class="wrap doc">
+<nav class="toc" aria-label="Contents"><strong>Contents</strong><ul><li><a href="#sec-1"><bdi>1.</bdi> Authentication</a></li><li><a href="#sec-2"><bdi>2.</bdi> Errors</a></li><li><a href="#sec-3"><bdi>3.</bdi> Idempotency (every POST)</a></li><li><a href="#sec-4"><bdi>4.</bdi> Rate limits</a></li><li><a href="#sec-5"><bdi>5.</bdi> Objects</a></li><li><a href="#sec-6"><bdi>6.</bdi> Flow 1: one payment, one address (payment intents)</a></li><li><a href="#sec-7"><bdi>7.</bdi> Flow 2: a permanent address per customer (top-up)</a></li><li><a href="#sec-8"><bdi>8.</bdi> Reading</a></li><li><a href="#sec-9"><bdi>9.</bdi> Webhooks</a></li></ul></nav>
+<article>
+<h1 id="s1">pay.mntad.com — API v1</h1>
+<p>USDT payments on <strong>TRC20</strong> (Tron) and <strong>BEP20</strong> (BNB Smart Chain) for merchants. You get crypto addresses, SamaPay watches the chains, and you get a signed webhook for every confirmed deposit. Money you receive becomes your <strong>gateway balance</strong> at SamaPay.</p>
+<ul><li>Base URL: <code>https://pay.mntad.com/v1</code></li><li>JSON in and out (<code>Content-Type: application/json</code>), UTF-8.</li><li>Timestamps are ISO-8601 UTC strings, e.g. <code>2026-09-25T12:00:00.000Z</code>.</li><li><strong>Money is always a decimal string</strong>, never a number: <code>&quot;12.5&quot;</code>, <code>&quot;0.000001&quot;</code>. Currency is always <code>USDT</code>, with at most 6 decimals.</li><li>Every response carries an <code>X-Request-Id</code> header. Every error body repeats it as <code>request_id</code>. Quote it when you contact support.</li></ul>
+<p>This file is checked against the code by <code>scripts/verify-api-docs.ts</code>. Every route, status, error code, event type, header and constant below is compared with <code>src/</code>, so the two cannot drift.</p>
+<hr>
+<h2 id="sec-1"><bdi>1.</bdi> Authentication</h2>
+<pre><code>Authorization: Bearer sk_live_&lt;40 characters&gt;</code></pre>
+<ul><li>One key belongs to exactly one account (your <em>client</em>). The account is <strong>always</strong> taken from the key, never from a request field.</li><li>Everything you create (addresses, payment intents, deposits, events) belongs to your account, not to the key. After a key rotation, the new key sees all of it.</li><li><code>sk_test_…</code> keys work only on non-production deployments. In production they are refused with <code>401 invalid_key</code>.</li><li>Keep the key on your server. Never ship it to a browser or an app.</li></ul>
+<h3 id="s2">Scopes</h3>
+<p>A key carries a set of scopes, and each route needs one of them:</p>
+<div class="table-wrap"><table><thead><tr><th>Scope</th><th>Allows</th></tr></thead><tbody><tr><td><code>payment_intents.write</code></td><td><code>POST /v1/payment-intents</code></td></tr><tr><td><code>payment_intents.read</code></td><td><code>GET /v1/payment-intents</code>, <code>GET /v1/payment-intents/:id</code></td></tr><tr><td><code>addresses.write</code></td><td><code>POST /v1/addresses</code></td></tr><tr><td><code>deposits.read</code></td><td><code>GET /v1/deposits</code>, <code>GET /v1/deposits/:id</code></td></tr><tr><td><code>events.read</code></td><td><code>GET /v1/events/:id</code></td></tr><tr><td><code>balance.read</code></td><td><code>GET /v1/balance</code></td></tr></tbody></table></div>
+<p>A missing scope gets <code>403 insufficient_scope</code>, and <code>error.details.required</code> names the scope.</p>
+<hr>
+<h2 id="sec-2"><bdi>2.</bdi> Errors</h2>
+<pre class="lang-json"><code>{ &quot;error&quot;: { &quot;code&quot;: &quot;amount_out_of_range&quot;, &quot;message&quot;: &quot;…&quot;, &quot;request_id&quot;: &quot;req_…&quot;, &quot;details&quot;: { } } }</code></pre>
+<p>Branch on <code>code</code>. <code>message</code> is English text for humans, and it may change.</p>
+<div class="table-wrap"><table><thead><tr><th>HTTP</th><th>code</th><th>When</th></tr></thead><tbody><tr><td>400</td><td><code>invalid_json</code></td><td>The body is not JSON.</td></tr><tr><td>400</td><td><code>idempotency_key_required</code></td><td>A POST without a valid <code>Idempotency-Key</code> (1–255 printable ASCII characters).</td></tr><tr><td>400</td><td><code>validation_failed</code></td><td>Wrong shape. <code>details.fields</code> lists the fields.</td></tr><tr><td>401</td><td><code>unauthenticated</code></td><td><code>Authorization</code> is missing or malformed.</td></tr><tr><td>401</td><td><code>invalid_key</code></td><td>Unknown key, wrong secret, or a test key in production.</td></tr><tr><td>401</td><td><code>key_revoked</code></td><td>The key was revoked. <code>details.successor</code> is the last 4 characters of its successor, if one exists.</td></tr><tr><td>403</td><td><code>insufficient_scope</code></td><td><code>details.required</code> names the missing scope.</td></tr><tr><td>404</td><td><code>not_found</code></td><td>Unknown id <strong>or an object of another account</strong>. The two cases get the same answer.</td></tr><tr><td>409</td><td><code>idempotency_payload_mismatch</code></td><td>The same <code>Idempotency-Key</code> was used with a different body.</td></tr><tr><td>409</td><td><code>idempotency_in_progress</code></td><td>The first request with this key is still running. Retry after about 1 s.</td></tr><tr><td>409</td><td><code>reference_conflict</code></td><td>A payment intent with this <code>reference</code> already exists with a different amount or chain.</td></tr><tr><td>422</td><td><code>amount_out_of_range</code></td><td>Amount ≤ 0, more than 6 decimals, or outside your account's min/max.</td></tr><tr><td>422</td><td><code>unsupported_chain</code></td><td>The chain is not <code>TRC20</code>/<code>BEP20</code>, or it is not enabled for your account.</td></tr><tr><td>422</td><td><code>reference_invalid</code></td><td>The reference's length or characters are not allowed (see each flow).</td></tr><tr><td>429</td><td><code>rate_limited</code></td><td>Too many requests. Wait for the number of seconds in the <code>Retry-After</code> header.</td></tr><tr><td>503</td><td><code>derivation_unavailable</code></td><td>No address can be derived right now. <strong>Nothing was created</strong>, so retry later.</td></tr><tr><td>503</td><td><code>chain_unavailable</code></td><td>The chain layer is unavailable. Nothing was created.</td></tr><tr><td>500</td><td><code>internal</code></td><td>Our fault. It is logged under <code>request_id</code>.</td></tr></tbody></table></div>
+<hr>
+<h2 id="sec-3"><bdi>3.</bdi> Idempotency (every POST)</h2>
+<p>Send <code>Idempotency-Key: &lt;1–255 printable ASCII characters&gt;</code> on <strong>every</strong> POST. Keys are scoped to (your key, Idempotency-Key) and kept for <strong>24 hours</strong>.</p>
+<ul><li><strong>Same key, same body:</strong> you get the <strong>original</strong> status and body, byte for byte, plus the header <code>Idempotent-Replayed: true</code>. The comparison uses the JSON content, so key order and whitespace do not matter.</li><li><strong>Same key, different body:</strong> <code>409 idempotency_payload_mismatch</code>.</li><li><strong>Same key while the first request is still running:</strong> <code>409 idempotency_in_progress</code>. Retry shortly.</li><li><strong>The first attempt got a 5xx:</strong> nothing was stored against the key, so retry <strong>with the same key</strong>.</li></ul>
+<p>A replay returns the answer as it was <em>then</em>. Read the current state with a GET.</p>
+<hr>
+<h2 id="sec-4"><bdi>4.</bdi> Rate limits</h2>
+<ul><li>Each key has a per-second limit (default <strong>10 requests/s</strong>). Above it you get <code>429 rate_limited</code> with <code>Retry-After</code>.</li><li>Repeated <strong>failed</strong> authentications for one key are braked: after 10 failures that key answers <code>429</code> until the brake recovers (1 per second). This applies even to correct requests while it lasts. Do not retry with a wrong key.</li></ul>
+<hr>
+<h2 id="sec-5"><bdi>5.</bdi> Objects</h2>
+<h3 id="s3">PaymentIntent</h3>
+<pre class="lang-json"><code>{
+  &quot;id&quot;: &quot;pi_3f9c…&quot;,
+  &quot;object&quot;: &quot;payment_intent&quot;,
+  &quot;status&quot;: &quot;requires_payment&quot;,
+  &quot;amount&quot;: &quot;12.5&quot;,
+  &quot;amount_received&quot;: &quot;0&quot;,
+  &quot;fee_amount&quot;: &quot;0&quot;,
+  &quot;currency&quot;: &quot;USDT&quot;,
+  &quot;chain&quot;: &quot;TRC20&quot;,
+  &quot;address&quot;: &quot;T…&quot;,
+  &quot;reference&quot;: &quot;order-1042&quot;,
+  &quot;tx_hashes&quot;: [],
+  &quot;confirmations_required&quot;: 19,
+  &quot;expires_at&quot;: &quot;2026-09-25T13:00:00.000Z&quot;,
+  &quot;created_at&quot;: &quot;2026-09-25T12:00:00.000Z&quot;,
+  &quot;succeeded_at&quot;: null,
+  &quot;expired_at&quot;: null
+}</code></pre>
+<ul><li><code>amount_received</code> is the sum of the <strong>confirmed</strong> deposits to the intent's address, and it can exceed <code>amount</code>. <code>tx_hashes</code> lists those deposits.</li><li><code>fee_amount</code> is the sum of the fees charged on those deposits. It comes out of <strong>your gateway balance</strong>, never out of the amount the payer sent.</li></ul>
+<p>Statuses:</p>
+<div class="table-wrap"><table><thead><tr><th>status</th><th>Meaning</th></tr></thead><tbody><tr><td><code>requires_payment</code></td><td>Waiting for a transfer.</td></tr><tr><td><code>processing</code></td><td>A transfer was seen but has not reached the confirmation depth yet.</td></tr><tr><td><code>succeeded</code></td><td>Confirmed deposits reached <code>amount</code> in time. Overpayment is allowed (<code>amount_received</code> &gt; <code>amount</code>).</td></tr><tr><td><code>succeeded_late</code></td><td>The amount was completed <strong>after</strong> <code>expires_at</code>.</td></tr><tr><td><code>expired</code></td><td>Expired with nothing received.</td></tr><tr><td><code>expired_partial</code></td><td>Expired with less than <code>amount</code> received.</td></tr></tbody></table></div>
+<ul><li><strong>On time or late</strong> is decided by when the completing transfer was <strong>detected</strong>, not by when it confirmed. A payment sent in time that is still confirming keeps the intent <code>processing</code> past <code>expires_at</code>.</li><li><code>succeeded</code> and <code>succeeded_late</code> are final. An <code>expired</code> or <code>expired_partial</code> intent can still become <code>succeeded_late</code> if a late payment completes the amount.</li><li><strong>No money is lost.</strong> Every confirmed deposit, early, late, partial or extra, produces its own <code>deposit.confirmed</code> event.</li></ul>
+<h3 id="s4">Deposit</h3>
+<pre class="lang-json"><code>{
+  &quot;id&quot;: &quot;dep_cm8x…&quot;,
+  &quot;object&quot;: &quot;deposit&quot;,
+  &quot;status&quot;: &quot;confirmed&quot;,
+  &quot;chain&quot;: &quot;TRC20&quot;,
+  &quot;tx_hash&quot;: &quot;a1b2…&quot;,
+  &quot;amount&quot;: &quot;12.5&quot;,
+  &quot;confirmations&quot;: 20,
+  &quot;address&quot;: &quot;T…&quot;,
+  &quot;reference&quot;: &quot;order-1042&quot;,
+  &quot;payment_intent_id&quot;: &quot;pi_3f9c…&quot;,
+  &quot;detected_at&quot;: &quot;2026-09-25T12:03:10.000Z&quot;,
+  &quot;confirmed_at&quot;: &quot;2026-09-25T12:04:05.000Z&quot;
+}</code></pre>
+<ul><li>Statuses: <code>detected</code>, then <code>confirmed</code>. A detected transfer that a chain reorganisation removed becomes <code>orphaned</code>. It never confirms and never counts.</li><li>One deposit exists per on-chain transfer. <code>(chain, tx_hash)</code> is unique.</li><li><code>reference</code> depends on where the money went:<ul><li>intent deposit: the <strong>intent's</strong> <code>reference</code>;</li><li>top-up address: the <strong>address's</strong> <code>reference</code>.</li></ul></li><li><code>payment_intent_id</code> is <code>null</code> for a top-up address.</li><li>Only the <code>dep_…</code> form of <code>id</code> is accepted anywhere.</li></ul>
+<h3 id="s5">Amounts, dust, confirmations</h3>
+<ul><li>On-chain amounts are <strong>truncated (rounded down) to 6 decimals</strong> when they are recorded.</li><li>A transfer that truncates to <code>0</code> (dust) is not a payment. It never moves an intent to <code>processing</code>.</li><li>A deposit is <code>confirmed</code> at this depth:</li></ul>
+<div class="table-wrap"><table><thead><tr><th>Chain</th><th>Confirmations</th></tr></thead><tbody><tr><td>TRC20</td><td>19</td></tr><tr><td>BEP20</td><td>15</td></tr></tbody></table></div>
+<p>The intent's <code>confirmations_required</code> field reports the same number.</p>
+<hr>
+<h2 id="sec-6"><bdi>6.</bdi> Flow 1: one payment, one address (payment intents)</h2>
+<p>Use this for checkout: a fixed amount with an expiry, on a fresh address that is never reused.</p>
+<p><code>POST /v1/payment-intents</code>, scope <code>payment_intents.write</code>.</p>
+<div class="table-wrap"><table><thead><tr><th>Field</th><th>Rule</th></tr></thead><tbody><tr><td><code>amount</code></td><td>Decimal string, &gt; 0, ≤ 6 decimals, within your account's min/max (default 1 … 10000).</td></tr><tr><td><code>chain</code></td><td><code>TRC20</code> or <code>BEP20</code>.</td></tr><tr><td><code>reference</code></td><td><strong>Your</strong> id for this payment: 1–200 characters of <code>[A-Za-z0-9:_-]</code>.</td></tr><tr><td><code>expires_in_sec</code></td><td>Optional, 300 … 604800. Default 3600.</td></tr></tbody></table></div>
+<pre class="lang-bash"><code>curl -s https://pay.mntad.com/v1/payment-intents \
+  -H &quot;Authorization: Bearer $SAMAPAY_KEY&quot; \
+  -H &quot;Content-Type: application/json&quot; \
+  -H &quot;Idempotency-Key: order-1042&quot; \
+  -d '{&quot;amount&quot;:&quot;12.5&quot;,&quot;chain&quot;:&quot;TRC20&quot;,&quot;reference&quot;:&quot;order-1042&quot;}'</code></pre>
+<ul><li><code>201</code>: a new intent. Show the payer <code>address</code>, the <strong>exact</strong> <code>amount</code> and <code>expires_at</code>.</li><li>**One intent per <code>reference</code>:** posting the same reference again (even with a new Idempotency-Key) gives the existing intent:<ul><li>same <code>amount</code> and <code>chain</code>: <code>200</code> with the existing intent;</li><li>different <code>amount</code> or <code>chain</code>: <code>409 reference_conflict</code>.</li></ul></li></ul>
+<p>Reading intents:</p>
+<ul><li><code>GET /v1/payment-intents/:id</code> (scope <code>payment_intents.read</code>) returns one intent.</li><li><code>GET /v1/payment-intents</code> lists intents, newest first, as <code>{ &quot;object&quot;: &quot;list&quot;, &quot;data&quot;: [...], &quot;has_more&quot;: bool }</code>. Query parameters: <code>reference</code>, <code>status</code>, <code>limit</code> (1–100, default 10) and <code>starting_after</code> (an intent id).</li></ul>
+<p>What arrives by webhook:</p>
+<ul><li>one <code>deposit.confirmed</code> per confirmed transfer to the intent's address;</li><li><code>payment_intent.succeeded</code> once, when the intent becomes <code>succeeded</code> or <code>succeeded_late</code>;</li><li><code>payment_intent.expired</code> once, when it becomes <code>expired</code> or <code>expired_partial</code>.</li></ul>
+<p>Read <code>data.object.status</code> to tell the variants apart. **Credit on <code>deposit.confirmed</code>**, and use the intent events only for status and UX.</p>
+<hr>
+<h2 id="sec-7"><bdi>7.</bdi> Flow 2: a permanent address per customer (top-up)</h2>
+<p>Use this for wallets and balances: each customer gets one address for life and can send any amount at any time.</p>
+<p><code>POST /v1/addresses</code>, scope <code>addresses.write</code>.</p>
+<div class="table-wrap"><table><thead><tr><th>Field</th><th>Rule</th></tr></thead><tbody><tr><td><code>chain</code></td><td><code>TRC20</code> or <code>BEP20</code> (enabled for your account).</td></tr><tr><td><code>reference</code></td><td><code>client:tenant:kind:id</code>: four non-empty segments of at most 64 characters, with no <code>:</code>, whitespace or control characters inside a segment. Example: <code>acme:shop1:user:42</code>.</td></tr></tbody></table></div>
+<pre class="lang-bash"><code>curl -s https://pay.mntad.com/v1/addresses \
+  -H &quot;Authorization: Bearer $SAMAPAY_KEY&quot; \
+  -H &quot;Content-Type: application/json&quot; \
+  -H &quot;Idempotency-Key: addr-acme-shop1-user-42-trc20&quot; \
+  -d '{&quot;chain&quot;:&quot;TRC20&quot;,&quot;reference&quot;:&quot;acme:shop1:user:42&quot;}'</code></pre>
+<pre class="lang-json"><code>{ &quot;object&quot;: &quot;address&quot;, &quot;chain&quot;: &quot;TRC20&quot;, &quot;address&quot;: &quot;T…&quot;, &quot;reference&quot;: &quot;acme:shop1:user:42&quot; }</code></pre>
+<ul><li><code>201</code>: the address was just issued.</li><li><code>200</code>: this <code>(chain, reference)</code> already had one, and you get <strong>the same address</strong>, every time, from any of your keys.</li><li>Every confirmed transfer to it produces one <code>deposit.confirmed</code>, with <code>data.object.reference</code> = your reference and <code>payment_intent_id: null</code>.</li></ul>
+<hr>
+<h2 id="sec-8"><bdi>8.</bdi> Reading</h2>
+<div class="table-wrap"><table><thead><tr><th>Route</th><th>Scope</th><th>Returns</th></tr></thead><tbody><tr><td><code>GET /v1/deposits</code></td><td><code>deposits.read</code></td><td><code>{ &quot;object&quot;: &quot;list&quot;, &quot;data&quot;: [Deposit], &quot;has_more&quot;: bool }</code>, oldest first. Query: <code>reference</code>, <code>payment_intent_id</code>, <code>since</code> (ISO-8601), <code>limit</code> (1–100, default 100).</td></tr><tr><td><code>GET /v1/deposits/:id</code></td><td><code>deposits.read</code></td><td>One Deposit (<code>dep_…</code>).</td></tr><tr><td><code>GET /v1/events/:id</code></td><td><code>events.read</code></td><td>One Event, exactly as it was delivered.</td></tr><tr><td><code>GET /v1/balance</code></td><td><code>balance.read</code></td><td>Your gateway balance (below).</td></tr><tr><td><code>GET /v1/health</code></td><td>none</td><td>Service status.</td></tr></tbody></table></div>
+<p><code>GET /v1/balance</code>:</p>
+<pre class="lang-json"><code>{
+  &quot;object&quot;: &quot;balance&quot;,
+  &quot;currency&quot;: &quot;USDT&quot;,
+  &quot;chains&quot;: { &quot;TRC20&quot;: { &quot;available&quot;: &quot;15.75&quot;, &quot;pending&quot;: &quot;0&quot; }, &quot;BEP20&quot;: { &quot;available&quot;: &quot;0&quot;, &quot;pending&quot;: &quot;0&quot; } },
+  &quot;fee_bps&quot;: 0
+}</code></pre>
+<ul><li><code>available</code> = confirmed deposits − fees − withdrawals.</li><li><code>pending</code> = detected deposits that are not confirmed yet.</li><li><code>fee_bps</code> is your current fee rate, in basis points.</li></ul>
+<hr>
+<h2 id="sec-9"><bdi>9.</bdi> Webhooks</h2>
+<p>SamaPay POSTs each event to your webhook URL (https, set when your key is issued).</p>
+<h3 id="s6">Event</h3>
+<pre class="lang-json"><code>{
+  &quot;id&quot;: &quot;evt_…&quot;,
+  &quot;object&quot;: &quot;event&quot;,
+  &quot;api_version&quot;: &quot;2026-09-24&quot;,
+  &quot;type&quot;: &quot;deposit.confirmed&quot;,
+  &quot;created_at&quot;: &quot;2026-09-25T12:04:05.000Z&quot;,
+  &quot;data&quot;: { &quot;object&quot;: { &quot;id&quot;: &quot;dep_…&quot;, &quot;object&quot;: &quot;deposit&quot; } }
+}</code></pre>
+<ul><li>Types: <code>deposit.confirmed</code>, <code>payment_intent.succeeded</code>, <code>payment_intent.expired</code>.</li><li><code>data.object</code> is the Deposit or PaymentIntent <strong>as it was when the event happened</strong>.</li></ul>
+<h3 id="s7">Headers</h3>
+<ul><li><code>X-SamaPay-Event</code>: the event type.</li><li><code>X-SamaPay-Delivery</code>: the delivery id.</li><li><code>X-SamaPay-Signature</code>: <code>t=&lt;unix seconds&gt;,v1=&lt;hex&gt;[,v1=&lt;hex&gt;…]</code>.</li></ul>
+<p>The signature is <code>v1 = HMAC-SHA256(secret, &quot;&lt;t&gt;.&lt;raw body&gt;&quot;)</code>, in hex. <code>secret</code> is your whole <code>whsec_…</code> string. During a secret rotation there can be several <code>v1</code> values; accept the request if <strong>any</strong> of them matches.</p>
+<h3 id="s8">Verify (Node)</h3>
+<pre class="lang-js"><code>import { createHmac, timingSafeEqual } from &quot;node:crypto&quot;;
+
+// rawBody: the EXACT bytes you received (not re-serialised JSON). secrets: your current whsec_… (and the previous one during a rotation).
+export function verifySamaPay(rawBody, header, secrets, now = Math.floor(Date.now() / 1000)) {
+  const parts = String(header ?? &quot;&quot;).split(&quot;,&quot;).map((p) =&gt; p.trim());
+  const ts = parts.filter((p) =&gt; p.startsWith(&quot;t=&quot;));
+  if (ts.length !== 1 || !/^t=\d{1,12}$/.test(ts[0])) return false;
+  const t = Number(ts[0].slice(2));
+  if (Math.abs(now - t) &gt; 300) return false;                       // replay window: 300 s
+  const given = parts.filter((p) =&gt; /^v1=[0-9a-f]{64}$/.test(p)).map((p) =&gt; Buffer.from(p.slice(3), &quot;hex&quot;));
+  let ok = false;
+  for (const s of secrets) {
+    const expected = createHmac(&quot;sha256&quot;, s).update(`${t}.${rawBody}`).digest();
+    for (const g of given) if (g.length === expected.length &amp;&amp; timingSafeEqual(g, expected)) ok = true;
+  }
+  return ok;
+}</code></pre>
+<h3 id="s9">What your receiver must do</h3>
+<ol><li><strong>Verify</strong> against the <strong>raw</strong> body. Reject if <code>|now − t|</code> &gt; 300 s. Compare in constant time.</li><li><strong>Do not trust the body.</strong> Re-fetch the object with <strong>your own key</strong> and act only on what you fetched:<ul><li><code>deposit.confirmed</code>: <code>GET /v1/deposits/:id</code>, where <code>:id</code> is <code>data.object.id</code>. Credit only if the fetched <code>status</code> is <code>confirmed</code>.</li><li><code>payment_intent.*</code>: <code>GET /v1/payment-intents/:id</code>.</li><li>Or re-fetch the whole event with <code>GET /v1/events/:id</code>.</li></ul></li><li><strong>Credit each deposit exactly once.</strong> Key the credit on the deposit, <code>&lt;CHAIN&gt;:&lt;tx_hash&gt;</code>, with the hash normalised: BEP20 as <code>0x</code> + 64 lowercase hex, TRC20 as 64 lowercase hex without <code>0x</code>. The <code>dep_…</code> id is equally unique. Put a <strong>unique constraint</strong> on that key in your own database. Deliveries are <strong>at-least-once</strong>, so the same event can arrive more than once.</li><li>Credit the fetched <code>amount</code>. If your ledger has fewer decimals, round <strong>down</strong>.</li><li>Answer <strong>2xx only after your write is durable</strong>.</li></ol>
+<h3 id="s10">Delivery and retries</h3>
+<ul><li>A delivery succeeds on any <code>2xx</code> within <strong>10 seconds</strong>.</li><li>Otherwise it is retried after <strong>1 m, 5 m, 30 m, 2 h, 6 h, 12 h and 24 h</strong>: 8 attempts in total. After that it is marked <code>exhausted</code>.</li><li>Exhausted deliveries can be <strong>re-driven</strong> by SamaPay operations. Contact support with the time range, and they are sent again as normal deliveries.</li><li>If you missed events, reconcile with <code>GET /v1/deposits?since=…</code> and credit anything you do not have yet, once per deposit, as above.</li></ul>
+</article>
+</main>
+<footer class="wrap foot">USDT payments on TRC20 and BEP20.</footer>
+</body>
+</html>
