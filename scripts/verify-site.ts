@@ -53,6 +53,7 @@ const ne = numbers(en), na = numbers(ar);
 check(diff(ne, na).length === 0, "3e. every number the English prose states also appears in the Arabic", `missing in ar: ${diff(ne, na).join(", ")}`);
 
 // ── 4. every page is static, private, mobile-ready, and its links resolve ──
+const CONTACT = "mailto:noreply@mntad.com";
 const html = readdirSync("site").filter((f) => f.endsWith(".html"));
 check(["index.html", "ar.html", "docs.html", "docs.ar.html"].every((f) => html.includes(f)), "4a. the four pages exist", html.join(", "));
 const ids = new Map(html.map((f) => [f, new Set([...read(`site/${f}`).matchAll(/\sid="([^"]+)"/g)].map((m) => m[1] as string))]));
@@ -60,8 +61,10 @@ for (const f of html) {
   const s = read(`site/${f}`);
   const isAr = f === "ar.html" || f.endsWith(".ar.html");
   check(!/<script/i.test(s) && !/\son[a-z]+\s*=/i.test(s), `4b. ${f}: no script, no inline event handler`);
-  const remote = [...s.matchAll(/\s(?:href|src|action)="([^"]+)"/g)].map((m) => m[1] as string).filter((u) => /^[a-z]+:/i.test(u) || u.startsWith("//"));
+  // The ONE allowed scheme is the contact mailto (Ibrahim, 2026-09-26): it makes no request.
+  const remote = [...s.matchAll(/\s(?:href|src|action)="([^"]+)"/g)].map((m) => m[1] as string).filter((u) => u !== CONTACT && (/^[a-z]+:/i.test(u) || u.startsWith("//")));
   check(remote.length === 0 && !/<iframe|<img|<link(?![^>]*href="style\.css")/i.test(s), `4c. ${f}: no external request (links, images, frames, stylesheets other than style.css)`, remote.join(", "));
+  check(s.includes(`href="${CONTACT}"`), `4i. ${f}: the contact link (${CONTACT}) is on the page`);
   check(/<meta name="viewport" content="width=device-width, initial-scale=1">/.test(s), `4d. ${f}: viewport meta for phones`);
   check(isAr ? /<html lang="ar" dir="rtl">/.test(s) : /<html lang="en" dir="ltr">/.test(s), `4e. ${f}: lang/dir ${isAr ? "ar/rtl" : "en/ltr"}`);
   const broken = [...s.matchAll(/\shref="([^"]+)"/g)].map((m) => m[1] as string).filter((u) => !/^[a-z]+:/i.test(u)).filter((u) => {

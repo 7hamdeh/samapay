@@ -10,11 +10,11 @@ import { readFileSync, writeFileSync } from "node:fs";
 export type Lang = "en" | "ar";
 const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-/** Inline markdown: `code`, **bold**, *em*. Code spans are cut out first so nothing inside them is formatted. */
+/** Inline markdown: `code`, **bold**, *em*, [text](mailto:…) (mailto only: the site links nowhere else). Code spans are cut out first so nothing inside them is formatted. */
 export function inline(s: string): string {
   return s.split(/(`[^`]+`)/).map((part) => {
     if (part.startsWith("`") && part.endsWith("`") && part.length > 1) return `<code>${esc(part.slice(1, -1))}</code>`;
-    return esc(part).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
+    return esc(part).replace(/\[([^\]]+)\]\((mailto:[^)\s]+)\)/g, '<a href="$2">$1</a>').replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
   }).join("");
 }
 

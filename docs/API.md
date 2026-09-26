@@ -10,7 +10,7 @@ Money you receive becomes your **gateway balance** at SamaPay.
 - **Money is always a decimal string**, never a number: `"12.5"`, `"0.000001"`. Currency is always
   `USDT`, with at most 6 decimals.
 - Every response carries an `X-Request-Id` header. Every error body repeats it as `request_id`.
-  Quote it when you contact support.
+  Quote it when you contact support: [noreply@mntad.com](mailto:noreply@mntad.com).
 
 This file is checked against the code by `scripts/verify-api-docs.ts`. Every route, status, error
 code, event type, header and constant below is compared with `src/`, so the two cannot drift.

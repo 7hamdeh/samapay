@@ -14,7 +14,7 @@
 <article>
 <h1 id="s1">pay.mntad.com — واجهة API الإصدار 1</h1>
 <p>مدفوعات USDT على شبكتي <strong>TRC20</strong> (ترون) و<strong>BEP20</strong> (BNB Smart Chain) للتجّار. تحصل على عناوين عملات رقمية، وتراقب SamaPay الشبكات، وتصلك رسالة webhook موقّعة عن كل إيداع مؤكَّد. الأموال التي تستلمها تصبح <strong>رصيدك في البوابة</strong> لدى SamaPay.</p>
-<ul><li>العنوان الأساسي: <code>https://pay.mntad.com/v1</code></li><li>JSON في الطلب والرد (<code>Content-Type: application/json</code>)، بترميز UTF-8.</li><li>التواريخ نصوص ISO-8601 بتوقيت UTC، مثل <code>2026-09-25T12:00:00.000Z</code>.</li><li><strong>المبالغ دائمًا نص عشري</strong> وليست رقمًا: <code>&quot;12.5&quot;</code> و<code>&quot;0.000001&quot;</code>. العملة دائمًا <code>USDT</code>، وبحدّ أقصى 6 منازل عشرية.</li><li>كل ردّ يحمل الترويسة <code>X-Request-Id</code>، وكل خطأ يكرّرها في الحقل <code>request_id</code>. اذكرها عند التواصل مع الدعم.</li></ul>
+<ul><li>العنوان الأساسي: <code>https://pay.mntad.com/v1</code></li><li>JSON في الطلب والرد (<code>Content-Type: application/json</code>)، بترميز UTF-8.</li><li>التواريخ نصوص ISO-8601 بتوقيت UTC، مثل <code>2026-09-25T12:00:00.000Z</code>.</li><li><strong>المبالغ دائمًا نص عشري</strong> وليست رقمًا: <code>&quot;12.5&quot;</code> و<code>&quot;0.000001&quot;</code>. العملة دائمًا <code>USDT</code>، وبحدّ أقصى 6 منازل عشرية.</li><li>كل ردّ يحمل الترويسة <code>X-Request-Id</code>، وكل خطأ يكرّرها في الحقل <code>request_id</code>. اذكرها عند التواصل مع الدعم: <a href="mailto:noreply@mntad.com">noreply@mntad.com</a>.</li></ul>
 <p>هذا الملف يُطابَق مع الشيفرة عبر <code>scripts/verify-api-docs.ts</code>: كل مسار وحالة ورمز خطأ ونوع حدث وترويسة وثابت هنا يُقارَن مع <code>src/</code>، فلا يمكن أن يختلفا.</p>
 <hr>
 <h2 id="sec-1"><bdi>1.</bdi> المصادقة</h2>
