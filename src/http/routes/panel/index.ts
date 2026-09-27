@@ -405,7 +405,7 @@ panel.post("/keys", async (c) => {
     key: { id: out.id, prefix: out.row.keyPrefix, last4: out.row.keyLast4, scopes: out.row.scopes, environment: out.row.environment },
     plaintext: out.plaintext,
     webhook_secret: out.webhookSecret,
-    warning: "This is the only time SamaPay can show you this key. Store it now.",
+    warning: "This is the only time MNTAD Pay can show you this key. Store it now.",
   }, 201);
 });
 

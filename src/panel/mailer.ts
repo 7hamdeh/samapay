@@ -29,15 +29,15 @@ export function isPlausibleEmail(email: string): boolean {
 export function loginCodeMail(from: string, email: string, code: string, ttlSec: number): Mail {
   return {
     to: email,
-    subject: "SamaPay sign-in code · رمز دخول SamaPay",
+    subject: "MNTAD Pay sign-in code · رمز دخول منطاد باي",
     text:
-`Your SamaPay sign-in code is: ${code}
+`Your MNTAD Pay sign-in code is: ${code}
 
-It works once, and for ${Math.round(ttlSec / 60)} minutes. Nobody at SamaPay will ever ask you for it, and support cannot sign in for you.
+It works once, and for ${Math.round(ttlSec / 60)} minutes. Nobody at MNTAD Pay will ever ask you for it, and support cannot sign in for you.
 
-رمز الدخول إلى SamaPay الخاص بك هو: ${code}
+رمز الدخول إلى منطاد باي الخاص بك هو: ${code}
 
-يُستخدم الرمز مرة واحدة وهو صالح لمدة ${Math.round(ttlSec / 60)} دقيقة. لن يطلبه منك أحد في SamaPay أبداً، ولا يستطيع الدعم تسجيل الدخول نيابةً عنك.
+يُستخدم الرمز مرة واحدة وهو صالح لمدة ${Math.round(ttlSec / 60)} دقيقة. لن يطلبه منك أحد في منطاد باي أبداً، ولا يستطيع الدعم تسجيل الدخول نيابةً عنك.
 `,
   };
 }

@@ -29,7 +29,7 @@ process.env.MNTAD_SAMAPAY_HANDOFF_SECRET = "l".repeat(48);
 
 import { assertSandboxDatabase } from "@/db/guard.js";
 import { prisma } from "@/db/client.js";
-import { check, summary } from "./lib/check.js";
+import { check, checkOver, summary } from "./lib/check.js";
 import { readPanelConfig, type PanelConfig } from "@/panel/config.js";
 import { FakeMailer } from "@/panel/mailer.js";
 import { MemoryBucketStore, ruleFor, enforce } from "@/panel/rate-limit.js";
@@ -114,9 +114,18 @@ async function main() {
     check(actions.length >= 1 && actions.every((a) => !a.includes("?") && !a.includes("#") && !a.includes(EMAIL) && !/\d{6}/.test(a)) && !setCookiesOf(asked).some((c) => /Location/i.test(c)),
       "4b. no form action carries a query, the address or six digits", actions.join(" "));
     const noLocation = asked.headers.get("location") === null;
-    const headerLine = [...asked.headers].filter(([k]) => k.toLowerCase() !== "set-cookie").map(([k, v]) => `${k}:${v}`).join(" ");
-    check(asked.status === 200 && noLocation && !/@|code=|\d{6}/.test(headerLine),
-      "4c. no response header other than the cookies names an address or a code", headerLine.slice(0, 160));
+    // An ALLOWLIST of header names, and the values checked with x-request-id
+    // excluded. The first version swept every value for a run of six digits, and
+    // a request id is 24 random hex characters — it can legitimately contain
+    // 000000, which made this assertion fail on a coin flip rather than on a
+    // leak. Naming the headers that may appear is the question being asked.
+    const ALLOWED_HEADERS = ["content-type", "content-security-policy", "cache-control", "x-robots-tag", "x-request-id", "set-cookie"];
+    const names = [...asked.headers].map(([k]) => k.toLowerCase());
+    const unexpected = names.filter((k) => !ALLOWED_HEADERS.includes(k));
+    const valueLine = [...asked.headers].filter(([k]) => !["set-cookie", "x-request-id"].includes(k.toLowerCase())).map(([k, v]) => `${k}:${v}`).join(" ");
+    check(asked.status === 200 && noLocation && unexpected.length === 0 && !/@|code=|\d{6}/.test(valueLine),
+      "4c. no response header names an address or a code, and no header outside the allowlist appears",
+      unexpected.length ? `unexpected: ${unexpected.join(",")}` : valueLine.slice(0, 90));
 
     // ── 5. THE CODE SPENDS AND PRODUCES A SESSION ─────────────────────────
     const code = mailer.outbox.at(-1)?.text.match(/is: (\d{6})/)?.[1] ?? "";
@@ -336,6 +345,52 @@ async function main() {
     check(mails <= ruleFor("sign_in_request").capacity && rows <= ruleFor("sign_in_request").capacity && mails >= 1,
       `13. twelve send attempts for one address produce at most ${ruleFor("sign_in_request").capacity} codes — the page shares the buckets the JSON API does, so "resend" cannot be a mail bomb`,
       `mails=${mails} rows=${rows}`);
+
+    // ── 14. THE BRAND: MNTAD Pay / منطاد باي ─────────────────────────────
+    // A rename is only finished when something refuses the old name. These read
+    // the bytes a merchant actually receives — both documents, the mail, the
+    // authenticator entry — and then sweep the source of every file that writes
+    // customer text, so the next string added with the old name is a failing test
+    // rather than a screenshot somebody notices in March.
+    check(!/SamaPay/.test(pageHtml) && pageHtml.includes("MNTAD Pay"),
+      "14a. the English login document says MNTAD Pay and never SamaPay", (pageHtml.match(/MNTAD Pay|SamaPay/g) ?? []).join(","));
+    check(!/SamaPay/.test(arHtml) && arHtml.includes("منطاد باي"),
+      "14b. the Arabic login document says منطاد باي — the platform's own Arabic name (samaprime lib/config/platform.ts:9) plus باي",
+      (arHtml.match(/منطاد باي|SamaPay/g) ?? []).join(","));
+    check(!/SamaPay/.test(dashHtml) && dashHtml.includes("MNTAD Pay"),
+      "14c. the dashboard carries the same name as the page that signed you in — two spellings of one brand inside one session reads like a phishing page",
+      (dashHtml.match(/MNTAD Pay|SamaPay/g) ?? []).join(","));
+    const mail = mailer.outbox.at(-1);
+    check(Boolean(mail) && !/SamaPay/.test(`${mail?.subject} ${mail?.text}`) && /MNTAD Pay/.test(mail?.subject ?? "") && /منطاد باي/.test(mail?.text ?? ""),
+      "14d. the code mail is renamed in both of its halves", String(mail?.subject).slice(0, 52));
+    const { otpauthUri } = await import("@/panel/totp.js");
+    const uri = decodeURIComponent(otpauthUri("x@example.invalid", "JBSWY3DPEHPK3PXP"));
+    check(!/SamaPay/.test(uri) && uri.includes("MNTAD Pay"),
+      "14e. and the row an authenticator shows for a NEW 2FA enrollment carries the new name — the issuer is a label, so an enrolled device is untouched",
+      uri.slice(0, 44));
+
+    const fs = await import("node:fs");
+    const CUSTOMER_FILES = ["src/render/panel-shell.ts", "src/render/panel-login.ts", "src/panel/mailer.ts", "src/panel/webhook.ts", "src/panel/totp.ts", "src/http/routes/panel/index.ts"];
+    const offenders: string[] = [];
+    for (const rel of CUSTOMER_FILES) {
+      const lines = fs.readFileSync(new URL(`../${rel}`, import.meta.url), "utf8").split("\n");
+      lines.forEach((line, i) => {
+        if (!/SamaPay/.test(line)) return;
+        if (/^\s*(\/\/|\*|\/\*)/.test(line)) return; // a comment names the service; the service is still SamaPay
+        offenders.push(`${rel}:${i + 1}`);
+      });
+    }
+    checkOver(CUSTOMER_FILES.length, offenders.length === 0,
+      "14f. no rendered string in the six files that write customer text still says SamaPay",
+      offenders.join(" "));
+
+    // THE BOUNDARY, asserted so it stays a decision and not an oversight: the
+    // webhook headers are a signed contract MNTAD's receiver parses. Renaming
+    // those is a coordinated change with its own review, not a find-and-replace.
+    const sign = await import("@/webhooks/sign.js");
+    check(sign.SIGNATURE_HEADER === "X-SamaPay-Signature" && sign.EVENT_HEADER === "X-SamaPay-Event" && sign.DELIVERY_HEADER === "X-SamaPay-Delivery",
+      "14g. the API's signature headers were deliberately NOT renamed — X-SamaPay-* is the contract every live receiver already verifies",
+      sign.SIGNATURE_HEADER);
   } finally {
     const emails = [EMAIL, `csrf-${RUN}@preview.invalid`, `nobody-${RUN}@preview.invalid`, `resend-${RUN}@preview.invalid`, `spam-${RUN}@preview.invalid`];
     await prisma.auditEvent.deleteMany({ where: { actor: { in: emails.map((e) => `pending:${crypto.createHash("sha256").update(e).digest("hex").slice(0, 16)}`) } } });

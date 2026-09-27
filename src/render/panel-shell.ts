@@ -53,7 +53,7 @@ export function renderPanelShell(input: ShellAccount & { cfg: PanelConfig; csrfT
 </head>
 <body class="panel">
 <header class="site-header">
-  <a class="brand" href="/panel">SamaPay</a>
+  <a class="brand" href="/panel">${t.brand}</a>
   <nav>
     ${nav}
     <a href="/docs.html">${t.docsEn}</a>
@@ -149,23 +149,23 @@ function panelScript(clientId: string | null): string {
 
 const TABLES = {
   en: {
-    title: "SamaPay — merchant panel", signedInAs: "Signed in as", keys: "API keys",
+    brand: "MNTAD Pay", title: "MNTAD Pay — merchant panel", signedInAs: "Signed in as", keys: "API keys",
     ar: "العربية", en: "English", docsEn: "Docs (EN)", docsAr: "Docs (عربي)", signOut: "Sign out",
     balance: "Balance", balanceHint: "available = confirmed deposits − fees − withdrawals still consuming. Nothing here moves money.",
     keysHint: "A key's plaintext is shown once, at creation, and cannot be recovered by anybody — including support.",
     deposits: "Deposits", intents: "Payment intents", addresses: "Permanent addresses",
-    addressesHint: "One address per customer per chain, for stores in permanent mode. SamaPay never reuses one.",
-    audit: "Audit trail", noClient: "No store is linked to this account yet. A SamaPay account is provisioned by the platform first.",
+    addressesHint: "One address per customer per chain, for stores in permanent mode. MNTAD Pay never reuses one.",
+    audit: "Audit trail", noClient: "No store is linked to this account yet. A MNTAD Pay account is provisioned by the platform first.",
     needScript: "This page needs script to read your own data. The panel exposes the same routes to you that it uses itself — use them directly if you prefer.",
   },
   ar: {
-    title: "SamaPay — لوحة التاجر", signedInAs: "تم الدخول باسم", keys: "مفاتيح API",
+    brand: "منطاد باي", title: "منطاد باي — لوحة التاجر", signedInAs: "تم الدخول باسم", keys: "مفاتيح API",
     ar: "العربية", en: "English", docsEn: "التوثيق (إنجليزي)", docsAr: "التوثيق (عربي)", signOut: "خروج",
     balance: "الرصيد", balanceHint: "المتاح = الإيداعات المؤكدة − الرسوم − السحوبات الجارية. لا شيء هنا يحرك المال.",
     keysHint: "يظهر نص المفتاح مرة واحدة عند الإنشاء ولا يمكن استرجاعه من أي جهة، بما فيها الدعم.",
     deposits: "الإيداعات", intents: "طلبات الدفع", addresses: "العناوين الدائمة",
     addressesHint: "عنوان واحد لكل عميل لكل شبكة للمتاجر في النمط الدائم. لا يُعاد استخدام العنوان أبداً.",
-    audit: "سجل التدقيق", noClient: "لا يوجد متجر مرتبط بهذا الحساب بعد. حساب SamaPay يُنشأ من المنصة أولاً.",
+    audit: "سجل التدقيق", noClient: "لا يوجد متجر مرتبط بهذا الحساب بعد. حساب منطاد باي يُنشأ من المنصة أولاً.",
     needScript: "تحتاج هذه الصفحة إلى جافاسكريبت لقراءة بياناتك. اللوحة تعرض عليك المسارات نفسها التي تستخدمها — يمكنك استخدامها مباشرة.",
   },
 } as const;

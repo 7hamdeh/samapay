@@ -99,7 +99,7 @@ async function main() {
       const m = /^=\?UTF-8\?B\?(.+)\?=$/.exec(header("Subject"));
       return m ? Buffer.from(m[1]!, "base64").toString("utf8") : header("Subject");
     })();
-    check(header("Subject").startsWith("=?UTF-8?B?") && decodedSubject === "SamaPay sign-in code · رمز دخول SamaPay",
+    check(header("Subject").startsWith("=?UTF-8?B?") && decodedSubject === "MNTAD Pay sign-in code · رمز دخول منطاد باي",
       "2f. the bilingual subject is an RFC 2047 encoded-word that decodes back to the same string — raw UTF-8 in a header is the receiver's guess, and one receiver's guess is mojibake in a merchant's inbox",
       decodedSubject.slice(0, 40));
     check(header("Content-Transfer-Encoding") === "8bit" && header("Auto-Submitted") === "auto-replied",

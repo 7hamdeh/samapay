@@ -73,7 +73,7 @@ function timingSafeEq(a: string, b: string): boolean {
   return diff === 0;
 }
 
-export function otpauthUri(label: string, secretBase32: string, issuer = "SamaPay"): string {
+export function otpauthUri(label: string, secretBase32: string, issuer = "MNTAD Pay"): string {
   return `otpauth://totp/${encodeURIComponent(issuer)}:${encodeURIComponent(label)}?secret=${secretBase32}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_PERIOD_SEC}`;
 }
 

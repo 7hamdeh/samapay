@@ -152,7 +152,7 @@ export async function panelTestWebhook(input: { accountId: string; keyId: string
     id: eventId,
     type: TEST_EVENT_TYPE,
     created_at: new Date().toISOString(),
-    data: { object: { kind: "webhook_test", key_prefix: key.keyPrefix, note: "Sent from the SamaPay panel. This is not a payment." } },
+    data: { object: { kind: "webhook_test", key_prefix: key.keyPrefix, note: "Sent from the MNTAD Pay panel. This is not a payment." } },
   } as unknown as Prisma.InputJsonObject;
   const delivery = await prisma.webhookDelivery.create({
     data: { keyId: input.keyId, clientId: key.clientId, eventType: TEST_EVENT_TYPE, eventId, payload, testOnly: true, nextAttemptAt: new Date() },

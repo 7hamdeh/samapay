@@ -105,7 +105,7 @@ export function renderLoginPage(v: LoginView): string {
 </head>
 <body class="panel auth">
 <main class="auth-wrap">
-  <h1 class="brand">SamaPay</h1>
+  <h1 class="brand">${t.brand}</h1>
   <p class="tagline">${v.step === "email" ? t.tagline : t.taglineCode}</p>
   ${v.step === "email" ? step1 : step2}
   <p class="nobody">${t.nobodyAsks}</p>
@@ -121,8 +121,8 @@ export function renderLoginPage(v: LoginView): string {
 
 const TABLES = {
   en: {
-    title: "Sign in — SamaPay merchant panel",
-    tagline: "Open your SamaPay merchant panel with a code sent to your email. There is no password to forget.",
+    brand: "MNTAD Pay", title: "Sign in — MNTAD Pay merchant panel",
+    tagline: "Open your MNTAD Pay merchant panel with a code sent to your email. There is no password to forget.",
     taglineCode: "Almost in. Enter the code we just sent you.",
     emailLabel: "Email address",
     hint: "The address your store was provisioned with. New here? The same form opens your account.",
@@ -136,7 +136,7 @@ const TABLES = {
     resend: "Send another code",
     cooldown: "You can request another code in {n} seconds.",
     changeAddress: "Use a different address",
-    nobodyAsks: "Nobody at SamaPay will ever ask you for this code, and support cannot sign in for you.",
+    nobodyAsks: "Nobody at MNTAD Pay will ever ask you for this code, and support cannot sign in for you.",
     docsEn: "Docs (EN)", docsAr: "Docs (عربي)",
     errors: {
       invalid_email: "That does not look like an email address.",
@@ -150,8 +150,8 @@ const TABLES = {
     },
   },
   ar: {
-    title: "دخول — لوحة تاجر SamaPay",
-    tagline: "افتح لوحة التاجر في SamaPay برمز يصلك بالبريد. لا توجد كلمة مرور لتنساها.",
+    brand: "منطاد باي", title: "دخول — لوحة تاجر منطاد باي",
+    tagline: "افتح لوحة التاجر في منطاد باي برمز يصلك بالبريد. لا توجد كلمة مرور لتنساها.",
     taglineCode: "بقيت خطوة واحدة. أدخل الرمز الذي أرسلناه إليك.",
     emailLabel: "البريد الإلكتروني",
     hint: "العنوان الذي فُعّل به متجرك. جديد هنا؟ نفس النموذج يفتح حسابك.",
@@ -165,7 +165,7 @@ const TABLES = {
     resend: "إرسال رمز آخر",
     cooldown: "يمكنك طلب رمز آخر بعد {n} ثانية.",
     changeAddress: "استخدام عنوان آخر",
-    nobodyAsks: "لن يطلب منك أي شخص في SamaPay هذا الرمز أبداً، والدعم لا يستطيع الدخول نيابةً عنك.",
+    nobodyAsks: "لن يطلب منك أي شخص في منطاد باي هذا الرمز أبداً، والدعم لا يستطيع الدخول نيابةً عنك.",
     docsEn: "التوثيق (إنجليزي)", docsAr: "التوثيق (عربي)",
     errors: {
       invalid_email: "هذا لا يبدو عنوان بريد إلكتروني صحيحًا.",
