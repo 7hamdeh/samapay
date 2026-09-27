@@ -19,6 +19,7 @@ import { check, summary } from "./lib/check.js";
 import { readPanelConfig } from "@/panel/config.js";
 import { grantMembership } from "@/panel/accounts.js";
 import { panelCreateKey, panelGetKey, panelListKeys, panelRevokeKey, visibleClientIds, PANEL_MINTABLE_SCOPES } from "@/panel/keys.js";
+import { issueKey } from "@/keys/issue.js";
 import { panelClearWebhook, panelListDeliveries, panelSetWebhook, panelTestWebhook } from "@/panel/webhook.js";
 import { addressesView, auditView, balanceView, depositsView, intentsView } from "@/panel/read-views.js";
 
@@ -176,6 +177,111 @@ async function main() {
       "9. the delivery log is scoped the same way: no membership → null, own client → a list", JSON.stringify({ stranger: dlStranger === null, b: Array.isArray(dlB), a: Array.isArray(dlOwn) }));
     const dlViewerAllowed = await panelListDeliveries({ accountId: viewer.id, clientId: ca.id });
     check(Array.isArray(dlViewerAllowed), "9b. a viewer may READ the delivery log — read-only is a role, not a lockout", "");
+
+    // ── 10. R2/R3: THE PANEL CANNOT RE-POINT THE STORE'S CREDITING KEY ──
+    // pay-dashboard review 2026-09-27, the residual after the HIGH fix:
+    //   "an owner can set/clear the webhook ON THE STORE'S OWN CLI-minted key →
+    //    reroutes + rotates its secret … must be closed BEFORE that issuer ships
+    //    (refuse panel set/clear on createdVia='cli')".
+    // The HIGH fix made a delivery go to its OWN key's URL, which stops a NEW
+    // key from stealing an old key's events. It does nothing about the merchant
+    // editing the CLI key's URL directly — and on this estate the CLI key IS the
+    // store's crediting key: Ibrahim mints it, applyTerms sets the client's fee
+    // and limits around it, and MNTAD's receiver is the URL it carries. Losing
+    // that URL is losing deposits' credit until reconcile notices.
+    const cliIssued = await issueKey({
+      clientId: ca.id, name: "store gateway", scopes: ["deposits.read", "events.read"],
+      issuedBy: "ibrahim", issuedVia: "cli", webhookUrl: HOOK,
+    });
+    const cliHookBefore = await prisma.clientKey.findUnique({
+      where: { id: cliIssued.id }, select: { webhookUrl: true, webhookSecret: true, webhookUpdatedAt: true, createdVia: true, issuedVia: true },
+    });
+    check(cliHookBefore?.createdVia === "cli" && cliHookBefore.webhookUrl === HOOK && cliHookBefore.webhookSecret !== null,
+      "10a. SCAFFOLD — a CLI-minted key carrying the store's webhook, on a client the panel account OWNS",
+      `createdVia=${cliHookBefore?.createdVia} url=${cliHookBefore?.webhookUrl}`);
+
+    const lockedSet = await panelSetWebhook({ accountId: a.id, keyId: cliIssued.id, url: HOOK.replace("/probe", "/other"), allowedHostnames: cfg.webhookAllowedHostnames });
+    const lockedClear = await panelClearWebhook({ accountId: a.id, keyId: cliIssued.id });
+    check(!lockedSet.ok && !lockedClear.ok && codeOf(lockedSet) === "webhook_locked" && codeOf(lockedClear) === "webhook_locked",
+      "10b. THE FIX — the OWNER of the client cannot set or clear that key's webhook, and the refusal says why",
+      `set=${codeOf(lockedSet)} clear=${codeOf(lockedClear)}`);
+    const cliHookAfter = await prisma.clientKey.findUnique({
+      where: { id: cliIssued.id }, select: { webhookUrl: true, webhookSecret: true, webhookUpdatedAt: true },
+    });
+    check(cliHookAfter?.webhookUrl === HOOK && cliHookAfter.webhookSecret === cliHookBefore?.webhookSecret && cliHookAfter.webhookUpdatedAt === null,
+      "10c. and the refusal writes NOTHING: same URL, same secret ciphertext, no touched timestamp — a refused attempt cannot half-rotate a crediting key",
+      `url=${cliHookAfter?.webhookUrl === HOOK} secret=${cliHookAfter?.webhookSecret === cliHookBefore?.webhookSecret}`);
+
+    // The control that keeps 10b a narrowing rather than a shut door: the panel
+    // still manages the webhook of the keys the panel itself minted, both ways.
+    const panelKey = await panelCreateKey({ accountId: a.id, clientId: ca.id, name: "panel hook", scopes: ["deposits.read"], ip: null, webhookUrl: HOOK, allowedHostnames: cfg.webhookAllowedHostnames });
+    const ownId = panelKey.ok ? panelKey.id : "no-key";
+    const setOwn = await panelSetWebhook({ accountId: a.id, keyId: ownId, url: HOOK.replace("/probe", "/mine"), allowedHostnames: cfg.webhookAllowedHostnames });
+    const clearOwn = await panelClearWebhook({ accountId: a.id, keyId: ownId });
+    check(panelKey.ok && setOwn.ok && clearOwn.ok,
+      "10d. CONTROL — set and clear still work on a panel-minted key: the lock names a provenance, not a feature",
+      `mint=${codeOf(panelKey)} set=${codeOf(setOwn)} clear=${codeOf(clearOwn)}`);
+
+    // No existence oracle, and no provenance oracle either: to an account that
+    // cannot see the key, a locked key is the same "nothing here" as a key that
+    // does not exist. Tenancy is decided BEFORE provenance, on purpose. (The
+    // account has to be `stranger`: B was made a VIEWER of this client in
+    // assertion 8, so its answer is legitimately not_owner, not not_found.)
+    const bLocked = await panelSetWebhook({ accountId: stranger.id, keyId: cliIssued.id, url: HOOK, allowedHostnames: cfg.webhookAllowedHostnames });
+    check(!bLocked.ok && bLocked.code === "not_found",
+      "10e. an account with no membership is told not_found, never webhook_locked — the lock does not confirm the id is real or CLI-made", codeOf(bLocked));
+    const viewerLocked = await panelSetWebhook({ accountId: viewer.id, keyId: cliIssued.id, url: HOOK, allowedHostnames: cfg.webhookAllowedHostnames });
+    check(!viewerLocked.ok && viewerLocked.code === "not_owner",
+      "10f. and a viewer is told not_owner — role is still decided before provenance, so the answer a member gets is the answer they got before", codeOf(viewerLocked));
+
+    // An operator-minted key (the struck `samaprime_admin_action` path) carries
+    // createdVia 'cli' by issueKey's own default, and a future value nobody has
+    // thought of yet must be locked too: the rule is an ALLOWLIST of what the
+    // panel may write, so an unknown provenance is a refusal by construction.
+    const adminKey = await issueKey({ clientId: ca.id, name: "legacy admin", scopes: ["deposits.read"], issuedBy: "samaprime", issuedVia: "samaprime_admin_action" });
+    const unknownKey = await issueKey({ clientId: ca.id, name: "future", scopes: ["deposits.read"], issuedBy: "someone", issuedVia: "cli" });
+    await prisma.clientKey.update({ where: { id: unknownKey.id }, data: { createdVia: "hand_edited" } });
+    const adminLocked = await panelSetWebhook({ accountId: a.id, keyId: adminKey.id, url: HOOK, allowedHostnames: cfg.webhookAllowedHostnames });
+    const unknownLocked = await panelSetWebhook({ accountId: a.id, keyId: unknownKey.id, url: HOOK, allowedHostnames: cfg.webhookAllowedHostnames });
+    check(!adminLocked.ok && adminLocked.code === "webhook_locked" && !unknownLocked.ok && unknownLocked.code === "webhook_locked",
+      "10g. an operator-minted key and a key whose created_via nobody recognises are BOTH locked — panel-writable is named, not inferred",
+      `operator=${codeOf(adminLocked)} unknown=${codeOf(unknownLocked)}`);
+
+    // Every attempt is visible to the account whose store it targets. Without
+    // this, the one signal an operator gets that a merchant tried to re-point a
+    // crediting key is the missing credit, days later.
+    const refusals = await prisma.auditEvent.count({ where: { actor: `account:${a.id}`, action: "panel.webhook.refused_locked" } });
+    check(refusals >= 2,
+      "10h. a locked refusal is AUDITED against the key — `panel.webhook.refused_locked` with the reason and the provenance",
+      `rows=${refusals} (10b set + clear, and 10g's two)`);
+
+    // ROUTE LEVEL: a refusal the HTTP layer cannot name answers 500 "Refusal
+    // mapping is incomplete", which is a bug report no merchant can act on and a
+    // signal an operator cannot alert on. This is the only assertion that can
+    // catch a new PanelRefusal code reaching refuse() unmapped.
+    const { buildApp } = await import("@/http/app.js");
+    const { setPanelDeps } = await import("@/http/routes/panel/index.js");
+    const { FakeMailer } = await import("@/panel/mailer.js");
+    const { MemoryBucketStore } = await import("@/panel/rate-limit.js");
+    const { createSession } = await import("@/panel/session.js");
+    setPanelDeps({ cfg, buckets: new MemoryBucketStore(), mailer: new FakeMailer() });
+    const app = buildApp();
+    const aSession = await createSession({ accountId: a.id, via: "otp", ip: "203.0.113.7", userAgent: "verify", cfg });
+    const cookie = `${cfg.cookieName}=${aSession.token}; ${cfg.cookieName}_csrf=${aSession.csrfToken}`;
+    const routeSet = await app.request("http://pay.mntad.test/panel/keys/" + cliIssued.id + "/webhook", {
+      method: "POST", headers: { "content-type": "application/json", cookie, "x-csrf-token": aSession.csrfToken },
+      body: JSON.stringify({ url: "http://127.0.0.1:3090/api/webhooks/samapay/attacker" }),
+    });
+    const routeClear = await app.request("http://pay.mntad.test/panel/keys/" + cliIssued.id + "/webhook/clear", {
+      method: "POST", headers: { "content-type": "application/json", cookie, "x-csrf-token": aSession.csrfToken }, body: "{}",
+    });
+    const routeBody = await routeSet.json() as { error?: { code?: string; message?: string; details?: { created_via?: string } } };
+    check(routeSet.status === 403 && routeClear.status === 403 && routeBody.error?.code === "insufficient_scope",
+      "10i. over HTTP the same refusal is a 403 insufficient_scope — never a 500 from an unmapped refusal code",
+      `set=${routeSet.status}/${String(routeBody.error?.code)} clear=${routeClear.status}`);
+    check(typeof routeBody.error?.message === "string" && /platform|not the panel|managed/i.test(routeBody.error.message),
+      "10j. and the message tells the merchant who DOES manage that webhook, in the response they will paste into a support thread",
+      String(routeBody.error?.message).slice(0, 70));
   } finally {
     await prisma.auditEvent.deleteMany({ where: { key: { client: { id: { in: [ca.id, cb.id] } } } } });
     await prisma.deposit.deleteMany({ where: { key: { client: { id: { in: [ca.id, cb.id] } } } } });

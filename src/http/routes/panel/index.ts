@@ -91,12 +91,16 @@ function requireOwner(membershipRole: string | null | undefined): void {
 /** Panel refusal → the contract's error shape. `not_found` everywhere a
  *  tenancy question was answered "no", because confirming an id exists is the
  *  oracle panel-survey §5 refusal 5 refuses to open. */
-function refuse(r: { code: string; reason?: string; scope?: string; allowance?: string; consumingWithdrawals?: number }): never {
+function refuse(r: { code: string; reason?: string; scope?: string; allowance?: string; consumingWithdrawals?: number; createdVia?: string }): never {
   switch (r.code) {
     case "not_found": throw new ApiError("not_found", "No such resource for this account.");
     case "not_owner": throw new ApiError("insufficient_scope", "Your role on this account cannot do that.");
     case "scope_not_mintable": throw new ApiError("insufficient_scope", "This scope cannot be minted from the panel.", { scope: r.scope });
     case "target_refused": throw new ApiError("validation_failed", "That webhook target was refused.", { reason: r.reason });
+    // R2/R3. 403, and the sentence says WHO can change it, because the person
+    // reading this is a merchant who just clicked "edit" on their own key and
+    // needs to know it is a rule of the platform rather than a broken button.
+    case "webhook_locked": throw new ApiError("insufficient_scope", "This key's webhook is managed by the platform, not by the panel: it is the address the store is credited at.", { created_via: r.createdVia });
     // 409, and the contract's own conflict code: the merchant is not asking for
     // something invalid, they are asking for it while value sits behind the key.
     case "revoke_blocked": throw new ApiError("reference_conflict", "This key still holds value, so revoking it would strand it.", { allowance: r.allowance, consuming_withdrawals: r.consumingWithdrawals });

@@ -24,7 +24,41 @@ import { assertWebhookTargetUrl } from "@/net/webhook-target.js";
 import { visibleClientIds } from "./keys.js";
 import { membershipFor } from "./accounts.js";
 
-export type WebhookRefusal = { ok: false; code: "not_found" } | { ok: false; code: "not_owner" } | { ok: false; code: "target_refused"; reason: string };
+export type WebhookRefusal =
+  | { ok: false; code: "not_found" }
+  | { ok: false; code: "not_owner" }
+  | { ok: false; code: "target_refused"; reason: string }
+  // R2/R3 (pay-dashboard review 2026-09-27): the key's provenance, not the
+  // caller's role, is what refuses. See PANEL_WRITABLE_WEBHOOK_VIA below.
+  | { ok: false; code: "webhook_locked"; createdVia: string };
+
+/** The only provenance whose webhook the panel may write. Anything else —
+ *  `cli`, the struck `samaprime_admin_action`, a value nobody has invented yet —
+ *  is a key Ibrahim minted, and on this estate THAT key is the store's crediting
+ *  address: `applyTerms` sets the client's fee and limits around it, MNTAD's
+ *  receiver is the URL it carries, and a merchant who re-points it stops being
+ *  credited until reconcile notices days later.
+ *
+ *  The HIGH fix (a delivery goes to its OWN key's webhook, 17967b9) closed
+ *  re-pointing by MINTING a new key. It says nothing about editing the CLI key
+ *  in place, which is what an account owner with a handoff session can do —
+ *  467fd1c's own review calls this the residual, and requires it closed before
+ *  the MNTAD issuer ships. An ALLOWLIST, so the next provenance value is locked
+ *  by default rather than by somebody remembering to add a case. */
+const PANEL_WRITABLE_WEBHOOK_VIA: readonly string[] = ["panel_owner"];
+
+/** Provenance is decided AFTER tenancy and role, never before: to an account
+ *  that cannot see the key, a locked key must stay indistinguishable from a key
+ *  that does not exist, or the refusal itself becomes the existence oracle
+ *  panel-survey §5 refusal 5 refuses to open. */
+async function refuseUnlessPanelWritten(input: { accountId: string; keyId: string; createdVia: string }): Promise<WebhookRefusal | null> {
+  if (PANEL_WRITABLE_WEBHOOK_VIA.includes(input.createdVia)) return null;
+  await appendAudit(prisma, {
+    keyId: input.keyId, actor: `account:${input.accountId}`, action: "panel.webhook.refused_locked",
+    subjectId: input.keyId, params: { created_via: input.createdVia },
+  });
+  return { ok: false, code: "webhook_locked", createdVia: input.createdVia };
+}
 
 /** Returns the PLAINTEXT secret exactly once, in this result. The row keeps the
  *  "v1:" ciphertext (src/keys/webhook-secret.ts) and the dispatcher refuses to
@@ -33,9 +67,11 @@ export type WebhookRefusal = { ok: false; code: "not_found" } | { ok: false; cod
 export async function panelSetWebhook(input: {
   accountId: string; keyId: string; url: string; allowedHostnames?: readonly string[];
 }): Promise<{ ok: true; webhookSecret: string; webhookUrl: string } | WebhookRefusal> {
-  const key = await prisma.clientKey.findUnique({ where: { id: input.keyId }, select: { clientId: true, active: true } });
+  const key = await prisma.clientKey.findUnique({ where: { id: input.keyId }, select: { clientId: true, active: true, createdVia: true } });
   if (!key || !(await visibleClientIds(input.accountId)).includes(key.clientId)) return { ok: false, code: "not_found" };
   if ((await membershipFor(input.accountId, key.clientId))?.role !== "owner") return { ok: false, code: "not_owner" };
+  const locked = await refuseUnlessPanelWritten({ accountId: input.accountId, keyId: input.keyId, createdVia: key.createdVia });
+  if (locked) return locked;
 
   const guard = await assertWebhookTargetUrl(input.url, { allowHostnames: input.allowedHostnames ?? [] });
   if (!guard.ok) return { ok: false, code: "target_refused", reason: guard.code };
@@ -64,9 +100,11 @@ function hostOf(url: string): string {
 }
 
 export async function panelClearWebhook(input: { accountId: string; keyId: string }): Promise<{ ok: true } | WebhookRefusal> {
-  const key = await prisma.clientKey.findUnique({ where: { id: input.keyId }, select: { clientId: true } });
+  const key = await prisma.clientKey.findUnique({ where: { id: input.keyId }, select: { clientId: true, createdVia: true } });
   if (!key || !(await visibleClientIds(input.accountId)).includes(key.clientId)) return { ok: false, code: "not_found" };
   if ((await membershipFor(input.accountId, key.clientId))?.role !== "owner") return { ok: false, code: "not_owner" };
+  const locked = await refuseUnlessPanelWritten({ accountId: input.accountId, keyId: input.keyId, createdVia: key.createdVia });
+  if (locked) return locked;
   await prisma.$transaction(async (tx) => {
     await tx.clientKey.update({ where: { id: input.keyId }, data: { webhookUrl: null, webhookSecret: null, webhookUpdatedAt: new Date() } });
     await appendAudit(tx, { keyId: input.keyId, actor: `account:${input.accountId}`, action: "panel.webhook.cleared", subjectId: input.keyId });
@@ -84,7 +122,14 @@ export const TEST_EVENT_TYPE = "webhook.test";
  *  It is marked `testOnly` on the row and typed `webhook.test`, and MNTAD's
  *  receiver refuses anything that is not payment_intent.* or deposit.confirmed
  *  (lib/samapay/webhook.ts:144-149, measured), so a test can never credit a
- *  store on the other side. That refusal is the reason this is safe to expose. */
+ *  store on the other side. That refusal is the reason this is safe to expose.
+ *
+ *  SCOPE, stated so silence is not approval: this one is NOT locked to
+ *  panel_owner the way set and clear are (R2/R3). A test sends to the URL the
+ *  key already carries — it changes nothing, rotates nothing, and the row it
+ *  writes is marked testOnly. What it does cost is one request to the store's
+ *  endpoint and one line in that client's delivery log, throttled to one per key
+ *  per minute by the route. */
 export async function panelTestWebhook(input: { accountId: string; keyId: string; allowedHostnames?: readonly string[] }): Promise<{ ok: true; deliveryId: string; status: number | null; outcome: string } | WebhookRefusal> {
   const key = await prisma.clientKey.findUnique({
     where: { id: input.keyId },
