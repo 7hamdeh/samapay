@@ -17,6 +17,13 @@
 // exits 1 with "REFUSING TO RUN", which is the only honest state for it.
 import { assertSandboxDatabase } from "@/db/guard.js";
 import { prisma } from "@/db/client.js";
+// THE SUITE'S OWN PRECONDITION, stated. Checks 3, 4, 7 and 7c mint and use
+// `sk_test_` keys, which src/http/auth.ts:33 refuses whenever CRYPTO_MODE is
+// "mainnet" — and instantiating Prisma Client loads this project's .env into
+// process.env, so on a box whose .env says mainnet (production's does) the
+// ambient value silently turns those four checks red. Set it here rather than
+// inherit it, so the suite answers the same question on every host.
+process.env.CRYPTO_MODE = "testnet";
 import { buildApp } from "@/http/app.js";
 import { issueKey, IssueKeyError, revokeKey } from "@/keys/issue.js";
 import { computeAuditHash, GENESIS_HASH } from "@/audit/append.js";
