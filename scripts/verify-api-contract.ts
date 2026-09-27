@@ -1,4 +1,4 @@
-// COVERS: src/http/app.ts src/http/auth.ts src/http/scopes.ts src/http/errors.ts src/http/idempotency.ts src/http/routes/payment-intents.ts src/http/routes/deposits.ts src/http/routes/events.ts
+// COVERS: src/http/app.ts src/http/auth.ts src/http/scopes.ts src/http/errors.ts src/http/idempotency.ts src/http/routes/payment-intents.ts src/http/routes/deposits.ts src/http/routes/events.ts src/http/routes/health.ts
 //
 // CONTRACT §2–§6 THROUGH THE REAL APP, in-process (no port, no chain).
 // /root/pay-mntad-api-contract.md is the spec; every row of the §6 error
@@ -93,9 +93,9 @@ async function main() {
     const SLOW = await iss(cA.id, "rate", ALL);
     await prisma.clientKey.update({ where: { id: SLOW.id }, data: { rpsLimit: 2 } });
 
-    const hdr = (k: string | null, idem?: string) => ({ ...(k ? { authorization: `Bearer ${k}` } : {}), "content-type": "application/json", ...(idem !== undefined ? { "idempotency-key": idem } : {}) });
-    const call = async (method: string, path: string, key: string | null, body?: unknown, idem?: string) => {
-      const res = await app.request(path, { method, headers: hdr(key, idem), ...(body !== undefined ? { body: typeof body === "string" ? body : JSON.stringify(body) } : {}) });
+    const hdr = (k: string | null, idem?: string, extra?: Record<string, string>) => ({ ...(k ? { authorization: `Bearer ${k}` } : {}), "content-type": "application/json", ...(idem !== undefined ? { "idempotency-key": idem } : {}), ...(extra ?? {}) });
+    const call = async (method: string, path: string, key: string | null, body?: unknown, idem?: string, extra?: Record<string, string>) => {
+      const res = await app.request(path, { method, headers: hdr(key, idem, extra), ...(body !== undefined ? { body: typeof body === "string" ? body : JSON.stringify(body) } : {}) });
       const text = await res.text();
       let json: Json = {}; try { json = JSON.parse(text) as Json; } catch { /* not JSON */ }
       return { res, status: res.status, json, text, code: json.error?.code };
@@ -354,7 +354,18 @@ async function main() {
     const nf = await call("GET", "/v1/nope", A.plaintext);
     check(nf.status === 404 && nf.code === "not_found" && !!nf.json.error?.request_id, "§6 404 not_found — unknown route under /v1, error shape with request_id", `${nf.status}`);
     // ── /v1/health (A2/A9) ──
-    const h0 = await call("GET", "/v1/health", null);
+    // TWO ANSWERS FROM ONE ROUTE, and the caller's Host decides which (owner ruling
+    // 2026-09-26, src/http/routes/health.ts:63-79): an operator at the loopback
+    // interface reads the detail, everyone else reads { ok }. `app.request()` sends
+    // no Host header at all — measured, not assumed — so a bare call() here IS the
+    // public caller. That is why the detailed rows below name the loopback Host
+    // instead of inheriting it: an assertion that silently fell back to the public
+    // body would still be checking HTTP, just not the thing it says.
+    const LOOPBACK = { host: "127.0.0.1:3090" };
+    const hPub = await call("GET", "/v1/health", null);
+    check(hPub.status === 200 && Object.keys(hPub.json).length === 1 && "ok" in hPub.json && !["vault", "derivation", "observer_lag_blocks", "legacy_watch"].some((k) => k in hPub.json),
+      "A9 GET /v1/health with no loopback Host is ONE key, { ok } — through the real app, so no middleware can leak the recon map by rewriting Host", JSON.stringify(hPub.json));
+    const h0 = await call("GET", "/v1/health", null, undefined, undefined, LOOPBACK);
     const lw0 = h0.json.legacy_watch as Record<string, unknown> | undefined;
     check(h0.status === 200 && h0.json.vault === "unproven" && h0.json.derivation === "unavailable" && !!lw0 && "TRC20" in lw0 && "BEP20" in lw0 && typeof h0.json.observer_lag_blocks === "object",
       "A9 GET /v1/health needs no key; unwired readers answer the SAFE values (unproven / unavailable)", JSON.stringify(h0.json));
@@ -362,18 +373,29 @@ async function main() {
     const stamp = new Date("2026-09-24T12:00:00.000Z");
     if (hadCursor) await prisma.scanCursor.update({ where: { chain: "TRC20" }, data: { legacyWatchEnabledAt: stamp } });
     else await prisma.scanCursor.create({ data: { chain: "TRC20", lastScannedBlock: 1n, legacyWatchEnabledAt: stamp } });
-    const h1 = await call("GET", "/v1/health", null);
+    const h1 = await call("GET", "/v1/health", null, undefined, undefined, LOOPBACK);
     if (hadCursor) await prisma.scanCursor.update({ where: { chain: "TRC20" }, data: { legacyWatchEnabledAt: hadCursor.legacyWatchEnabledAt } });
     else await prisma.scanCursor.delete({ where: { chain: "TRC20" } });
     check((h1.json.legacy_watch as Record<string, unknown> | undefined)?.TRC20 === stamp.toISOString() && (h1.json.legacy_watch as Record<string, unknown> | undefined)?.BEP20 === null,
       "A2 legacy_watch reports scan_cursors.legacy_watch_enabled_at per chain", JSON.stringify(h1.json.legacy_watch));
     setHealthReaders({ observerLagBlocks: async () => ({ TRC20: 3, BEP20: 7 }), vault: async () => "proven", derivation: async () => "ready" });
-    const h2 = await call("GET", "/v1/health", null);
+    const h2 = await call("GET", "/v1/health", null, undefined, undefined, LOOPBACK);
     check(h2.json.ok === true && h2.json.vault === "proven" && h2.json.derivation === "ready" && JSON.stringify(h2.json.observer_lag_blocks) === JSON.stringify({ TRC20: 3, BEP20: 7 }),
       "A9 wired readers are reported as-is", JSON.stringify(h2.json));
     setHealthReaders({ legacyWatch: async () => { throw new Error("db down"); } });
-    const h3 = await call("GET", "/v1/health", null);
+    const h3 = await call("GET", "/v1/health", null, undefined, undefined, LOOPBACK);
     check(h3.status === 200 && h3.json.ok === false && !("legacy_watch" in h3.json), "A2 a failing legacy_watch reader is ok:false and the field is ABSENT (never a null that reads as 'not watching')", JSON.stringify(h3.json));
+    // THE SAME MOMENT, SEEN FROM OUTSIDE. Narrowing the BODY must not narrow the
+    // SIGNAL: an earlier cut of health.ts answered a public caller with a
+    // constant {ok:true}, which would show a dead scanner as healthy — strictly
+    // worse than the disclosure it was closing. verify-health-narrow.ts proves
+    // that on the pure function; this proves it through the real app, on the
+    // exact row state where the loopback view above has just said ok:false for
+    // a named reason, so the two answers cannot diverge into "detail broken,
+    // public cheerful".
+    const hPubDown = await call("GET", "/v1/health", null);
+    check(hPubDown.status === 200 && Object.keys(hPubDown.json).length === 1 && hPubDown.json.ok === false,
+      "A9 a failing reader is ok:false to the PUBLIC caller too — one key, still the TRUE one (the narrowing did not narrow the signal)", JSON.stringify(hPubDown.json));
     const hRoot = await call("GET", "/health", null);
     check(hRoot.status === 200, "unversioned /health stays for supervision", `${hRoot.status}`);
 
