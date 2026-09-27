@@ -118,6 +118,33 @@ async function main() {
       "6. an attempt to mint a keys.issue key from the panel is refused by name", `${codeOf(admin)}/${String((admin as { scope?: string }).scope ?? "")}`);
     check(!PANEL_MINTABLE_SCOPES.includes("keys.issue" as never), "6b. and the picker never offered it in the first place", "");
 
+    // 6c-6f. withdrawals are not a panel permission yet (review MEDIUM).
+    // `PANEL_MINTABLE_SCOPES` was `SCOPES.filter(s => s !== "keys.issue")`, so
+    // every other scope — including the whole withdrawal family — was offered.
+    // Withdrawals are UNMOUNTED service-wide in Phase 0 (src/http/app.ts:8-11),
+    // so a panel-minted withdrawals.write today is a permission with no route
+    // behind it, and the moment the rail is mounted it becomes a key that moves
+    // money, minted by a browser session with no step-up. The rail's own review
+    // (the "keys that can move money need a second factor at use" ruling) is
+    // what has to land before either half comes back.
+    const keysBeforeAttempts = await prisma.clientKey.count({ where: { clientId: ca.id } });
+    const wWrite = await panelCreateKey({ accountId: a.id, clientId: ca.id, name: "withdraw-writer", scopes: ["withdrawals.write"], ip: null });
+    check(!wWrite.ok && wWrite.code === "scope_not_mintable" && wWrite.scope === "withdrawals.write",
+      "6c. withdrawals.write is refused from the panel BY NAME, the same way keys.issue is", `${codeOf(wWrite)}/${String((wWrite as { scope?: string }).scope ?? "")}`);
+    const wRead = await panelCreateKey({ accountId: a.id, clientId: ca.id, name: "withdraw-reader", scopes: ["withdrawals.read"], ip: null });
+    check(!wRead.ok && wRead.code === "scope_not_mintable",
+      "6d. the whole family goes, not just the write half — a panel that offers `withdrawals.read` advertises a surface that does not exist",
+      `${codeOf(wRead)}/${String((wRead as { scope?: string }).scope ?? "")}`);
+    const wMixed = await panelCreateKey({ accountId: a.id, clientId: ca.id, name: "mixed", scopes: ["deposits.read", "withdrawals.write"], ip: null });
+    const keysAfterAttempts = await prisma.clientKey.count({ where: { clientId: ca.id } });
+    check(!wMixed.ok && wMixed.code === "scope_not_mintable" && keysAfterAttempts === keysBeforeAttempts,
+      "6e. a MIXED request naming one good scope and one bad is refused whole, and writes no key row (no partial mint to discover later)",
+      `${codeOf(wMixed)} keys=${keysBeforeAttempts}→${keysAfterAttempts}`);
+    const offered = PANEL_MINTABLE_SCOPES.filter((s) => /^(withdrawals|keys)\./.test(s));
+    check(offered.length === 0 && PANEL_MINTABLE_SCOPES.includes("deposits.read" as never) && PANEL_MINTABLE_SCOPES.includes("payment_intents.write" as never),
+      "6f. the picker offers neither family AND still offers the merchant's real scopes — the fix is a narrowing, not a shut door",
+      `excluded=${JSON.stringify(offered)}`);
+
     // 7. a viewer reads but never mutates
     const vList = await panelListKeys(viewer.id, ca.id);
     const vMint = await panelCreateKey({ accountId: viewer.id, clientId: ca.id, name: "viewer key", scopes: ["deposits.read"], ip: null });

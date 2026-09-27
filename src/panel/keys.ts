@@ -15,11 +15,24 @@ import { SCOPES, type Scope } from "@/http/scopes.js";
 import { membershipFor } from "./accounts.js";
 import { assertWebhookTargetUrl } from "@/net/webhook-target.js";
 
-/** `keys.issue` is not in this list and can never be. It is minted by the CLI
- *  only, and issueKey's own refusal (keys_issue_not_via_admin) is the backstop
- *  when a picker is wired wrong — a panel that could mint an admin key would
- *  make "keys come by his hand" false by degrees. */
-export const PANEL_MINTABLE_SCOPES: readonly Scope[] = SCOPES.filter((s) => s !== "keys.issue");
+/** What the panel may NEVER offer, and why each one is here:
+ *    `keys.issue`      — minting an admin key is the CLI's hand; issueKey's own
+ *                        refusal (keys_issue_not_via_admin) is the backstop when
+ *                        a picker is wired wrong. A panel that could mint an
+ *                        admin key would make "keys come by his hand" false by
+ *                        degrees.
+ *    `withdrawals.*`   — pay-dashboard review 2026-09-27, MEDIUM. The rail is
+ *                        unmounted service-wide in Phase 0 (src/http/app.ts:8-11),
+ *                        so today this is a permission with no route behind it;
+ *                        the day it is mounted, it is a key that moves money
+ *                        minted from a browser session with no step-up. Bring
+ *                        the family back only with withdrawals' step-up at use.
+ *                        The READ half goes with the write half on purpose: a
+ *                        picker that offers `withdrawals.read` advertises a
+ *                        surface that does not exist, and the next person reads
+ *                        the family as panel-mintable. */
+const PANEL_EXCLUDED_SCOPES: readonly Scope[] = ["keys.issue", "withdrawals.write", "withdrawals.read"];
+export const PANEL_MINTABLE_SCOPES: readonly Scope[] = SCOPES.filter((s) => !PANEL_EXCLUDED_SCOPES.includes(s));
 
 export type PanelKeyRow = Readonly<{
   id: string; name: string; keyPrefix: string; keyLast4: string; scopes: string[];
