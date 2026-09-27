@@ -7,10 +7,14 @@
 // withdrawal.* notifications, which are out of Phase 0.
 //
 // Contract v1.1:
-//   A6 — a delivery goes to the CLIENT's current active key (its URL, its
-//        secret), not to the key it was enqueued under: after a rotation the
-//        old key's events still arrive, signed with the secret the receiver
-//        now holds.
+//   A6 — a delivery goes to the webhook target of the KEY IT BELONGS TO, while
+//        that key is active and still has one. Only once it does not — after a
+//        rotation or a revoke, or for a key that never had a URL — does the
+//        delivery follow the client's current active key, so a rotated
+//        receiver still gets the events of its old key, signed with the secret
+//        it now holds. "Newest key wins for everything" was the first reading
+//        of this clause and the 2026-09-27 review's HIGH: one new key with a
+//        webhook re-pointed every other key's deposit notifications.
 //   A7 — an attempt starts with a CLAIM: one conditional UPDATE that only one
 //        worker can win, and only when the attempt is DUE. The claim is a
 //        LEASE on `next_attempt_at` — the winner moves it CLAIM_LEASE_MS into
@@ -133,12 +137,25 @@ export async function attemptDelivery(deliveryId: string, fetchImpl: FetchLike =
     }
   }
 
-  // ── THE TARGET (A6) ── the client's current active key, newest first.
-  const target = await prisma.clientKey.findFirst({
-    where: { clientId: d.key.clientId, active: true, revokedAt: null, webhookUrl: { not: null }, webhookSecret: { not: null } },
-    orderBy: { createdAt: "desc" },
-    select: { id: true, webhookUrl: true, webhookSecret: true },
-  });
+  // ── THE TARGET (A6, narrowed by the 2026-09-27 review) ──
+  // A delivery belongs to a KEY, not merely to a client: `keyId` is the key of
+  // the object the event is about, and its webhook URL is the address that
+  // receiver told us to use. Taking the client's NEWEST active key on every
+  // attempt (the reading this file had until now) let one newly minted key —
+  // including a panel owner's own key, or a webhook set on any key — capture
+  // every pending `deposit.confirmed` of the client, which on a SHARED client
+  // is other stores' crediting events.
+  //
+  // So: the delivery's own key while it is active and still carries a target;
+  // the client's newest active key only as the fallback once that key is
+  // revoked, deactivated, or has no URL of its own. The fallback is what A6
+  // was for — a rotation moves the secret, and an address's deliveries
+  // outlive its key because revocation refuses while value sits behind it.
+  const targetWhere = { active: true, revokedAt: null, webhookUrl: { not: null }, webhookSecret: { not: null } } as const;
+  const targetSelect = { id: true, webhookUrl: true, webhookSecret: true } as const;
+  const own = await prisma.clientKey.findFirst({ where: { id: d.keyId, clientId: d.key.clientId, ...targetWhere }, select: targetSelect });
+  const target = own ?? await prisma.clientKey.findFirst({ where: { clientId: d.key.clientId, ...targetWhere }, orderBy: { createdAt: "desc" }, select: targetSelect });
+  if (target && !own) log.info({ actor: "webhooks", action: "webhook.deliver", result: "target_fallback", deliveryId, eventId: d.eventId, ownKeyId: d.keyId, usedKeyId: target.id }, "the delivery's own key has no target; using the client's current one");
   // No key to send to is a failed ATTEMPT, not a lost event: it stays on the
   // schedule (and redrive-deliveries.ts can bring it back after exhaustion).
   if (!target?.webhookUrl || !target.webhookSecret) return fail("no active key with a webhook url for this client", null);
