@@ -75,7 +75,9 @@ export function loopbackOnly(hostHeader: string | undefined, portless: string): 
 }
 
 export function shouldExposeDetailedHealth(input: {
-  host?: string; forwardToken?: string | null; configuredToken?: string | undefined;
+  // `| undefined` is stated because a caller reading a Hono header HAS one, and
+  // exactOptionalPropertyTypes will not let `string | undefined` satisfy `string`.
+  host?: string | undefined; forwardToken?: string | null | undefined; configuredToken?: string | undefined;
 }): boolean {
   const token = input.configuredToken;
   if (token && token.length >= 16 && input.forwardToken && input.forwardToken === token) return true;
