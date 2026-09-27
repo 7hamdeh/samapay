@@ -45,13 +45,17 @@
 //     merchant learns now, not as a mysterious `exhausted` later.
 //     ⚠️ THIS IS NOT THE SECURITY BOUNDARY.
 //  2. AT DISPATCH TIME — `src/webhooks/dispatch.ts` `attemptDelivery()`,
-//     after the `target` row is read (~line 137) and BEFORE the
-//     `fetchImpl` call (~line 164), on `target.webhookUrl` as stored. DNS
-//     at save time is not DNS at send time, and the dispatcher re-reads
-//     the client's CURRENT active key on every attempt (contract v1.1 A6),
-//     so the string being fetched is re-checked as late as it can be.
-//     Neither edit is in this file's scope — dispatch.ts and
-//     webhook-secret.ts have another owner on this branch.
+//     after the `target` row is read and BEFORE the `fetchImpl` call, on
+//     `target.webhookUrl` as stored. DNS at save time is not DNS at send
+//     time, and the dispatcher re-reads the key's CURRENT stored URL on
+//     every attempt, so the string being fetched is re-checked as late as
+//     it can be. WIRED 2026-09-27 (review MEDIUM: the test button guarded
+//     key X's URL while dispatch POSTed elsewhere and retried unguarded);
+//     `scripts/verify-dispatch-egress.ts` owns the proof. Its allowlist is
+//     `webhookEgressAllowlist()` in src/keys/webhook-secret.ts — the
+//     operator door UNION the loopback hosts `validateWebhookUrl` has always
+//     accepted, because a send-time refusal of a CLI-minted loopback target
+//     would stop the crediting path on the next restart.
 //
 // ⚠️ AND NEITHER CALL CLOSES THE REDIRECT HOLE. A pre-flight check on the
 // URL is worthless if the transport then follows a 302 to
@@ -76,6 +80,7 @@ import {
   type AddressResolver,
   type OutboundRefusalReason,
 } from "./outbound-address-guard.js";
+import { WEBHOOK_LOOPBACK_HOSTNAMES } from "@/keys/webhook-secret.js";
 
 /** Stable, machine-readable refusal codes. An API — renaming one is a
  *  breaking change to anything that branches on it. */
@@ -113,13 +118,13 @@ export type WebhookTargetResult =
   | { readonly ok: false; readonly code: WebhookTargetCode; readonly detail: string };
 
 /**
- * The three hostnames `validateWebhookUrl` treats as loopback, verbatim.
- * ⚠️ `"[::1]"` is bracketed because that is what `url.hostname` holds for
- * an IPv6 literal — measured on Node 24.14:
+ * The three hostnames `validateWebhookUrl` treats as loopback — IMPORTED, not
+ * restated, so there is one list. (`"[::1]"` is bracketed because that is what
+ * `url.hostname` holds for an IPv6 literal — measured on Node 24.14:
  *   new URL("http://[::1]:3090/").hostname  ->  "[::1]"
- * A plain "::1" here would never match, and the door would look open.
+ * A plain "::1" here would never match, and the door would look open.)
  */
-const LOOPBACK_HOSTNAMES: readonly string[] = ["127.0.0.1", "localhost", "[::1]"];
+const LOOPBACK_HOSTNAMES: readonly string[] = WEBHOOK_LOOPBACK_HOSTNAMES;
 
 /** The guard's reasons map 1:1 onto codes here; nothing is reworded. */
 function reasonToCode(reason: OutboundRefusalReason): WebhookTargetCode {

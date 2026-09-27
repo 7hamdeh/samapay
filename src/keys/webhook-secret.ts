@@ -51,13 +51,41 @@ export function decryptWebhookSecret(stored: string): string {
 }
 
 /**
+ * The hostnames `validateWebhookUrl` accepts for a PLAIN http target. Named
+ * once and imported by `src/net/webhook-target.ts`, which used to restate this
+ * list: a webhook to loopback is a normal shape on this box (MNTAD and SamaPay
+ * share it — `scripts/issue-key.ts`'s own runbook line is
+ * `--webhook-url "http://127.0.0.1:3033/api/webhooks/samapay/<credentialId>"`),
+ * and the two readers of that fact must not be able to drift.
+ */
+export const WEBHOOK_LOOPBACK_HOSTNAMES: readonly string[] = ["127.0.0.1", "localhost", "[::1]"];
+
+/**
+ * The hosts the DISPATCHER may POST to over plain http. The operator's door
+ * (`PANEL_WEBHOOK_ALLOWED_HOSTNAMES`, the same variable the panel reads when it
+ * saves a URL) UNION `WEBHOOK_LOOPBACK_HOSTNAMES`.
+ *
+ * The union is not a widening of what a MERCHANT can aim us at: nothing in
+ * `src/panel/` uses this function, and a panel save still goes through
+ * `assertWebhookTargetUrl` with the operator list ALONE, so a loopback target
+ * this accepts can only be a row the CLI — Ibrahim's hand — wrote. What the
+ * union buys is that wiring the guard at send time cannot change one delivery
+ * that works today, which is the only way a change to this file can be merged
+ * while the crediting path is live.
+ */
+export function webhookEgressAllowlist(env: NodeJS.ProcessEnv = process.env): readonly string[] {
+  const configured = (env.PANEL_WEBHOOK_ALLOWED_HOSTNAMES ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  return Object.freeze([...new Set([...configured, ...WEBHOOK_LOOPBACK_HOSTNAMES])]);
+}
+
+/**
  * https anywhere; plain http ONLY to a loopback host (MNTAD and SamaPay share
  * the box in slice 1). No credentials in the URL. Returns the normalised URL.
  */
 export function validateWebhookUrl(raw: string): string {
   let u: URL;
   try { u = new URL(raw); } catch { throw new Error(`webhook URL does not parse: ${raw}`); }
-  const loopback = u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "[::1]";
+  const loopback = WEBHOOK_LOOPBACK_HOSTNAMES.includes(u.hostname);
   if (u.protocol !== "https:" && !(u.protocol === "http:" && loopback)) throw new Error("webhook URL must be https (plain http only to a loopback host)");
   if (u.username || u.password) throw new Error("webhook URL must not carry credentials");
   return u.toString();

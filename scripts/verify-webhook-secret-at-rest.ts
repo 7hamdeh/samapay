@@ -32,7 +32,12 @@ async function main() {
   const deliveries: string[] = [];
   try {
     // 1-3. issue with a webhook URL: plaintext once, ciphertext at rest
-    const issued = await issueKey({ clientId: client.id, name: "store", scopes: ["deposits.read"], issuedBy: "verify", issuedVia: "cli", webhookUrl: "https://store.example/api/webhooks/samapay/cred1" });
+    // The host is loopback on purpose. `attemptDelivery` now re-judges the
+    // stored URL before every POST (src/net/webhook-target.ts, 2026-09-27), and
+    // a name that does not resolve is refused — so a `store.example` fixture
+    // would never reach the signing code this suite is actually about. https is
+    // kept so the URL still exercises the real shape.
+    const issued = await issueKey({ clientId: client.id, name: "store", scopes: ["deposits.read"], issuedBy: "verify", issuedVia: "cli", webhookUrl: "https://127.0.0.1:3033/api/webhooks/samapay/cred1" });
     made.push(issued.id);
     const plain = issued.webhookSecret ?? "";
     check(/^whsec_[A-Za-z0-9_-]{43}$/.test(plain), "1. issuing with a webhook URL returns the plaintext secret once (whsec_ + 43 base64url)", plain ? `${plain.slice(0, 9)}…` : "NO SECRET RETURNED");
@@ -42,7 +47,7 @@ async function main() {
     let roundTrip = "";
     try { roundTrip = decryptWebhookSecret(stored); } catch (e) { roundTrip = `THREW ${(e as Error).name}`; }
     check(plain !== "" && roundTrip === plain, "3. the stored ciphertext decrypts to exactly the returned plaintext", roundTrip === plain ? "equal" : roundTrip.slice(0, 40));
-    check(row.webhookUrl === "https://store.example/api/webhooks/samapay/cred1", "3b. the webhook URL is stored as given");
+    check(row.webhookUrl === "https://127.0.0.1:3033/api/webhooks/samapay/cred1", "3b. the webhook URL is stored as given");
 
     // 4-5. THE DEFECT — plant a known secret as ciphertext, deliver, verify as the RECEIVER would
     const known = generateWebhookSecret();

@@ -28,7 +28,8 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import { logger } from "@/log.js";
 import { depositEventSuppression, EventObjectNotFound } from "@/events/index.js";
-import { decryptWebhookSecret, WebhookSecretUnreadable } from "@/keys/webhook-secret.js";
+import { decryptWebhookSecret, webhookEgressAllowlist, WebhookSecretUnreadable } from "@/keys/webhook-secret.js";
+import { assertWebhookTargetUrl, type WebhookTargetResult } from "@/net/webhook-target.js";
 import { DELIVERY_HEADER, EVENT_HEADER, SIGNATURE_HEADER, signPayload } from "./sign.js";
 
 const MIN = 60_000, HOUR = 60 * MIN;
@@ -43,6 +44,39 @@ export const TIMEOUT_MS = 10_000;
  * wide margin: a live attempt can never still be running when its lease ends.
  */
 export const CLAIM_LEASE_MS = 60_000;
+/**
+ * How long the send-time egress guard may take to answer. It runs INSIDE a
+ * claimed attempt, so the alternative to a budget is a lease that expires while
+ * the guard is still resolving — and the next worker then sends the same event
+ * while this one is about to as well. Kept well under
+ * `CLAIM_LEASE_MS − TIMEOUT_MS` (asserted by scripts/verify-dispatch-egress.ts)
+ * so guard + send can never overrun the lease together.
+ */
+export const EGRESS_GUARD_BUDGET_MS = 5_000;
+
+/** The send-time judgement of one URL. The seam exists because no fixture can
+ *  otherwise produce a resolver that hangs for 60 s on purpose. */
+export type WebhookEgressGuard = (url: string) => Promise<WebhookTargetResult>;
+
+const defaultEgressGuard: WebhookEgressGuard = (url) => assertWebhookTargetUrl(url, { allowHostnames: webhookEgressAllowlist() });
+let egressGuard: WebhookEgressGuard = defaultEgressGuard;
+
+/** Swap (or, with `null`, restore) the send-time egress guard. Wiring point for
+ *  scripts/verify-dispatch-egress.ts, like `setHealthReaders` for /health. */
+export function setWebhookEgressGuard(next: WebhookEgressGuard | null): void { egressGuard = next ?? defaultEgressGuard; }
+export function webhookEgressGuard(): WebhookEgressGuard { return egressGuard; }
+
+/** The guard, or `"budget"` when it never answered. Fail-CLOSED: no answer is
+ *  a refusal, never permission to POST. */
+async function judgeTargetAtSend(url: string): Promise<WebhookTargetResult | "budget"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const budget = new Promise<"budget">((resolve) => { timer = setTimeout(() => resolve("budget"), EGRESS_GUARD_BUDGET_MS); });
+  try {
+    return await Promise.race([egressGuard(url), budget]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const log = logger.child({ module: "webhooks" });
 
@@ -159,6 +193,22 @@ export async function attemptDelivery(deliveryId: string, fetchImpl: FetchLike =
   // No key to send to is a failed ATTEMPT, not a lost event: it stays on the
   // schedule (and redrive-deliveries.ts can bring it back after exhaustion).
   if (!target?.webhookUrl || !target.webhookSecret) return fail("no active key with a webhook url for this client", null);
+
+  // ── THE SEND-TIME RE-GUARD ── `webhookUrl` is a string this service does not
+  // own, and it is fetched on a schedule that outlives any decision made when
+  // it was written. The panel already re-guards at the test button; that guarded
+  // ONE address on ONE code path while this function went on to POST a possibly
+  // different one, on eight attempts, with the outcome rendered back to the
+  // merchant in the delivery log — a port scanner built out of our own egress.
+  // So every attempt, including the seventh, judges the URL actually about to
+  // be fetched (which, above, may be the fallback key's and not this row's).
+  //
+  // ⚠️ REFUSING IS A FAILED ATTEMPT, NOT A LOST EVENT, and the merchant sees
+  // only the CODE. `last_error` is rendered in the panel; echoing the guard's
+  // sentence or the path would hand back what the probe was for.
+  const judged = await judgeTargetAtSend(target.webhookUrl);
+  if (judged === "budget") return fail("send-time egress guard gave no answer within the budget; nothing was POSTed", null);
+  if (!judged.ok) return fail(`send-time target refused: ${judged.code}`, null);
 
   // ⚠️ SIGN WITH THE DECRYPTED SECRET, NEVER THE COLUMN. The column holds AEAD
   // ciphertext (src/keys/webhook-secret.ts); this line used to pass the column
