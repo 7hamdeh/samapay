@@ -187,7 +187,29 @@ async function main() {
       "8b. and even if escaping failed, script-src names a HASH and never 'self' — an injected <script src> has no source the browser will fetch",
       directive(evilCsp, "script-src").slice(0, 46));
 
-    // ── 9. PANEL OFF: THE TREE HEADERS NOTHING, BECAUSE IT ANSWERS NOTHING ─
+    // ── 9. THE PANEL'S STYLESHEET IS SERVED, LINKED AND ADMITTED ────────
+    // 2026-09-27 browser pass: the six-column tables overflow a 360px phone and
+    // the nav links measure 19px tall. Both are CSS, and the only sheet the page
+    // had was /style.css — a file in nginx's static root, shared with the landing
+    // and docs pages, edited outside this repo. The panel's own sheet is served
+    // from the app, which is why it is same-origin and why `style-src 'self'` is
+    // the directive that admits it.
+    const css = await get("/panel/panel.css", { cookie: "" });
+    const cssCsp = css.headers.get("content-security-policy") ?? "";
+    const cssText = css.status === 200 ? await css.text() : "";
+    check(css.status === 200 && (css.headers.get("content-type") ?? "").startsWith("text/css") && body.includes('href="/panel/panel.css"'),
+      "9a. /panel/panel.css is served as text/css, without a session, and the shell links it",
+      `status=${css.status} type=${css.headers.get("content-type")}`);
+    check(cssText.includes(".table-wrap") && cssText.includes("overflow-x") && cssText.includes("min-height: 44px"),
+      "9b. and the sheet carries the two rules the pass asked for: a scroll box for the tables, and a 44px minimum for the nav targets",
+      `bytes=${cssText.length}`);
+    check(directive(cssCsp, "style-src") === "style-src 'self'" && directive(cssCsp, "default-src") === "default-src 'none'",
+      "9c. the stylesheet response is headed by the same policy, and 'self' is what makes it load", directive(cssCsp, "style-src"));
+    check(!/<style[\s>]/.test(body) && !/\sstyle\s*=/.test(body),
+      "9d. the shell carries no <style> element and no style attribute — so style-src can stay 'self', and assertion 5's refusal of 'unsafe-inline' costs nothing",
+      "clean");
+
+    // ── 10. PANEL OFF: THE TREE HEADERS NOTHING, BECAUSE IT ANSWERS NOTHING ─
     // app.ts's own comment promises that with PANEL_ENABLED off "every /panel
     // and /auth path answers the same 404 as any unknown route, so a preview host
     // and a production host look identical from the outside". A CSP middleware
@@ -207,7 +229,7 @@ async function main() {
       // Bodies are compared by code, not byte-for-byte: every error echoes a
       // unique X-Request-Id, so identical bytes would be an assertion about the
       // request id rather than about what a caller can tell the two paths apart.
-      "9. with the panel OFF, /panel/ and /auth/ are the same 404 as any unknown route and carry no CSP — the header does not disclose the tree",
+      "10. with the panel OFF, /panel/ and /auth/ are the same 404 as any unknown route and carry no CSP — the header does not disclose the tree",
       `panel=${offPanel.status} auth=${offAuth.status} csp=${offPanel.headers.get("content-security-policy") === null ? "absent" : "PRESENT"}`);
   } finally {
     // Cleanup is by the ids this run created, never by an address pattern: a

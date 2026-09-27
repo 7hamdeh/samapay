@@ -49,6 +49,7 @@ export function renderPanelShell(input: ShellAccount & { cfg: PanelConfig; csrfT
 <meta name="robots" content="noindex">
 <title>${escapeHtml(t.title)}</title>
 <link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/panel/panel.css">
 </head>
 <body class="panel">
 <header class="site-header">
@@ -101,6 +102,10 @@ function panelScript(clientId: string | null, csrf: string): string {
   const esc = (s) => String(s).replace(/[&<>"]/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m]));
   const row = (cells) => '<tr>' + cells.map((c) => '<td>' + c + '</td>').join("") + '</tr>';
   const cell = (v) => esc(fmt(v));
+  // A table cannot scroll itself; the overflow rule needs a block around it.
+  // See src/render/panel-css.ts and the 2026-09-27 browser pass (975px of
+  // six-column key list on a 360px phone).
+  const wrap = (table) => '<div class="table-wrap">' + table + '</div>';
   async function load(view, render) {
     const el = document.querySelector('[data-view="' + view + '"] .rows');
     if (!el) return;
@@ -114,21 +119,21 @@ function panelScript(clientId: string | null, csrf: string): string {
   }
   load('balance', (b) => {
     const chains = Object.entries(b.chains ?? {});
-    return '<table>' + row(['chain', 'received', 'fees', 'withdrawn', 'available', 'pending']) +
+    return wrap('<table>' + row(['chain', 'received', 'fees', 'withdrawn', 'available', 'pending']) +
       chains.map(([c, p]) => row([cell(c), cell(p.received), cell(p.fees), cell(p.withdrawn), cell(p.available), cell(p.pending)]))
-        .join("") + '</table><p class="hint">fee ' + (b.feeBps / 100) + '% · ' + esc(fmt(b.note)) + '</p>';
+        .join("") + '</table>') + '<p class="hint">fee ' + (b.feeBps / 100) + '% · ' + esc(fmt(b.note)) + '</p>';
   });
-  load('keys', (b) => '<table>' + row(['name', 'prefix', 'last4', 'scopes', 'env', 'active', 'created via', 'webhook']) +
+  load('keys', (b) => wrap('<table>' + row(['name', 'prefix', 'last4', 'scopes', 'env', 'active', 'created via', 'webhook']) +
     (b.keys ?? []).map((k) => row([cell(k.name), cell(k.keyPrefix) + '…', cell(k.keyLast4), cell(k.scopes.join(" ")), cell(k.environment),
-      cell(k.active), cell(k.createdVia), k.hasWebhookSecret ? 'secret set' : 'none'])).join("") + '</table>');
-  load('deposits', (b) => '<table>' + row(['chain', 'amount', 'fee', 'confirmations', 'status', 'reference', 'detected']) +
-    (b.deposits ?? []).map((d) => row([cell(d.chain), cell(d.amount), cell(d.feeAmount), cell(d.confirmations), cell(d.status), cell(d.reference), cell(d.detectedAt)])).join("") + '</table>');
-  load('intents', (b) => '<table>' + row(['id', 'reference', 'chain', 'amount', 'status', 'created', 'expires']) +
-    (b.intents ?? []).map((i) => row([cell(i.id), cell(i.reference), cell(i.chain), cell(i.amount), cell(i.status), cell(i.createdAt), cell(i.expiresAt)])).join("") + '</table>');
-  load('addresses', (b) => '<table>' + row(['chain', 'address', 'reference', 'legacy import', 'watch disabled']) +
-    (b.addresses ?? []).map((a) => row([cell(a.chain), '<code>' + cell(a.address) + '</code>', cell(a.reference), cell(a.legacyImport), cell(a.watchDisabledAt)])).join("") + '</table>');
-  load('audit', (b) => '<table>' + row(['at', 'actor', 'action', 'subject']) +
-    (b.events ?? []).map((e) => row([cell(e.at), cell(e.actor), cell(e.action), cell(e.subjectId)])).join("") + '</table>');
+      cell(k.active), cell(k.createdVia), k.hasWebhookSecret ? 'secret set' : 'none'])).join("") + '</table>'));
+  load('deposits', (b) => wrap('<table>' + row(['chain', 'amount', 'fee', 'confirmations', 'status', 'reference', 'detected']) +
+    (b.deposits ?? []).map((d) => row([cell(d.chain), cell(d.amount), cell(d.feeAmount), cell(d.confirmations), cell(d.status), cell(d.reference), cell(d.detectedAt)])).join("") + '</table>'));
+  load('intents', (b) => wrap('<table>' + row(['id', 'reference', 'chain', 'amount', 'status', 'created', 'expires']) +
+    (b.intents ?? []).map((i) => row([cell(i.id), cell(i.reference), cell(i.chain), cell(i.amount), cell(i.status), cell(i.createdAt), cell(i.expiresAt)])).join("") + '</table>'));
+  load('addresses', (b) => wrap('<table>' + row(['chain', 'address', 'reference', 'legacy import', 'watch disabled']) +
+    (b.addresses ?? []).map((a) => row([cell(a.chain), '<code>' + cell(a.address) + '</code>', cell(a.reference), cell(a.legacyImport), cell(a.watchDisabledAt)])).join("") + '</table>'));
+  load('audit', (b) => wrap('<table>' + row(['at', 'actor', 'action', 'subject']) +
+    (b.events ?? []).map((e) => row([cell(e.at), cell(e.actor), cell(e.action), cell(e.subjectId)])).join("") + '</table>'));
   // Every mutation carries the CSRF token in the HEADER the server checks
   // (checkCsrf reads X-CSRF-Token). A form field named _csrf would be ignored,
   // so there is exactly one way to send it and the button below is the only

@@ -23,6 +23,7 @@ import { PANEL_MINTABLE_SCOPES, panelCreateKey, panelGetKey, panelListKeys, pane
 import { panelClearWebhook, panelListDeliveries, panelSetWebhook, panelTestWebhook } from "@/panel/webhook.js";
 import { addressesView, auditView, balanceView, depositsView, intentsView } from "@/panel/read-views.js";
 import { renderPanelShell } from "@/render/panel-shell.js";
+import { PANEL_CSS } from "@/render/panel-css.js";
 
 export interface PanelDeps {
   cfg: PanelConfig;
@@ -195,6 +196,14 @@ function clearState(c: Context): void {
 const panel = new Hono();
 
 import * as totpManagement from "@/panel/totp-management.js";
+
+panel.get("/panel.css", (c) => c.body(PANEL_CSS, 200, {
+  // Same-origin, so `style-src 'self'` admits it. Public on purpose: a
+  // stylesheet carries no merchant data, and refusing it to an expired session
+  // would render the sign-in shell unstyled on the one page that must not look
+  // broken. Short max-age because a deploy is the only thing that changes it.
+  "content-type": "text/css; charset=utf-8", "cache-control": "public, max-age=300",
+}));
 
 /** The one HTML document the panel serves, and the one response that has to
  *  carry its OWN Content-Security-Policy: the app's default authorizes no script
