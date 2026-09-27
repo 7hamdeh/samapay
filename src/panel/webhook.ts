@@ -42,9 +42,10 @@ export type WebhookRefusal =
  *  The HIGH fix (a delivery goes to its OWN key's webhook, 17967b9) closed
  *  re-pointing by MINTING a new key. It says nothing about editing the CLI key
  *  in place, which is what an account owner with a handoff session can do —
- *  467fd1c's own review calls this the residual, and requires it closed before
- *  the MNTAD issuer ships. An ALLOWLIST, so the next provenance value is locked
- *  by default rather than by somebody remembering to add a case. */
+ *  the re-review's RESIDUAL line (pay-dashboard-review-0927.txt:49) names it, and
+ *  requires it closed before the MNTAD issuer ships. An ALLOWLIST, so the next
+ *  provenance value is locked by default rather than by somebody remembering to
+ *  add a case. */
 const PANEL_WRITABLE_WEBHOOK_VIA: readonly string[] = ["panel_owner"];
 
 /** Provenance is decided AFTER tenancy and role, never before: to an account
