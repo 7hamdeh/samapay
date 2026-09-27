@@ -22,6 +22,12 @@ const Schema = z.object({
   MNTAD_SAMAPAY_HANDOFF_SECRET: z.string().min(32).optional(),
   PANEL_COOKIE_NAME: z.string().default("spnl"),
   PANEL_STATE_COOKIE_NAME: z.string().default("spnl_st"),
+  // The login page's own state cookie (see src/panel/login-state.ts): it binds a
+  // code entry to the browser that asked for the code, which is what stops
+  // login-CSRF. 15 min is the SAME window the send/verify buckets run on, so a
+  // state that has expired is never the reason a merchant is locked out.
+  PANEL_LOGIN_STATE_COOKIE_NAME: z.string().default("spnl_lg"),
+  PANEL_LOGIN_STATE_TTL_SEC: z.coerce.number().int().min(300).max(1800).default(900),
   // 12 h, not 30 d: this session can mint and revoke API keys that receive
   // money. The cost of a short TTL is one email code a day, not a support ticket.
   PANEL_SESSION_TTL_SEC: z.coerce.number().int().min(300).max(43200).default(43200),
@@ -59,6 +65,8 @@ export type PanelConfig = Readonly<{
   handoffSecret: string | null;
   cookieName: string;
   stateCookieName: string;
+  loginStateCookieName: string;
+  loginStateTtlSec: number;
   sessionTtlSec: number;
   codeTtlSec: number;
   codeMaxAttempts: number;
@@ -91,6 +99,8 @@ export function readPanelConfig(env: NodeJS.ProcessEnv = process.env): PanelConf
     handoffSecret: c.MNTAD_SAMAPAY_HANDOFF_SECRET ?? null,
     cookieName: c.PANEL_COOKIE_NAME,
     stateCookieName: c.PANEL_STATE_COOKIE_NAME,
+    loginStateCookieName: c.PANEL_LOGIN_STATE_COOKIE_NAME,
+    loginStateTtlSec: c.PANEL_LOGIN_STATE_TTL_SEC,
     sessionTtlSec: c.PANEL_SESSION_TTL_SEC,
     codeTtlSec: c.PANEL_LOGIN_CODE_TTL_SEC,
     codeMaxAttempts: c.PANEL_CODE_MAX_ATTEMPTS,

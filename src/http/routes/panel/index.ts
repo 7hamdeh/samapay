@@ -8,21 +8,27 @@
 // where a second caller cannot miss it. A route here that "just does" its own
 // prisma call would be the beginning of two answers to the same question.
 import { Hono, type Context } from "hono";
+import { readFileSync } from "node:fs";
 import { getCookie, setCookie } from "hono/cookie";
 import { z } from "zod";
 import { ApiError } from "../../errors.js";
+import { cspHeader } from "../../csp.js";
+import { logger } from "@/log.js";
 import { clientIp } from "@/panel/request-ip.js";
+import { isPlausibleEmail, normalizeEmail } from "@/panel/email.js";
 import { enforce, MemoryBucketStore, type BucketStore } from "@/panel/rate-limit.js";
 import { readPanelConfig, type PanelConfig } from "@/panel/config.js";
 import { buildMailer, type Mailer } from "@/panel/mailer.js";
 import { completeSignIn, requestCode, signOut } from "@/panel/auth.js";
+import { checkLoginState, issueLoginState } from "@/panel/login-state.js";
 import { consumeHandoff, newStateCookieValue, stateHashOf } from "@/panel/handoff-ticket.js";
-import { checkCsrf, clearSessionCookies, loadPrincipal, writeSessionCookies, type PanelPrincipal } from "@/panel/session.js";
+import { checkCsrf, checkCsrfValue, clearSessionCookies, loadPrincipal, writeSessionCookies, type PanelPrincipal } from "@/panel/session.js";
 import { getAccount, listMemberships } from "@/panel/accounts.js";
 import { PANEL_MINTABLE_SCOPES, panelCreateKey, panelGetKey, panelListKeys, panelRevokeKey } from "@/panel/keys.js";
 import { panelClearWebhook, panelListDeliveries, panelSetWebhook, panelTestWebhook } from "@/panel/webhook.js";
 import { addressesView, auditView, balanceView, depositsView, intentsView } from "@/panel/read-views.js";
 import { renderPanelShell } from "@/render/panel-shell.js";
+import { renderLoginPage, type LoginError, type LoginView } from "@/render/panel-login.js";
 import { PANEL_CSS } from "@/render/panel-css.js";
 
 export interface PanelDeps {
@@ -197,6 +203,131 @@ const panel = new Hono();
 
 import * as totpManagement from "@/panel/totp-management.js";
 
+// ── the login page (HTML forms, no script, same CSP tree) ────────────────
+// Why this is a page and not only an API: see src/render/panel-login.ts. Every
+// decision below is the same one the JSON routes already make — the same
+// `requestCode` / `completeSignIn`, the same buckets, the same session writer —
+// so the browser front-end cannot drift from the API it sits on top of.
+const FORM_FIELDS = ["email", "code", "totp", "lang", "login_state", "_csrf"] as const;
+const langOf = (v: string | undefined): "en" | "ar" => (v === "ar" ? "ar" : "en");
+const CODE_TTL_MIN = () => Math.round(deps.cfg.codeTtlSec / 60);
+
+async function readForm(c: Context): Promise<Record<string, string>> {
+  const parsed = await c.req.parseBody({ all: true }).catch(() => null);
+  const out: Record<string, string> = {};
+  if (!parsed) return out;
+  for (const key of FORM_FIELDS) {
+    const value = parsed[key];
+    if (typeof value === "string") out[key] = value.slice(0, 400);
+  }
+  return out;
+}
+
+/** Every render issues a fresh state cookie and returns its hash, so the form
+ *  the merchant submits always carries the hash of the cookie THIS response is
+ *  setting. A state that outlived a refusal would be replayable. */
+function loginHtml(c: Context, view: Omit<LoginView, "loginState">, status = 200): Response {
+  const html = renderLoginPage({ ...view, loginState: issueLoginState(c, deps.cfg) });
+  c.header("Content-Security-Policy", cspHeader());
+  c.header("Cache-Control", "no-store");
+  c.header("X-Robots-Tag", "noindex");
+  return c.html(html, status as 200);
+}
+
+panel.get("/login", (c) => loginHtml(c, { step: "email", lang: langOf(c.req.query("lang")), codeTtlMin: CODE_TTL_MIN() }));
+
+panel.post("/login", async (c) => {
+  const f = await readForm(c);
+  const lang = langOf(f.lang);
+  const email = normalizeEmail(f.email ?? "");
+  const base = { step: "email" as const, lang, codeTtlMin: CODE_TTL_MIN(), ...(email ? { email } : {}) };
+  // A state mismatch is a PROTOCOL failure, not a mistyped field: 400, so it can
+  // be counted and alerted on, while the page still re-renders with the sentence.
+  if (!checkLoginState(c, deps.cfg, f.login_state)) return loginHtml(c, { ...base, error: "state_expired" }, 400);
+  if (!isPlausibleEmail(email)) return loginHtml(c, { ...base, error: "invalid_email" });
+
+  const ip = clientIp(c);
+  // Three buckets, three subjects, and the ORDER is the design: the 45 s spacing
+  // answers first so a person who double-clicked "resend" is told how long to
+  // wait rather than being told they are rate limited, and the two wider caps
+  // still stop one address or one NAT from spending the MTA's day.
+  const resend = enforce(deps.buckets, "code_resend", email);
+  if (!resend.ok) return loginHtml(c, { step: "code", lang, email, codeTtlMin: CODE_TTL_MIN(), retryAfterSec: resend.retryAfterSec });
+  if (!enforce(deps.buckets, "code_send", ip ?? "unknown").ok) return loginHtml(c, { ...base, error: "rate_limited" });
+  if (!enforce(deps.buckets, "sign_in_request", email).ok) return loginHtml(c, { ...base, error: "rate_limited" });
+
+  try {
+    await requestCode({ email, purpose: "sign_up" }, { cfg: deps.cfg, mailer: deps.mailer, ip, userAgent: c.req.header("user-agent") ?? null });
+  } catch (e) {
+    // The mailer throwing means the MTA refused the message. A code row exists
+    // and will expire unsent; what the merchant gets is the truth, not a page
+    // that says "check your email".
+    logger.warn({ err: e instanceof Error ? e.message : String(e), where: "panel.login.send" }, "login code could not be mailed");
+    return loginHtml(c, { ...base, error: "mail_failed" });
+  }
+  return loginHtml(c, { step: "code", lang, email, codeTtlMin: CODE_TTL_MIN() });
+});
+
+panel.post("/login/code", async (c) => {
+  const f = await readForm(c);
+  const lang = langOf(f.lang);
+  const email = normalizeEmail(f.email ?? "");
+  const backToCode = (error: LoginError) => loginHtml(c, { step: "code", lang, email, codeTtlMin: CODE_TTL_MIN(), error });
+  if (!checkLoginState(c, deps.cfg, f.login_state)) return loginHtml(c, { step: "email", lang, codeTtlMin: CODE_TTL_MIN(), error: "state_expired" }, 400);
+  if (!isPlausibleEmail(email) || !/^[0-9]{6}$/.test(f.code ?? "")) return backToCode("bad_code");
+  if (!enforce(deps.buckets, "code_verify", email).ok) return backToCode("rate_limited");
+  const out = await completeSignIn({ email, purpose: "sign_up", code: f.code ?? "", totp: f.totp ?? null }, {
+    cfg: deps.cfg, mailer: deps.mailer, ip: clientIp(c), userAgent: c.req.header("user-agent") ?? null,
+  });
+  if (!out.ok) {
+    if (out.code === "totp_required") return backToCode("totp_required");
+    if (out.code === "totp_invalid") return backToCode("totp_invalid");
+    if (out.code === "account_disabled") return backToCode("account_disabled");
+    // invalid_code / no_such_account / email_invalid answer identically, and the
+    // page says what the API says: the code did not work. Whether the address is
+    // ours is not in this response.
+    return backToCode("bad_code");
+  }
+  writeSessionCookies(c, deps.cfg, out.token, out.csrfToken, out.expiresAt);
+  // 303, not 200: the browser lands on /panel with a GET, so reloading the
+  // destination cannot re-submit the code — a reload of a 200 would be a reload
+  // of a spent credential.
+  return c.redirect("/panel", 303);
+});
+
+panel.post("/logout", async (c) => {
+  const f = await readForm(c);
+  const principal = await loadPrincipal(c, deps.cfg);
+  if (principal) {
+    // A form cannot set X-CSRF-Token, so here the token travels in the body —
+    // and ONLY here. checkCsrf, the API's, still reads the header and nothing
+    // else; scripts/verify-panel-login.ts:6e is the assertion that keeps the two
+    // from quietly becoming one check with two sources.
+    if (!checkCsrfValue(principal, f._csrf)) throw new ApiError("unauthenticated", "Missing or mismatched CSRF token.");
+    await signOut({ accountId: principal.accountId, sessionId: principal.sessionId });
+  }
+  clearSessionCookies(c, deps.cfg);
+  return c.redirect("/panel/login", 303);
+});
+
+// ── the panel's own font files ───────────────────────────────────────────
+// An ALLOWLIST of two names, not a path: `:file` is caller-supplied, and building
+// a filesystem path out of a URL segment is how `/../../../.env` becomes a
+// download. Anything outside the list is the same 404 as any unknown route.
+const PANEL_FONTS: Record<string, string> = {
+  "alexandria-latin.woff2": "font/woff2",
+  "alexandria-arabic.woff2": "font/woff2",
+};
+
+panel.get("/fonts/:file", (c) => {
+  const name = c.req.param("file") ?? "";
+  const type = PANEL_FONTS[name];
+  if (!type) throw new ApiError("not_found", "No such font.");
+  const bytes = readFileSync(new URL(`../../../../public/panel/fonts/${name}`, import.meta.url));
+  c.header("Content-Security-Policy", cspHeader());
+  return c.body(new Uint8Array(bytes), 200, { "content-type": type, "cache-control": "public, max-age=31536000, immutable" });
+});
+
 panel.get("/panel.css", (c) => c.body(PANEL_CSS, 200, {
   // Same-origin, so `style-src 'self'` admits it. Public on purpose: a
   // stylesheet carries no merchant data, and refusing it to an expired session
@@ -210,12 +341,22 @@ panel.get("/panel.css", (c) => c.body(PANEL_CSS, 200, {
  *  at all (src/http/csp.ts), so a shell rendered without this header is a page
  *  whose data never loads. The header is derived from the bytes about to be sent,
  *  by the renderer, so it cannot drift from the script it hashes. */
+/** A browser sends an Accept of text/html; the shell's own fetches and every
+ *  machine caller send the wildcard or application/json. Only the first is a
+ *  person who should be looking at a login form — the rest keep the contract's
+ *  401, so this change cannot move the API surface. */
+function wantsHtml(c: Context): boolean {
+  return /text\/html|application\/xhtml\+xml/.test(c.req.header("accept") ?? "");
+}
+
 export async function panelShell(c: Context): Promise<Response> {
-  const principal = await requirePrincipal(c);
+  if (!deps.cfg.enabled) throw new ApiError("not_found", "The panel is not enabled on this service.");
+  const principal = await loadPrincipal(c, deps.cfg);
+  if (!principal) {
+    if (wantsHtml(c)) return c.redirect("/panel/login", 302);
+    throw new ApiError("unauthenticated", "No panel session. Sign in with an emailed code or from your store.");
+  }
   const [account, clients] = await Promise.all([getAccount(principal.accountId), listMemberships(principal.accountId)]);
-  // The language is a query parameter, not a path segment, because the shell
-  // links its own switcher and there is exactly one document to serve. Anything
-  // that is not "ar" gets English — a typo in a shared link is a working page.
   const lang = c.req.query("lang") === "ar" ? "ar" : "en";
   const rendered = renderPanelShell({
     email: account?.email ?? principal.email, displayName: account?.displayName ?? null, clients,

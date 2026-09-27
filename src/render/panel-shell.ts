@@ -38,7 +38,7 @@ export function renderPanelShell(input: ShellAccount & { cfg: PanelConfig; csrfT
     ? input.clients.map((c) => `<li class="client"><a href="/panel?clientId=${encodeURIComponent(c.id)}">${escapeHtml(c.name)}</a> <span class="role">${escapeHtml(c.role)}</span> <span class="fee">${c.feeBps / 100}%</span></li>`).join("")
     : `<li class="empty">${t.noClient}</li>`;
   const nav = NAV.map(([key, label]) => `<a href="#${label}">${t[key]}</a>`).join("\n    ");
-  const script = panelScript(input.clients[0]?.id ?? null, input.csrfToken);
+  const script = panelScript(input.clients[0]?.id ?? null);
   return {
     csp: cspHeader([scriptHash(script)]),
     html: `<!doctype html>
@@ -61,7 +61,14 @@ export function renderPanelShell(input: ShellAccount & { cfg: PanelConfig; csrfT
     <a href="/panel?lang=ar" lang="ar" rel="alternate">${t.ar}</a>
     <a href="/panel?lang=en" lang="en" rel="alternate">${t.en}</a>
   </nav>
-  <button type="button" id="signout" class="signout">${t.signOut}</button>
+  <!-- Logout is a FORM, not a script: a merchant who cannot run JS must still be
+       able to end their session, and the token in the field is checked by the one
+       route that reads a body value (src/http/routes/panel/index.ts's /panel/logout). -->
+  <form method="post" action="/panel/logout" class="logout">
+    <input type="hidden" name="_csrf" value="${escapeHtml(input.csrfToken)}">
+    <input type="hidden" name="lang" value="${lang}">
+    <button type="submit" class="signout">${t.signOut}</button>
+  </form>
 </header>
 <main data-empty="${escapeHtml(t.noClient)}">
   <p class="who">${t.signedInAs} <strong>${escapeHtml(input.displayName || input.email)}</strong></p>
@@ -84,14 +91,13 @@ export function renderPanelShell(input: ShellAccount & { cfg: PanelConfig; csrfT
  *  computed over exactly the bytes between the <script> tags — a template
  *  literal's leading newline is a byte, and a hash that misses one by one is a
  *  page whose data never loads. */
-function panelScript(clientId: string | null, csrf: string): string {
+function panelScript(clientId: string | null): string {
   return `
 // INLINED ON PURPOSE. /panel.js would be a request to nginx's static root
 // (location / serves /www/wwwroot/pay.mntad.com), which needs a deploy step that
 // the panel itself does not; a dashboard whose script 404s is a blank page.
 (() => {
   const clientId = ${clientId ? JSON.stringify(clientId) : "null"};
-  const csrf = ${JSON.stringify(csrf)};
   const empty = document.querySelector("main")?.dataset.empty ?? "no data";
   const qs = clientId ? "?clientId=" + encodeURIComponent(clientId) : "";
   const fmt = (v) => (v === null || v === undefined ? "–" : typeof v === "object" ? JSON.stringify(v) : String(v));
@@ -134,14 +140,9 @@ function panelScript(clientId: string | null, csrf: string): string {
     (b.addresses ?? []).map((a) => row([cell(a.chain), '<code>' + cell(a.address) + '</code>', cell(a.reference), cell(a.legacyImport), cell(a.watchDisabledAt)])).join("") + '</table>'));
   load('audit', (b) => wrap('<table>' + row(['at', 'actor', 'action', 'subject']) +
     (b.events ?? []).map((e) => row([cell(e.at), cell(e.actor), cell(e.action), cell(e.subjectId)])).join("") + '</table>'));
-  // Every mutation carries the CSRF token in the HEADER the server checks
-  // (checkCsrf reads X-CSRF-Token). A form field named _csrf would be ignored,
-  // so there is exactly one way to send it and the button below is the only
-  // mutation the shell itself makes.
-  document.getElementById("signout")?.addEventListener("click", async () => {
-    await fetch('/auth/signout', { method: 'POST', credentials: 'same-origin', headers: { 'X-CSRF-Token': csrf } });
-    location.href = '/';
-  });
+  // No mutation happens from script any more: signing out is a real form with
+  // the session's CSRF value in a hidden field, so it works with JavaScript
+  // refused, and the only script on this page is the read layer.
 })();
 `;
 }

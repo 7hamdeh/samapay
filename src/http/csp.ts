@@ -32,9 +32,17 @@ export function cspHeader(allowScripts: readonly string[] = []): string {
     "default-src 'none'",
     allowScripts.length ? `script-src ${allowScripts.join(" ")}` : "script-src 'none'",
     "style-src 'self'",
+    // Alexandria is served by this app from /panel/fonts/ (see src/render/panel-css.ts
+    // for why the panel owns its stylesheet, and why the font has to come with it).
+    // 'self' only — a login page that reaches fonts.gstatic.com at render time is a
+    // privacy leak and a dependency on somebody else's uptime.
+    "font-src 'self'",
     "connect-src 'self'",
     "base-uri 'none'",
-    "form-action 'none'",
+    // 'self' because the login page IS a form posting to /panel/login. It is not
+    // 'none' and not a host list: the one thing an injected <form> must never be
+    // able to do is carry a session cookie to somebody else's address.
+    "form-action 'self'",
     "frame-ancestors 'none'",
   ].join("; ");
 }

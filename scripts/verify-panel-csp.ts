@@ -102,8 +102,12 @@ async function main() {
       "2c. base-uri 'none' — a <base href> injected into the page is the classic way to redirect the shell's own relative fetches", directive(csp, "base-uri"));
     check(directive(csp, "frame-ancestors") === "frame-ancestors 'none'",
       "2d. frame-ancestors 'none' — the panel cannot be framed, so a clickjacked \"sign out\" or \"revoke key\" button is refused by the browser", directive(csp, "frame-ancestors"));
-    check(directive(csp, "form-action") === "form-action 'none'",
-      "2e. form-action 'none' — an injected <form> cannot POST a merchant's session cookie to another host", directive(csp, "form-action"));
+    check(directive(csp, "form-action") === "form-action 'self'",
+      "2e. form-action 'self' — the login page IS a form, so 'none' would break it; 'self' still refuses an injected <form> that posts a merchant's session to another host. Widened on purpose, and asserted at the exact value so the next 'unsafe' is a failing test, not a quiet edit",
+      directive(csp, "form-action"));
+    check(directive(csp, "font-src") === "font-src 'self'",
+      "2h. font-src 'self' — Alexandria is served by this app (src/render/panel-css.ts), and a login page that fetched its letters from a CDN would both leak the visit and fail to render when the CDN is blocked",
+      directive(csp, "font-src"));
     check(directive(csp, "connect-src") === "connect-src 'self'",
       "2f. connect-src 'self' — the shell's fetches stay on this origin, and an injected exfiltration fetch is blocked by the browser", directive(csp, "connect-src"));
     check(directive(csp, "style-src") === "style-src 'self'",

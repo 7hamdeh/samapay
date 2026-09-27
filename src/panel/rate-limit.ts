@@ -13,6 +13,8 @@
 //  · code verify      per email: 5 / 15 min  — PANEL_CODE_MAX_ATTEMPTS on the
 //    code row is the per-code rule; this is the per-address rule that stops an
 //    attacker from spraying one address's inbox while codes rotate.
+//  · code resend      per email:  1 / 45 s  — the spacing between two sends to
+//    one address; see RULES below for why it is a bucket and not a disabled button.
 //  · code send        per IP:     10 / 15 min — one person per IP plus nine for
 //    an office behind one NAT, per fifteen minutes, is enough that a real
 //    customer never notices the cap and a script does immediately.
@@ -27,7 +29,7 @@
 // An account-level brake at 20 failures / 15 min is the stolen-cookie detector
 // (a 32-byte base64url session id is not guessable; the point is to notice
 // somebody TRYING, and 20 in 15 min is above what one flaky browser tab does).
-export type BucketKind = "sign_in_request" | "code_verify" | "code_send" | "handoff_consume" | "panel_mutation" | "account_failure" | "webhook_test" | "second_factor";
+export type BucketKind = "code_resend" | "sign_in_request" | "code_verify" | "code_send" | "handoff_consume" | "panel_mutation" | "account_failure" | "webhook_test" | "second_factor";
 
 type Rule = Readonly<{ capacity: number; refillPerSec: number; windowSec: number }>;
 
@@ -43,6 +45,12 @@ const RULES: Record<BucketKind, Rule> = {
   // B.6 step 12): enough for a human to check their receiver twice, not enough to
   // use the dispatcher as a scanner.
   webhook_test:     { capacity: 1,  refillPerSec: 1 / 60,   windowSec: 60 },
+  // "Resend" spacing, per address. A code lives 600 s, so 45 s lets a person who
+  // genuinely did not see the first mail try it a dozen times across one code's
+  // life, and makes "click 200 times" cost nothing to the page and everything to
+  // the MTA. It is a bucket, not a page timer: a script that skips the form still
+  // hits it, which a disabled button would not.
+  code_resend:      { capacity: 1,  refillPerSec: 1 / 45,   windowSec: 45 },
 };
 
 export type RateDecision = Readonly<{ ok: true; remaining: number } | { ok: false; retryAfterSec: number }>;

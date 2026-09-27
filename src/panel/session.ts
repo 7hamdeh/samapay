@@ -110,16 +110,29 @@ export function clearSessionCookies(c: Context, cfg: PanelConfig): void {
 
 /** The mutation guard. SameSite=Lax already refuses a cross-site POST; this is
  *  the second lock, and the one that survives a future SameSite change. */
+/** The header-only contract of the JSON API. A form cannot set a header, so the
+ *  panel's logout form goes through checkCsrfValue with the body field instead —
+ *  and ONLY there. One function that read both sources would be a CSRF check
+ *  that a cross-origin form can satisfy, which is the exact thing the double
+ *  submit exists to prevent. */
 export function checkCsrf(c: Context, cfg: PanelConfig, principal: PanelPrincipal): boolean {
   const header = c.req.header("x-csrf-token");
   const cookie = getCookie(c, `${cfg.cookieName}_csrf`);
-  if (!header || header.length !== principal.csrfToken.length) return false;
-  const a = Buffer.from(header), b = Buffer.from(principal.csrfToken);
+  return compareTokens(header, principal.csrfToken) && (!cookie || cookie === principal.csrfToken);
+}
+
+/** Constant-time equality against the token the SESSION ROW holds. The caller
+ *  names where the presented value came from; this function never looks at a
+ *  request, so no route can accidentally accept a token from two places. */
+export function checkCsrfValue(principal: PanelPrincipal, presented: string | undefined): boolean {
+  return compareTokens(presented, principal.csrfToken);
+}
+
+function compareTokens(presented: string | undefined, issued: string): boolean {
+  if (!presented || presented.length !== issued.length) return false;
+  const a = Buffer.from(presented), b = Buffer.from(issued);
   if (a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
-  // The cookie is not the authority; the SESSION ROW is. If they diverge, the
-  // header matched a token the server never issued for this session.
-  if (cookie && cookie !== principal.csrfToken) return false;
   return diff === 0;
 }
