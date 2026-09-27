@@ -192,11 +192,27 @@ const panel = new Hono();
 
 import * as totpManagement from "@/panel/totp-management.js";
 
-panel.get("/", async (c) => {
+/** The one HTML document the panel serves, and the one response that has to
+ *  carry its OWN Content-Security-Policy: the app's default authorizes no script
+ *  at all (src/http/csp.ts), so a shell rendered without this header is a page
+ *  whose data never loads. The header is derived from the bytes about to be sent,
+ *  by the renderer, so it cannot drift from the script it hashes. */
+export async function panelShell(c: Context): Promise<Response> {
   const principal = await requirePrincipal(c);
   const [account, clients] = await Promise.all([getAccount(principal.accountId), listMemberships(principal.accountId)]);
-  return c.html(renderPanelShell({ email: account?.email ?? principal.email, displayName: account?.displayName ?? null, clients, cfg: deps.cfg, csrfToken: principal.csrfToken }), 200);
-});
+  // The language is a query parameter, not a path segment, because the shell
+  // links its own switcher and there is exactly one document to serve. Anything
+  // that is not "ar" gets English — a typo in a shared link is a working page.
+  const lang = c.req.query("lang") === "ar" ? "ar" : "en";
+  const rendered = renderPanelShell({
+    email: account?.email ?? principal.email, displayName: account?.displayName ?? null, clients,
+    cfg: deps.cfg, csrfToken: principal.csrfToken, lang,
+  });
+  c.header("Content-Security-Policy", rendered.csp);
+  return c.html(rendered.html, 200);
+}
+
+panel.get("/", panelShell);
 
 panel.get("/account", async (c) => {
   const principal = await requirePrincipal(c);

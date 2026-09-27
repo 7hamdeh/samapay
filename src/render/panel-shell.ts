@@ -6,6 +6,7 @@
 // from the same read-only panel routes a merchant's own integration would use,
 // so the dashboard cannot be right while the API is wrong.
 import { escapeHtml } from "./html.js";
+import { cspHeader, scriptHash } from "@/http/csp.js";
 import type { PanelConfig } from "@/panel/config.js";
 
 export interface ShellAccount {
@@ -13,14 +14,34 @@ export interface ShellAccount {
   clients: Array<{ id: string; name: string; kind: string; role: string; feeBps: number }>;
 }
 
-export function renderPanelShell(input: ShellAccount & { cfg: PanelConfig; csrfToken: string; lang?: "en" | "ar" }): string {
+export interface RenderedShell {
+  html: string;
+  /** The header value that authorizes THIS document's inline script. The route
+   *  sets it; the app's default policy would block the script otherwise. */
+  csp: string;
+}
+
+/** The sections the shell renders, in page order, each with the label the nav
+ *  gives it. One list, so a nav link cannot point at a section that is not on
+ *  the page — which is how the phase-1 draft's nav ended up linking four
+ *  JSON API routes as if they were pages. */
+const NAV: Array<[keyof typeof TABLES.en, string]> = [
+  ["balance", "balance"], ["keys", "keys"], ["deposits", "deposits"],
+  ["intents", "intents"], ["addresses", "addresses"], ["audit", "audit"],
+];
+
+export function renderPanelShell(input: ShellAccount & { cfg: PanelConfig; csrfToken: string; lang?: "en" | "ar" }): RenderedShell {
   const lang = input.lang === "ar" ? "ar" : "en";
   const dir = lang === "ar" ? "rtl" : "ltr";
   const t = TABLES[lang];
   const clients = input.clients.length
     ? input.clients.map((c) => `<li class="client"><a href="/panel?clientId=${encodeURIComponent(c.id)}">${escapeHtml(c.name)}</a> <span class="role">${escapeHtml(c.role)}</span> <span class="fee">${c.feeBps / 100}%</span></li>`).join("")
     : `<li class="empty">${t.noClient}</li>`;
-  return `<!doctype html>
+  const nav = NAV.map(([key, label]) => `<a href="#${label}">${t[key]}</a>`).join("\n    ");
+  const script = panelScript(input.clients[0]?.id ?? null, input.csrfToken);
+  return {
+    csp: cspHeader([scriptHash(script)]),
+    html: `<!doctype html>
 <html lang="${lang}" dir="${dir}">
 <head>
 <meta charset="utf-8">
@@ -33,18 +54,15 @@ export function renderPanelShell(input: ShellAccount & { cfg: PanelConfig; csrfT
 <header class="site-header">
   <a class="brand" href="/panel">SamaPay</a>
   <nav>
-    <a href="/panel/account">${t.overview}</a>
-    <a href="/panel/keys">${t.keys}</a>
-    <a href="/panel/deliveries">${t.webhooks}</a>
-    <a href="/panel/deposits">${t.movements}</a>
+    ${nav}
     <a href="/docs.html">${t.docsEn}</a>
     <a href="/docs.ar.html">${t.docsAr}</a>
-    <a href="/panel?lang=ar" lang="ar">العربية</a>
-    <a href="/panel?lang=en" lang="en">English</a>
+    <a href="/panel?lang=ar" lang="ar" rel="alternate">${t.ar}</a>
+    <a href="/panel?lang=en" lang="en" rel="alternate">${t.en}</a>
   </nav>
   <button type="button" id="signout" class="signout">${t.signOut}</button>
 </header>
-<main>
+<main data-empty="${escapeHtml(t.noClient)}">
   <p class="who">${t.signedInAs} <strong>${escapeHtml(input.displayName || input.email)}</strong></p>
   <ul class="clients">${clients}</ul>
   <section id="balance" data-view="balance"><h2>${t.balance}</h2><p class="hint">${t.balanceHint}</p><div class="rows"></div></section>
@@ -55,44 +73,62 @@ export function renderPanelShell(input: ShellAccount & { cfg: PanelConfig; csrfT
   <section id="audit" data-view="audit"><h2>${t.audit}</h2><div class="rows"></div></section>
   <noscript>${t.needScript}</noscript>
 </main>
-<script>
+<script>${script}</script>
+</body>
+</html>`,
+  };
+}
+
+/** The shell's whole client side. Split out of the document so the CSP hash is
+ *  computed over exactly the bytes between the <script> tags — a template
+ *  literal's leading newline is a byte, and a hash that misses one by one is a
+ *  page whose data never loads. */
+function panelScript(clientId: string | null, csrf: string): string {
+  return `
 // INLINED ON PURPOSE. /panel.js would be a request to nginx's static root
 // (location / serves /www/wwwroot/pay.mntad.com), which needs a deploy step that
 // the panel itself does not; a dashboard whose script 404s is a blank page.
 (() => {
-  const clientId = ${input.clients[0] ? JSON.stringify(input.clients[0]!.id) : "null"};
-  const csrf = ${JSON.stringify(input.csrfToken)};
+  const clientId = ${clientId ? JSON.stringify(clientId) : "null"};
+  const csrf = ${JSON.stringify(csrf)};
+  const empty = document.querySelector("main")?.dataset.empty ?? "no data";
   const qs = clientId ? "?clientId=" + encodeURIComponent(clientId) : "";
   const fmt = (v) => (v === null || v === undefined ? "–" : typeof v === "object" ? JSON.stringify(v) : String(v));
+  // Escaped at the point a value becomes markup, not before: every cell below
+  // reaches innerHTML, and a key's name, a deposit reference and an audit
+  // subject are all merchant- or chain-supplied strings. CSP's hash stops an
+  // injected <script> from RUNNING; it does not make the page's own text safe.
+  const esc = (s) => String(s).replace(/[&<>"]/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m]));
   const row = (cells) => '<tr>' + cells.map((c) => '<td>' + c + '</td>').join("") + '</tr>';
+  const cell = (v) => esc(fmt(v));
   async function load(view, render) {
     const el = document.querySelector('[data-view="' + view + '"] .rows');
     if (!el) return;
-    if (!clientId) { el.innerHTML = '<p class="empty">no client linked to this account</p>'; return; }
+    if (!clientId) { el.textContent = empty; return; }
     try {
       const r = await fetch('/panel/' + view + qs, { credentials: 'same-origin' });
       const body = await r.json();
-      if (!r.ok) { el.innerHTML = '<p class="empty">' + fmt(body?.error?.code ?? r.status) + '</p>'; return; }
+      if (!r.ok) { el.textContent = String(body?.error?.code ?? r.status); return; }
       el.innerHTML = render(body);
-    } catch (e) { el.innerHTML = '<p class="empty">load failed</p>'; }
+    } catch (e) { el.textContent = "load failed"; }
   }
   load('balance', (b) => {
     const chains = Object.entries(b.chains ?? {});
     return '<table>' + row(['chain', 'received', 'fees', 'withdrawn', 'available', 'pending']) +
-      chains.map(([c, p]) => row([c, fmt(p.received), fmt(p.fees), fmt(p.withdrawn), fmt(p.available), fmt(p.pending)]))
-        .join("") + '</table><p class="hint">fee ' + (b.feeBps / 100) + '% · ' + fmt(b.note) + '</p>';
+      chains.map(([c, p]) => row([cell(c), cell(p.received), cell(p.fees), cell(p.withdrawn), cell(p.available), cell(p.pending)]))
+        .join("") + '</table><p class="hint">fee ' + (b.feeBps / 100) + '% · ' + esc(fmt(b.note)) + '</p>';
   });
   load('keys', (b) => '<table>' + row(['name', 'prefix', 'last4', 'scopes', 'env', 'active', 'created via', 'webhook']) +
-    (b.keys ?? []).map((k) => row([fmt(k.name), fmt(k.keyPrefix) + '…', fmt(k.keyLast4), fmt(k.scopes.join(" ")), fmt(k.environment),
-      fmt(k.active), fmt(k.createdVia), k.hasWebhookSecret ? 'secret set' : 'none'])).join("") + '</table>');
+    (b.keys ?? []).map((k) => row([cell(k.name), cell(k.keyPrefix) + '…', cell(k.keyLast4), cell(k.scopes.join(" ")), cell(k.environment),
+      cell(k.active), cell(k.createdVia), k.hasWebhookSecret ? 'secret set' : 'none'])).join("") + '</table>');
   load('deposits', (b) => '<table>' + row(['chain', 'amount', 'fee', 'confirmations', 'status', 'reference', 'detected']) +
-    (b.deposits ?? []).map((d) => row([fmt(d.chain), fmt(d.amount), fmt(d.feeAmount), fmt(d.confirmations), fmt(d.status), fmt(d.reference), fmt(d.detectedAt)])).join("") + '</table>');
+    (b.deposits ?? []).map((d) => row([cell(d.chain), cell(d.amount), cell(d.feeAmount), cell(d.confirmations), cell(d.status), cell(d.reference), cell(d.detectedAt)])).join("") + '</table>');
   load('intents', (b) => '<table>' + row(['id', 'reference', 'chain', 'amount', 'status', 'created', 'expires']) +
-    (b.intents ?? []).map((i) => row([fmt(i.id), fmt(i.reference), fmt(i.chain), fmt(i.amount), fmt(i.status), fmt(i.createdAt), fmt(i.expiresAt)])).join("") + '</table>');
+    (b.intents ?? []).map((i) => row([cell(i.id), cell(i.reference), cell(i.chain), cell(i.amount), cell(i.status), cell(i.createdAt), cell(i.expiresAt)])).join("") + '</table>');
   load('addresses', (b) => '<table>' + row(['chain', 'address', 'reference', 'legacy import', 'watch disabled']) +
-    (b.addresses ?? []).map((a) => row([fmt(a.chain), '<code>' + fmt(a.address) + '</code>', fmt(a.reference), fmt(a.legacyImport), fmt(a.watchDisabledAt)])).join("") + '</table>');
+    (b.addresses ?? []).map((a) => row([cell(a.chain), '<code>' + cell(a.address) + '</code>', cell(a.reference), cell(a.legacyImport), cell(a.watchDisabledAt)])).join("") + '</table>');
   load('audit', (b) => '<table>' + row(['at', 'actor', 'action', 'subject']) +
-    (b.events ?? []).map((e) => row([fmt(e.at), fmt(e.actor), fmt(e.action), fmt(e.subjectId)])).join("") + '</table>');
+    (b.events ?? []).map((e) => row([cell(e.at), cell(e.actor), cell(e.action), cell(e.subjectId)])).join("") + '</table>');
   // Every mutation carries the CSRF token in the HEADER the server checks
   // (checkCsrf reads X-CSRF-Token). A form field named _csrf would be ignored,
   // so there is exactly one way to send it and the button below is the only
@@ -102,15 +138,13 @@ export function renderPanelShell(input: ShellAccount & { cfg: PanelConfig; csrfT
     location.href = '/';
   });
 })();
-</script>
-</body>
-</html>`;
+`;
 }
 
 const TABLES = {
   en: {
-    title: "SamaPay — merchant panel", signedInAs: "Signed in as", overview: "Overview", keys: "API keys",
-    webhooks: "Webhooks", movements: "Movements", docsEn: "Docs (EN)", docsAr: "Docs (عربي)", signOut: "Sign out",
+    title: "SamaPay — merchant panel", signedInAs: "Signed in as", keys: "API keys",
+    ar: "العربية", en: "English", docsEn: "Docs (EN)", docsAr: "Docs (عربي)", signOut: "Sign out",
     balance: "Balance", balanceHint: "available = confirmed deposits − fees − withdrawals still consuming. Nothing here moves money.",
     keysHint: "A key's plaintext is shown once, at creation, and cannot be recovered by anybody — including support.",
     deposits: "Deposits", intents: "Payment intents", addresses: "Permanent addresses",
@@ -119,8 +153,8 @@ const TABLES = {
     needScript: "This page needs script to read your own data. The panel exposes the same routes to you that it uses itself — use them directly if you prefer.",
   },
   ar: {
-    title: "SamaPay — لوحة التاجر", signedInAs: "تم الدخول باسم", overview: "نظرة عامة", keys: "مفاتيح API",
-    webhooks: "الويب هوك", movements: "الحركات", docsEn: "التوثيق (إنجليزي)", docsAr: "التوثيق (عربي)", signOut: "خروج",
+    title: "SamaPay — لوحة التاجر", signedInAs: "تم الدخول باسم", keys: "مفاتيح API",
+    ar: "العربية", en: "English", docsEn: "التوثيق (إنجليزي)", docsAr: "التوثيق (عربي)", signOut: "خروج",
     balance: "الرصيد", balanceHint: "المتاح = الإيداعات المؤكدة − الرسوم − السحوبات الجارية. لا شيء هنا يحرك المال.",
     keysHint: "يظهر نص المفتاح مرة واحدة عند الإنشاء ولا يمكن استرجاعه من أي جهة، بما فيها الدعم.",
     deposits: "الإيداعات", intents: "طلبات الدفع", addresses: "العناوين الدائمة",
