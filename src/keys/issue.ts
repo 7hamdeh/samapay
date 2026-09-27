@@ -1,7 +1,16 @@
-// Issuing and revoking keys. Called by the CLI (his hand) and by the admin
-// route (SamaPrime's admin key, scope keys.issue). Returns the plaintext
-// ONCE; nothing stores it. Same for the webhook secret when a webhook URL is
-// given: plaintext returned once, AEAD ciphertext stored (webhook-secret.ts).
+// Issuing and revoking keys. Called by the CLI (his hand), by the admin route
+// (retired, unmounted) and — since the phase-1 panel — by the signed-in OWNER
+// of the account the key belongs to. Returns the plaintext ONCE; nothing stores
+// it. Same for the webhook secret when a webhook URL is given: plaintext
+// returned once, AEAD ciphertext stored (webhook-secret.ts).
+//
+// ⚠️ THE `keys.issue` REFUSAL BELOW IS DERIVED FROM `issuedVia !== "cli"`, so
+// the value a caller passes is a privilege, not a label. That is precisely why
+// the panel passes its OWN value: reusing "cli" for a panel mint would hand the
+// panel the CLI's one unforgeable power (minting an admin key that can mint
+// admin keys), silently and by accident of a string. See
+// pay-dashboard.md B.6 step 9, which proposes keeping "cli" — implemented
+// differently here, deliberately, and flagged for Ibrahim in the approval doc.
 import type { KeyEnvironment } from "@prisma/client";
 import { prisma } from "@/db/client.js";
 import { appendAudit } from "@/audit/append.js";
@@ -14,8 +23,15 @@ export interface IssueKeyInput {
   name: string;
   scopes: string[];
   environment?: KeyEnvironment;
-  issuedBy: string;   // 'ibrahim' | 'samaprime_admin:<userId>'
-  issuedVia: "cli" | "samaprime_admin_action";
+  // Provenance columns the panel fills in (EXPAND, 20261001000000_panel_identity).
+  // Defaults keep every existing caller writing exactly what it wrote before.
+  createdVia?: "cli" | "panel_owner";
+  createdFromIp?: string | null;
+  // 'ibrahim' | 'account:<accountId>' for a panel owner | a CLI operator name.
+  issuedBy: string;
+  // 'samaprime_admin_action' is STRUCK (CLAUDE.md 2026-09-06) but stays in the
+  // union because rows carrying it exist; nothing may write it again.
+  issuedVia: "cli" | "samaprime_admin_action" | "panel_owner";
   webhookUrl?: string | null;
 }
 
@@ -54,10 +70,13 @@ export async function issueKey(input: IssueKeyInput) {
         data: {
           clientId: client.id, name: input.name, keyPrefix, keyHash, keyLast4: keyLast4Of(plaintext),
           scopes, environment, issuedBy: input.issuedBy, issuedVia: input.issuedVia, webhookUrl, webhookSecret: webhookSecretCiphertext,
+          createdVia: input.createdVia ?? (input.issuedVia === "panel_owner" ? "panel_owner" : "cli"),
+          createdFromIp: input.createdFromIp ?? null,
         },
         select: { id: true, clientId: true, name: true, keyPrefix: true, keyLast4: true, scopes: true, environment: true, createdAt: true },
       });
-      await appendAudit(tx, { keyId: created.id, actor: input.issuedVia === "cli" ? `cli:${input.issuedBy}` : `admin:${input.issuedBy}`, action: "key.issued", subjectId: created.id, params: { scopes, environment, name: input.name, webhookUrl } });
+      const actor = input.issuedVia === "cli" ? `cli:${input.issuedBy}` : input.issuedVia === "panel_owner" ? input.issuedBy : `admin:${input.issuedBy}`;
+      await appendAudit(tx, { keyId: created.id, actor, action: "key.issued", subjectId: created.id, params: { scopes, environment, name: input.name, webhookUrl } });
       return created;
     });
     // `webhookSecret` is the PLAINTEXT, returned once like `plaintext`; null when no URL was given.

@@ -15,6 +15,12 @@ import { balance } from "./routes/balance.js";
 import { paymentIntents } from "./routes/payment-intents.js";
 import { events } from "./routes/events.js";
 import { health } from "./routes/health.js";
+// The merchant panel (pay.mntad.com, phase 1). Mounted only when PANEL_ENABLED
+// is on — see src/panel/config.ts: a service with one database and no staging
+// earns its safety by making new customer-facing reach an explicit act. When it
+// is off, every /panel and /auth path answers the same 404 as any unknown route,
+// so a preview host and a production host look identical from the outside.
+import { panel as panelRoutes, auth as panelAuthRoutes, panelDeps } from "./routes/panel/index.js";
 
 export function buildApp(): Hono {
   const app = new Hono();
@@ -39,6 +45,11 @@ export function buildApp(): Hono {
   v1.route("/balance", balance);
   app.route("/v1", v1);
   app.route("/health", health);
+
+  if (panelDeps().cfg.enabled) {
+    app.route("/auth", panelAuthRoutes);
+    app.route("/panel", panelRoutes);
+  }
 
   app.notFound((c) => c.json(new ApiError("not_found", "No such route.").toBody(c.get("requestId")), 404));
   app.onError((err, c) => {

@@ -92,6 +92,10 @@ model Client {
   enabledChains Chain[] @default([BEP20, TRC20]) @map("enabled_chains")
 
   keys       ClientKey[]
+  // PANEL IDENTITY (phase 1, expand-only): the ownership edge the mint rule
+  // needs, and the ticket ledger. Neither is read by any API route.
+  accountMemberships AccountClient[]
+  handoffTickets     HandoffTicket[]
   intents    PaymentIntent[]
   events     Event[]
   addresses  Address[]
@@ -133,6 +137,17 @@ model ClientKey {
   successorKeyId String?        @map("successor_key_id")
   revokedAt      DateTime?      @map("revoked_at")
   revokedReason  String?        @map("revoked_reason")
+  // PANEL PROVENANCE (phase 1, EXPAND). Deliberately a NEW column rather than a
+  // new value inside `issuedVia`: 'cli' | 'samaprime_admin_action' is the union
+  // that has ever existed, and the second one is struck by CLAUDE.md. Writing
+  // 'panel_owner' into the OLD column would rewrite what history says, so the
+  // panel writes only here and `issuedVia` keeps its old meaning.
+  createdVia     String         @default("cli") @map("created_via") // 'cli' | 'panel_owner'
+  createdFromIp  String?        @map("created_from_ip") // from the trusted header only
+  // When the webhook target last moved. A merchant notices a hijacked key by
+  // the URL change; the audit trail needs the timestamp on the row, not just
+  // in the chain.
+  webhookUpdatedAt DateTime?    @map("webhook_updated_at")
   // Per-client-key webhook target and secret. `webhook_secret` holds AEAD
   // CIPHERTEXT ONLY (src/keys/webhook-secret.ts, "v1:" prefix) — never the
   // plaintext, which is printed once by the CLI. The dispatcher DECRYPTS it
@@ -341,6 +356,10 @@ model WebhookDelivery {
   lastError      String?        @map("last_error")
   createdAt      DateTime       @default(now()) @map("created_at")
   deliveredAt    DateTime?      @map("delivered_at")
+  // The panel's "send a test" button is a FACT on the row, not a guess from the
+  // payload: a real receiver refuses webhook.test, and an operator must be able
+  // to separate a test from a credit-triggering delivery without re-deriving it.
+  testOnly       Boolean        @default(false) @map("test_only")
 
   // G3: at most one delivery series per (key, event) — the enqueue is
   // idempotent structurally, not by a findFirst race.
@@ -535,3 +554,174 @@ model Event {
   @@index([clientId, createdAt])
   @@map("events")
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PANEL IDENTITY (pay.mntad.com merchant dashboard, phase 1) — EXPAND ONLY.
+// Nothing here touches a balance, an allowance, a deposit or a withdrawal.
+// SamaPay had ZERO human identity before this block (docs/panel-survey-2026-09-06.md
+// §0.2, still true on main as measured 2026-09-26): no account, no session,
+// no email, no code table. The whole dashboard rests on these five tables, and
+// Ibrahim's rule (CLAUDE.md, typed 2026-09-06) is the reason `AccountClient`
+// exists at all: "KEYS ARE MINTED BY THE OWNER'S HAND OR BY THE CLIENT PANEL'S
+// OWN SIGNED-IN OWNER FOR THEIR OWN ACCOUNT — NEVER BY AN OPERATOR ON SOMEONE
+// ELSE'S BEHALF." A mint therefore takes the acting account from the SESSION
+// and the target client from an AccountClient row of THAT account — never from
+// a request parameter (panel-survey §5 refusal 13).
+// ═══════════════════════════════════════════════════════════════════════════
+
+enum AccountRole {
+  owner // may mint/revoke its own keys and set its own webhook target
+  viewer // read-only screens; cannot mint, cannot revoke, cannot set a webhook URL
+}
+
+enum LoginCodePurpose {
+  sign_up
+  sign_in
+}
+
+// A human. Email is the identifier and is stored lowercased by the writer, so
+// the unique index means what it says. There is deliberately NO password
+// column: this service authenticates humans with an emailed code (single-use,
+// argon2-hashed, `login_codes`) or with a consumed MNTAD handoff ticket, never
+// with a secret they type twice.
+model Account {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  displayName  String?   @map("display_name")
+  // The MNTAD user id this account was federated from, when it arrived by
+  // handoff. OPAQUE, and never an auth key: it is a cross-reference for
+  // support and for the "already linked" answer, nothing trusts it at login.
+  mntadUserId  String?   @unique @map("mntad_user_id")
+  mntadMerchantId String? @map("mntad_merchant_id") // which store this account was introduced as
+  totpSecretEnc String?  @map("totp_secret_enc") // AEAD ciphertext ("v1:" prefix), never plaintext; optional 2FA
+  totpEnabledAt DateTime? @map("totp_enabled_at")
+  disabledAt   DateTime? @map("disabled_at") // a human, not a key, can be switched off
+  createdAt    DateTime  @default(now()) @map("created_at")
+  lastSignInAt DateTime? @map("last_sign_in_at")
+
+  memberships AccountClient[]
+  sessions    PanelSession[]
+  backupCodes PanelBackupCode[]
+
+  @@map("accounts")
+}
+
+// Which human owns which Client. THE only path from a session to a mint
+// target. `onDelete: Restrict` on both sides: deleting a client or an account
+// must not silently orphan the ownership fact that justifies a key's existence.
+model AccountClient {
+  id        String    @id @default(cuid())
+  accountId String    @map("account_id")
+  account   Account   @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  clientId  String    @map("client_id")
+  client    Client    @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  role      AccountRole @default(owner)
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@unique([accountId, clientId])
+  @@index([clientId])
+  @@map("account_clients")
+}
+
+// A single-use emailed code. The CODE ITSELF is never stored: argon2 over the
+// full plaintext with the library's default params — the same treatment a key
+// gets (src/keys/generate.ts:23-25) — because a 6-digit code in a leaked DB is
+// brute-forceable offline if it is only sha256'd.
+// ⚠️ WHAT IS ENFORCED WHERE: `attempts`/`max_attempts` and `expiresAt` are the
+// per-code rules; the per-IP and per-account brake that stops the email
+// endpoint from being a free oracle lives in src/panel/rate-limit.ts, NOT here.
+model LoginCode {
+  id          String           @id @default(cuid())
+  email       String
+  purpose     LoginCodePurpose
+  codeHash    String           @map("code_hash")
+  expiresAt   DateTime         @map("expires_at")
+  consumedAt  DateTime?        @map("consumed_at")
+  attempts    Int              @default(0)
+  maxAttempts Int              @default(5) @map("max_attempts")
+  createdAt   DateTime         @default(now()) @map("created_at")
+  createdFromIp String?        @map("created_from_ip")
+  // The address that actually received it. Lets a support reply say "we sent
+  // it here" without ever storing or logging the code.
+  sentTo      String           @map("sent_to")
+
+  @@index([email, purpose, createdAt])
+  @@index([expiresAt])
+  @@map("login_codes")
+}
+
+// The panel's own session. The cookie carries a 32-byte random token; this row
+// keeps only its sha256, so a database read cannot mint a live cookie and a
+// log line cannot leak one. `revokedAllForAccount` is what a sign-in-after-
+// leak and a 2FA enrollment both call: session fixation is closed by revoking
+// every prior session for the account, not by rotating a name.
+model PanelSession {
+  id         String    @id @default(cuid())
+  tokenHash  String    @unique @map("token_hash")
+  accountId  String    @map("account_id")
+  account    Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  csrfToken  String    @map("csrf_token") // double-submit value; the mutation routes require it echoed as a header
+  via        String    // 'otp' | 'handoff' — how this session was born
+  createdAt  DateTime  @default(now()) @map("created_at")
+  lastSeenAt DateTime  @default(now()) @map("last_seen_at")
+  expiresAt  DateTime  @map("expires_at")
+  revokedAt  DateTime? @map("revoked_at")
+  lastSeenIp String?   @map("last_seen_ip") // from the TRUSTED header only (X-Real-IP), see src/panel/request-ip.ts
+  userAgent  String?   @map("user_agent")
+
+  @@index([accountId])
+  @@index([expiresAt])
+  @@map("panel_sessions")
+}
+
+// Backup codes for optional 2FA. High-entropy (10 chars), so a plain sha256
+// with the code as its own salt is honest here — and it is what lets
+// "verify a code" be an index lookup instead of an argon2 grind per attempt.
+model PanelBackupCode {
+  id        String    @id @default(cuid())
+  accountId String    @map("account_id")
+  account   Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  codeHash  String    @unique @map("code_hash")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([accountId])
+  @@map("panel_backup_codes")
+}
+
+// ONE SPEND LEDGER, ON THE CONSUMER'S SIDE. pay-dashboard-review.md B2: the
+// plan's "a ticket table on both sides so both can verify" never said who owns
+// the atomic spend, and that omission is either a replay window or a dangling
+// auth. The invariant this table enforces: MNTAD mints and signs; SamaPay is
+// the only place a ticket can be burned, and it is burned by an
+// `UPDATE … WHERE consumed_at IS NULL` inside the same transaction that creates
+// the session. A lost return-trip 302 costs the merchant one re-handoff; a
+// replayed ticket costs an attacker nothing, because the row is already spent.
+model HandoffTicket {
+  id              String    @id // the ticket's own jti (24 random base64url chars)
+  mntadUserId     String    @map("mntad_user_id")
+  mntadMerchantId String    @map("mntad_merchant_id")
+  // RESOLVED BY MNTAD AT ISSUE TIME from the store's own credential, never
+  // from anything merchant-controlled: this is the whole trust delegation, and
+  // it is why SamaPay does not have to read MNTAD's session (A.12, review B2).
+  samapayClientId String    @map("samapay_client_id")
+  client          Client    @relation(fields: [samapayClientId], references: [id], onDelete: Restrict)
+  audienceHost    String    @map("audience_host") // must equal the Host that consumed it
+  stateHash       String    @map("state_hash") @db.Char(64) // sha256 of the browser's state cookie
+  returnPath      String?   @map("return_path")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  expiresAt       DateTime  @map("expires_at") // 60 s, per FINAL-RULINGS B#6
+  consumedAt      DateTime? @map("consumed_at")
+  consumedIp      String?   @map("consumed_ip")
+  sessionId       String?   @map("session_id") // the session this spend produced, for the audit trail
+
+  @@index([expiresAt])
+  @@index([mntadMerchantId])
+  @@map("handoff_tickets")
+}
+
+// Webhook deliveries carry a `test_only` flag so the panel's "send a test"
+// button is a fact on the row, not a guess from the payload type: a real
+// receiver must be able to refuse a test, and an operator must be able to tell
+// the two apart in the log without re-deriving it.
+// (ClientKey gains its panel-side provenance below, as an EXPAND column.)
