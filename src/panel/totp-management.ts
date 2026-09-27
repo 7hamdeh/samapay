@@ -66,15 +66,43 @@ export async function consumeBackupCode(input: { accountId: string; code: string
   return spent.count === 1;
 }
 
-export async function disableTotp(input: { accountId: string; sessionId: string }): Promise<{ ok: true } | TotpRefusal> {
-  const account = await prisma.account.findUnique({ where: { id: input.accountId }, select: { totpEnabledAt: true } });
+/** Turning 2FA OFF costs the second factor — by TOTP or by a printed backup
+ *  code, the same two proofs the account already accepts.
+ *
+ *  WHY THIS IS NOT A `requireTotp` Nicety (pay-dashboard review 2026-09-27,
+ *  MEDIUM on item 2): this function deletes the secret AND every backup code,
+ *  so before this it was one authenticated POST away from converting a
+ *  two-factor account into a one-factor account — with a session cookie and a
+ *  CSRF token as the whole of the authorisation, which is exactly what a
+ *  hijacked session holds. ENABLING 2FA revokes every other session; DISABLING
+ *  it asked for nothing. The asymmetry was the finding.
+ *
+ *  ⚠️ NOTHING HERE CHECKS A CODE IT DID NOT ACCEPT: a refusal leaves the
+ *  secret in place and spends no backup code, so a wrong guess is not a way to
+ *  burn through the recovery set. The rate limit that keeps the guess cheap
+ *  for the attacker is the `second_factor` bucket on the route, not here.
+ */
+export async function disableTotp(input: { accountId: string; code: string }): Promise<{ ok: true; via: "totp" | "backup" } | TotpRefusal> {
+  const cfg = readPanelConfig();
+  if (!cfg.seedEncryptionKey) return { ok: false, code: "no_encryption_key" };
+  const account = await prisma.account.findUnique({ where: { id: input.accountId }, select: { totpEnabledAt: true, totpSecretEnc: true } });
   if (!account || account.totpEnabledAt === null) return { ok: false, code: "not_enabled" };
+  // An unreadable secret is not "no factor needed": the backups still open the
+  // door, which is the whole point of printing them.
+  const secret = account.totpSecretEnc ? decryptTotpSecret(cfg.seedEncryptionKey, account.totpSecretEnc) : null;
+  const via = secret !== null && verifyTotpCode(secret, input.code) ? "totp" as const : null;
+  if (via === null && !(await consumeBackupCode({ accountId: input.accountId, code: input.code }))) {
+    await appendAudit(prisma, { actor: `account:${input.accountId}`, action: "panel.totp.disable_refused", subjectId: input.accountId });
+    return { ok: false, code: "code_invalid" };
+  }
+  const proved = via ?? "backup" as const;
+  const now = new Date();
   await prisma.$transaction(async (tx) => {
     await tx.account.update({ where: { id: input.accountId }, data: { totpEnabledAt: null, totpSecretEnc: null } });
     await tx.panelBackupCode.deleteMany({ where: { accountId: input.accountId } });
-    await appendAudit(tx, { actor: `account:${input.accountId}`, action: "panel.totp.disabled", subjectId: input.accountId });
+    await appendAudit(tx, { actor: `account:${input.accountId}`, action: "panel.totp.disabled", subjectId: input.accountId, params: { via: proved } });
   });
-  return { ok: true };
+  return { ok: true, via: proved };
 }
 
 export async function totpStatus(accountId: string): Promise<{ enabled: boolean; pending: boolean; backupCodesRemaining: number }> {

@@ -1,4 +1,5 @@
-// COVERS: src/panel/login-code.ts src/panel/session.ts src/panel/auth.ts src/panel/totp.ts src/panel/config.ts src/http/routes/panel/index.ts
+// COVERS: src/panel/login-code.ts src/panel/session.ts src/panel/auth.ts src/panel/totp.ts
+// COVERS ALSO: src/panel/totp-management.ts src/panel/rate-limit.ts src/http/routes/panel/index.ts
 //
 // RED-FIRST — the panel's human authentication. The claim under test is the
 // owner's phase-1 sentence: "sign up / log in (email + OTP code, POST only,
@@ -26,7 +27,8 @@ import { createSession, loadPrincipal, revokeAllSessions, checkCsrf } from "@/pa
 import { requestCode, completeSignIn } from "@/panel/auth.js";
 import { generateTotpSecret, totpCode, verifyTotpCode, decodeBase32 } from "@/panel/totp.js";
 import { decryptTotpSecret, encryptTotpSecret, sha256Hex } from "@/panel/crypto.js";
-import { MemoryBucketStore, enforce } from "@/panel/rate-limit.js";
+import { MemoryBucketStore, enforce, ruleFor } from "@/panel/rate-limit.js";
+import * as totpManagement from "@/panel/totp-management.js";
 
 /** The only thing request-ip reads. It stays a hand-made object because the
  *  assertion is about which HEADER is trusted, not about Hono plumbing — the
@@ -242,10 +244,102 @@ async function main() {
     await sweepExpiredCodes();
     const swept = await prisma.loginCode.count({ where: { email: EMAIL } });
     check(swept >= 0, "17. the sweep runs and reports (it deletes only rows that can no longer be spent)", `rows=${swept}`);
+
+    // ── 18. TURNING 2FA OFF COSTS THE SECOND FACTOR ──────────────────────
+    // pay-dashboard review 2026-09-27, MEDIUM on item (2): "/2fa/disable needs
+    // only session+CSRF, no TOTP/backup code (totp-management.ts:69-78)". The
+    // TOTP secret and the ten printed backup codes are the two things a stolen
+    // session cannot read, and one request deleted BOTH (totpSecretEnc → null,
+    // panelBackupCode → deleteMany). So the old route was a switch that quietly
+    // turned a two-factor account into a one-factor one, and to the owner it
+    // looked like nothing had happened — indistinguishable from "I never set it
+    // up". ENABLING 2FA revokes every other session; DISABLING asked for
+    // nothing. That asymmetry is the finding.
+    const stepOf = () => Math.floor(Math.floor(Date.now() / 1000) / 30);
+    const acct3 = await prisma.account.create({ data: { email: `2fa-off-${RUN}@preview.invalid` } });
+    const begun = await totpManagement.beginTotpEnrollment({ accountId: acct3.id });
+    const activated = begun.ok ? await totpManagement.activateTotp({ accountId: acct3.id, sessionId: "verify-18", code: totpCode(begun.secret, stepOf())! }) : { ok: false as const, code: "no_pending_enrollment" as const };
+    const scaffold = await totpManagement.totpStatus(acct3.id);
+    check(begun.ok && activated.ok && scaffold.enabled === true && scaffold.backupCodesRemaining === 10,
+      "18a. SCAFFOLD — a real 2FA account with ten live backup codes, built only through the functions the panel's routes call",
+      `begun=${begun.ok} activated=${activated.ok} enabled=${scaffold.enabled} backups=${scaffold.backupCodesRemaining}`);
+    if (!begun.ok || !activated.ok) throw new Error("18 could not build a 2FA account — nothing below this line can be asserted");
+
+    const wrongCode = await totpManagement.disableTotp({ accountId: acct3.id, code: "000000" });
+    const afterWrong = await totpManagement.totpStatus(acct3.id);
+    check(!wrongCode.ok && wrongCode.code === "code_invalid" && afterWrong.enabled === true && afterWrong.backupCodesRemaining === 10,
+      "18b. THE FIX — a wrong second factor refuses, and 2FA is STILL ON afterwards with all ten backups unspent",
+      `code=${!wrongCode.ok && wrongCode.code} enabled=${afterWrong.enabled} backups=${afterWrong.backupCodesRemaining}`);
+    const noCode = await totpManagement.disableTotp({ accountId: acct3.id, code: "" });
+    const afterNoCode = await totpManagement.totpStatus(acct3.id);
+    check(!noCode.ok && afterNoCode.enabled === true && afterNoCode.backupCodesRemaining === 10,
+      "18c. an ABSENT code is refused on the same path and costs nothing — the route cannot be satisfied by omitting the field",
+      `code=${!noCode.ok && noCode.code} enabled=${afterNoCode.enabled}`);
+    // The finding, asserted as literally as it can be: the two values the OLD
+    // route demanded — a session token and its CSRF pair — are not a second
+    // factor, and neither decodes to one. A hijacked cookie held both.
+    const bySession = await totpManagement.disableTotp({ accountId: acct3.id, code: session.csrfToken });
+    const byCookie = await totpManagement.disableTotp({ accountId: acct3.id, code: session.token });
+    check(!bySession.ok && !byCookie.ok && (await totpManagement.totpStatus(acct3.id)).enabled === true,
+      "18d. THE FINDING — the session and its CSRF token, which is all the old route checked, are refused: neither is a factor",
+      `csrf=${!bySession.ok} token=${!byCookie.ok}`);
+    const stale = await totpManagement.disableTotp({ accountId: acct3.id, code: totpCode(begun.secret, stepOf() - 6)! });
+    check(!stale.ok && (await totpManagement.totpStatus(acct3.id)).enabled === true,
+      "18e. a code six steps old is not a second factor — the ±1 window is a phone's clock, not a grace period for a captured code",
+      `code=${!stale.ok && stale.code}`);
+
+    const byTotp = await totpManagement.disableTotp({ accountId: acct3.id, code: totpCode(begun.secret, stepOf())! });
+    const secretRow = await prisma.account.findUniqueOrThrow({ where: { id: acct3.id }, select: { totpEnabledAt: true, totpSecretEnc: true } });
+    check(byTotp.ok && secretRow.totpEnabledAt === null && secretRow.totpSecretEnc === null,
+      "18f. the LIVE code from the enrolled device does disable it — the fix asks for a proof, it does not refuse the feature",
+      `ok=${byTotp.ok}`);
+    const orphans = await prisma.panelBackupCode.count({ where: { accountId: acct3.id } });
+    check(orphans === 0, "18g. and the factor is deleted with the factor: no backup code outlives the enrollment it came from", `rows=${orphans}`);
+
+    // The drawer path. The phone is gone, so a printed recovery code is the
+    // proof — and this is the FIRST caller of consumeBackupCode in the repo:
+    // the review's LOW said backup codes are generated and never accepted
+    // anywhere, which is a recovery route that does not exist when you need it.
+    const reBegun = await totpManagement.beginTotpEnrollment({ accountId: acct3.id });
+    const reActivated = reBegun.ok ? await totpManagement.activateTotp({ accountId: acct3.id, sessionId: "verify-18g", code: totpCode(reBegun.secret, stepOf())! }) : { ok: false as const, code: "no_pending_enrollment" as const };
+    if (!reBegun.ok || !reActivated.ok) throw new Error("18 could not re-enroll for the backup-code case");
+    const byBackup = await totpManagement.disableTotp({ accountId: acct3.id, code: reActivated.backupCodes[0] ?? "" });
+    check(byBackup.ok && (await prisma.account.findUniqueOrThrow({ where: { id: acct3.id }, select: { totpEnabledAt: true } })).totpEnabledAt === null,
+      "18h. a printed BACKUP code is the other accepted proof (a lost phone must not mean a lost account)",
+      `ok=${byBackup.ok}`);
+    const refusalsBefore = await prisma.auditEvent.count({ where: { actor: `account:${acct3.id}`, action: "panel.totp.disable_refused" } });
+    const third = await totpManagement.beginTotpEnrollment({ accountId: acct3.id });
+    const thirdActivated = third.ok ? await totpManagement.activateTotp({ accountId: acct3.id, sessionId: "verify-18i", code: totpCode(third.secret, stepOf())! }) : { ok: false as const, code: "no_pending_enrollment" as const };
+    if (!third.ok || !thirdActivated.ok) throw new Error("18 could not re-enroll for the spent-backup case");
+    // Re-enrolled, so 2FA is ON and this call can only be refused for its CODE.
+    // That is what makes it a single-use proof: the spent printout is dead
+    // forever, and stealing it buys exactly one disable, not a standing key.
+    const replayed = await totpManagement.disableTotp({ accountId: acct3.id, code: reActivated.backupCodes[0] ?? "" });
+    const liveBackups = await prisma.panelBackupCode.count({ where: { accountId: acct3.id, usedAt: null } });
+    const refusals = await prisma.auditEvent.count({ where: { actor: `account:${acct3.id}`, action: "panel.totp.disable_refused" } });
+    check(!replayed.ok && replayed.code === "code_invalid" && liveBackups === 10 && (await totpManagement.totpStatus(acct3.id)).enabled === true,
+      "18i. CONTROL — the spent backup code is dead for good: re-enrolling does not resurrect it, and it cannot spend any of the new ten",
+      `code=${!replayed.ok && replayed.code} unspent=${liveBackups}`);
+    check(refusals === refusalsBefore + 1,
+      "18j. a refused attempt is AUDITED, and only a refusal writes that line — an owner reading the log can see somebody tried to strip the factor",
+      `refusals=${refusalsBefore}→${refusals} (the ${refusalsBefore} before are 18b–18e, and 18f/18h succeeded and added none)`);
+
+    // A hijacked session is the threat model here, and what it guesses is a
+    // six-digit number against a 30 s step with a ±1 window: 3 valid codes per
+    // 10^6. The bucket is what makes the guess slower than the window moves, so
+    // it is stated as a DERIVED rate, never as a copied capacity.
+    const rule = ruleFor("second_factor");
+    const buckets18 = new MemoryBucketStore();
+    let accepted = 0;
+    for (let i = 0; i < rule.capacity * 4; i++) if (enforce(buckets18, "second_factor", acct3.id, Math.floor(Date.now() / 1000)).ok) accepted++;
+    const throughPerWindow = (rule.capacity * 3) / 1_000_000;
+    check(accepted === rule.capacity && throughPerWindow < 0.001,
+      `18k. the attempt is rate limited per account (${rule.capacity} per ${rule.windowSec / 60} min), which caps a blind guess at ${(throughPerWindow * 100).toFixed(3)}% of windows`,
+      `accepted=${accepted}/${rule.capacity}`);
   } finally {
-    await prisma.loginCode.deleteMany({ where: { email: { in: [EMAIL, `2fa-${RUN}@preview.invalid`] } } });
-    await prisma.panelSession.deleteMany({ where: { account: { email: { in: [EMAIL, `2fa-${RUN}@preview.invalid`] } } } });
-    await prisma.account.deleteMany({ where: { email: { in: [EMAIL, `2fa-${RUN}@preview.invalid`] } } });
+    await prisma.loginCode.deleteMany({ where: { email: { in: [EMAIL, `2fa-${RUN}@preview.invalid`, `2fa-off-${RUN}@preview.invalid`] } } });
+    await prisma.panelSession.deleteMany({ where: { account: { email: { in: [EMAIL, `2fa-${RUN}@preview.invalid`, `2fa-off-${RUN}@preview.invalid`] } } } });
+    await prisma.account.deleteMany({ where: { email: { in: [EMAIL, `2fa-${RUN}@preview.invalid`, `2fa-off-${RUN}@preview.invalid`] } } });
   }
   const failed = summary();
   process.exit(failed > 0 ? 1 : 0);

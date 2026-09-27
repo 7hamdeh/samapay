@@ -371,7 +371,13 @@ panel.post("/2fa/activate", async (c) => {
 panel.post("/2fa/disable", async (c) => {
   const principal = await requirePrincipal(c);
   requireCsrf(c, principal);
-  const disabled = await totpManagement.disableTotp({ accountId: principal.accountId, sessionId: principal.sessionId });
+  // The second factor itself, and a per-account budget on guessing it: this
+  // request deletes the TOTP secret AND every backup code, so a session cookie
+  // and a CSRF token — all a hijacked session holds — are not authorisation.
+  // pay-dashboard review 2026-09-27, MEDIUM on item (2).
+  limited(c, "second_factor", principal.accountId);
+  const body = await parseBody(c, z.object({ code: z.string().trim().min(1).max(20) }), "Body must be { code } — the 6-digit code or a printed backup code.");
+  const disabled = await totpManagement.disableTotp({ accountId: principal.accountId, code: body.code });
   return c.json(disabled, 200);
 });
 

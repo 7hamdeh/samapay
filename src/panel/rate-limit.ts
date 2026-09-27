@@ -20,10 +20,14 @@
 //    merchant; 10 covers a reload-happy operator on a bad connection.
 //  · panel mutation   per account: 30 / 1 min — key create/revoke/webhook set
 //    are all "a human clicking, occasionally twice by accident".
+//  · second factor    per account:  5 / 15 min — turning 2FA OFF. The thing
+//    being guessed is a 6-digit code valid for 3 steps (±1), so 5 tries is
+//    15 in 10^6 per window: a hijacked session cannot grind its way out of the
+//    second factor, which is the entire reason the factor is asked for here.
 // An account-level brake at 20 failures / 15 min is the stolen-cookie detector
 // (a 32-byte base64url session id is not guessable; the point is to notice
 // somebody TRYING, and 20 in 15 min is above what one flaky browser tab does).
-export type BucketKind = "sign_in_request" | "code_verify" | "code_send" | "handoff_consume" | "panel_mutation" | "account_failure" | "webhook_test";
+export type BucketKind = "sign_in_request" | "code_verify" | "code_send" | "handoff_consume" | "panel_mutation" | "account_failure" | "webhook_test" | "second_factor";
 
 type Rule = Readonly<{ capacity: number; refillPerSec: number; windowSec: number }>;
 
@@ -33,6 +37,7 @@ const RULES: Record<BucketKind, Rule> = {
   code_send:        { capacity: 10, refillPerSec: 10 / 900, windowSec: 900 },
   handoff_consume:  { capacity: 10, refillPerSec: 10 / 900, windowSec: 900 },
   panel_mutation:   { capacity: 30, refillPerSec: 30 / 60,  windowSec: 60 },
+  second_factor:    { capacity: 5,  refillPerSec: 5 / 900,  windowSec: 900 },
   account_failure:  { capacity: 20, refillPerSec: 20 / 900, windowSec: 900 },
   // One signed POST to a merchant-chosen address per key per minute (pay-dashboard.md
   // B.6 step 12): enough for a human to check their receiver twice, not enough to
