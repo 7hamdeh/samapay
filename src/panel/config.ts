@@ -35,7 +35,13 @@ const Schema = z.object({
   PANEL_HANDOFF_TTL_SEC: z.coerce.number().int().min(30).max(120).default(60),
   PANEL_MAIL_TRANSPORT: z.enum(["sendmail", "log", "none"]).default("none"),
   PANEL_SENDMAIL_PATH: z.string().default("/usr/sbin/sendmail"),
-  PANEL_MAIL_FROM: z.string().default("payments@mntad.com"),
+  // Measured on this box: postfix's sendmail, mntad.com is in
+  // virtual_mailbox_domains, `mail.mntad.com` resolves to this host (so the SPF
+  // `+mx` on mntad.com authorizes it as a sender) and the DKIM SigningTable maps
+  // *@mntad.com to default._domainkey.mntad.com. noreply@mntad.com is a real
+  // mailbox here, so a bounce or a reply has somewhere to land instead of
+  // becoming a support ticket about a code that never came.
+  PANEL_MAIL_FROM: z.string().default("noreply@mntad.com"),
   // Operator-only allowlist for the http+loopback webhook exception (MNTAD and
   // SamaPay share this box and talk over http://127.0.0.1:3090). Comma-list of
   // hostnames. THIS IS NEVER A MERCHANT INPUT — pay-dashboard.md A.8.
